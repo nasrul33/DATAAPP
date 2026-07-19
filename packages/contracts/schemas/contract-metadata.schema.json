@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/foundation/contract-metadata.schema.json",
+  "title": "ContractMetadata",
+  "description": "Version metadata embedded in generated Teratai cross-language contracts.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "protocol_version",
+    "schema_name",
+    "schema_version",
+    "generator_revision"
+  ],
+  "properties": {
+    "protocol_version": {
+      "description": "Major and minor engine protocol version.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$"
+    },
+    "schema_name": {
+      "description": "Stable kebab-case canonical schema name.",
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+    },
+    "schema_version": {
+      "description": "Semantic version of this schema.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "generator_revision": {
+      "description": "Monotonic revision of the generator contract subset.",
+      "type": "integer",
+      "minimum": 1
+    }
+  }
+}

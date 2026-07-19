@@ -1,0 +1,20 @@
+{
+  "name": "@teratai/config",
+  "version": "0.1.0",
+  "private": true,
+  "files": [
+    "eslint.config.mjs",
+    "vitest.config.ts",
+    "tsconfig.base.json"
+  ],
+  "exports": {
+    "./eslint": "./eslint.config.mjs",
+    "./vitest": "./vitest.config.ts",
+    "./tsconfig": "./tsconfig.base.json"
+  },
+  "dependencies": {
+    "@eslint/js": "catalog:",
+    "typescript-eslint": "catalog:",
+    "vitest": "catalog:"
+  }
+}

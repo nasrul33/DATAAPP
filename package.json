@@ -1,0 +1,39 @@
+{
+  "name": "teratai-analytics",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Teratai Analytics Desktop monorepo",
+  "packageManager": "pnpm@11.9.0",
+  "engines": {
+    "node": ">=24.0.0",
+    "pnpm": "11.9.0"
+  },
+  "scripts": {
+    "build": "pnpm build:ts && pnpm build:rust && pnpm build:python",
+    "build:python": "uv run python -m compileall -q engine/teratai_engine",
+    "build:rust": "cargo build --workspace --locked",
+    "build:ts": "pnpm --recursive --if-present build",
+    "contracts:check": "node scripts/contracts/generate.mjs --check",
+    "contracts:generate": "node scripts/contracts/generate.mjs",
+    "lint": "pnpm contracts:check && pnpm lint:ts && pnpm lint:rust && pnpm lint:python",
+    "lint:python": "uv run ruff check engine tests/golden",
+    "lint:rust": "cargo fmt --check && cargo clippy --workspace --all-targets --locked -- -D warnings",
+    "lint:ts": "eslint . --max-warnings 0",
+    "test": "pnpm test:unit && pnpm test:e2e && pnpm test:rust && pnpm test:python",
+    "test:e2e": "node --test tests/e2e/workspace.test.mjs tests/e2e/contracts.test.mjs",
+    "test:python": "uv run pytest",
+    "test:rust": "cargo test --workspace --locked",
+    "test:unit": "vitest run",
+    "typecheck": "pnpm typecheck:ts && pnpm typecheck:rust && pnpm typecheck:python",
+    "typecheck:python": "uv run mypy",
+    "typecheck:rust": "cargo check --workspace --locked",
+    "typecheck:ts": "pnpm --recursive --if-present typecheck && tsc --noEmit -p tsconfig.test.json"
+  },
+  "devDependencies": {
+    "@eslint/js": "9.39.1",
+    "eslint": "9.39.1",
+    "typescript-eslint": "8.48.1",
+    "typescript": "5.9.3",
+    "vitest": "3.2.4"
+  }
+}
