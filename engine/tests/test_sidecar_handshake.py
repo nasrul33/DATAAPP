@@ -75,6 +75,25 @@ def test_non_uuid_v7_request_id_is_rejected_without_echoing_it() -> None:
         raise AssertionError("non-UUID-v7 correlation identifiers must be rejected")
 
 
+def test_invalid_correlation_cannot_break_typed_error_response() -> None:
+    payload = handshake_payload()
+    payload["host_version"] = "invalid"
+    payload["request_id"] = "not-a-uuid"
+    output_stream = BytesIO()
+    error_stream = BytesIO()
+
+    assert serve(
+        BytesIO(json.dumps(payload).encode() + b"\n"),
+        output_stream,
+        error_stream,
+    ) == 0
+    response = json.loads(output_stream.getvalue())
+
+    assert response["code"] == "ENGINE_UNAVAILABLE"
+    assert response["correlation_id"] == "not-a-uuid"
+    assert error_stream.getvalue() == b""
+
+
 def test_module_sidecar_stays_alive_until_host_closes_stdin() -> None:
     process = subprocess.Popen(
         [sys.executable, "-B", "-m", "teratai_engine.sidecar"],
@@ -93,6 +112,13 @@ def test_module_sidecar_stays_alive_until_host_closes_stdin() -> None:
     response = json.loads(process.stdout.readline())
     assert response["healthy"] is True
     assert process.poll() is None
+
+    assert process.stderr is not None
+    received_log = json.loads(process.stderr.readline())
+    ready_log = json.loads(process.stderr.readline())
+    assert [received_log["sequence"], ready_log["sequence"]] == [2, 3]
+    assert received_log["correlation_id"] == REQUEST_ID
+    assert ready_log["correlation_id"] == REQUEST_ID
 
     process.stdin.close()
     assert process.wait(timeout=5) == 0

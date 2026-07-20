@@ -5,7 +5,9 @@ import type {
   EngineError,
   EngineHandshakeRequest,
   EngineHandshakeResponse,
+  RuntimeLogEvent,
 } from "../src/index";
+import { createCorrelationId, createRuntimeLogEvent } from "../src/index";
 
 describe("generated contract metadata", () => {
   it("round-trips the canonical fixture shape", () => {
@@ -17,6 +19,46 @@ describe("generated contract metadata", () => {
     } satisfies ContractMetadata;
 
     expect(JSON.parse(JSON.stringify(metadata))).toEqual(metadata);
+  });
+});
+
+describe("runtime logging", () => {
+  it("creates deterministic UUID v7 correlation identifiers", () => {
+    const correlationId = createCorrelationId({
+      randomBytes: new Uint8Array(16).fill(0xab),
+      timestampMs: 1_721_469_600_000,
+    });
+
+    expect(correlationId).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+    expect(correlationId[14]).toBe("7");
+  });
+
+  it("creates a canonical safe structured event", () => {
+    const event = createRuntimeLogEvent({
+      component: "desktop-shell",
+      correlationId: "00000000-0000-7000-8000-000000000007",
+      event: "desktop.startup",
+      layer: "desktop",
+      level: "INFO",
+      message: "Desktop shell dimulai.",
+      sequence: 1,
+      timestamp: new Date("2026-07-20T10:00:00.000Z"),
+    }) satisfies RuntimeLogEvent;
+
+    expect(event.timestamp).toBe("2026-07-20T10:00:00.000Z");
+    expect(event.correlation_id).toMatch(/-7[0-9a-f]{3}-/);
+  });
+
+  it("rejects an invalid correlation identifier at runtime", () => {
+    expect(() => createRuntimeLogEvent({
+      component: "desktop-shell",
+      correlationId: "not-a-uuid",
+      event: "desktop.startup",
+      layer: "desktop",
+      level: "INFO",
+      message: "Desktop shell dimulai.",
+      sequence: 1,
+    })).toThrow("correlationId must be a lowercase UUID v7");
   });
 });
 

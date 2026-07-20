@@ -12,6 +12,9 @@ use std::time::{Duration, Instant};
 use teratai_contracts::generated::engine_error::EngineError;
 use teratai_contracts::generated::engine_handshake_request::EngineHandshakeRequest;
 use teratai_contracts::generated::engine_handshake_response::EngineHandshakeResponse;
+use teratai_contracts::generated::runtime_log_event::RuntimeLogEvent;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 /// Version of the newline-delimited engine protocol implemented by this host.
 pub const ENGINE_PROTOCOL_VERSION: &str = "1.0";
@@ -20,6 +23,7 @@ pub const PYTHON_VERSION_PREFIX: &str = "3.12.";
 const HANDSHAKE_COMMAND: &str = "engine.handshake";
 const ENGINE_MODULE: &str = "teratai_engine.sidecar";
 const STDERR_LIMIT_BYTES: usize = 8 * 1024;
+const DEFAULT_TRACE_LIMIT: usize = 128;
 
 /// Runtime settings supplied by the desktop application when starting the engine.
 #[derive(Debug, Clone)]
@@ -38,6 +42,8 @@ pub struct EngineHostConfig {
     pub expected_protocol_version: String,
     /// Engine package version required by the native host.
     pub expected_engine_version: String,
+    /// Maximum structured events retained for one supervised process.
+    pub trace_limit: usize,
 }
 
 impl EngineHostConfig {
@@ -56,6 +62,7 @@ impl EngineHostConfig {
             shutdown_timeout: Duration::from_secs(5),
             expected_protocol_version: ENGINE_PROTOCOL_VERSION.to_owned(),
             expected_engine_version: env!("CARGO_PKG_VERSION").to_owned(),
+            trace_limit: DEFAULT_TRACE_LIMIT,
         }
     }
 }
@@ -71,6 +78,8 @@ pub enum EngineHostError {
     Io(io::Error),
     /// A wire message could not be serialized or decoded.
     Serialization(serde_json::Error),
+    /// A UTC timestamp could not be formatted for the canonical log contract.
+    Timestamp(time::error::Format),
     /// The engine did not answer before the configured deadline.
     HandshakeTimeout,
     /// The process exited or closed stdout before sending a response.
@@ -104,6 +113,7 @@ impl Display for EngineHostError {
             Self::Serialization(error) => {
                 write!(formatter, "engine protocol message is invalid: {error}")
             }
+            Self::Timestamp(error) => write!(formatter, "runtime log timestamp failed: {error}"),
             Self::HandshakeTimeout => formatter.write_str("engine handshake timed out"),
             Self::HandshakeChannelClosed => {
                 formatter.write_str("engine closed before completing handshake")
@@ -164,38 +174,32 @@ impl EngineHost {
     pub fn start(self) -> Result<RunningEngine, EngineHostError> {
         validate_config(&self.config)?;
 
-        let mut child = Command::new(&self.config.python_executable)
-            .args(["-B", "-m", ENGINE_MODULE])
-            .current_dir(&self.config.engine_module_root)
-            .env("PYTHONPATH", &self.config.engine_module_root)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(EngineHostError::Spawn)?;
+        let trace_capture = Arc::new(Mutex::new(Vec::with_capacity(self.config.trace_limit)));
+        push_trace(
+            &trace_capture,
+            runtime_log(
+                "INFO",
+                "native",
+                "engine-host",
+                "native.handshake.started",
+                "Native host memulai handshake engine.",
+                &self.config.request_id,
+                1,
+            )?,
+            self.config.trace_limit,
+        );
 
-        let Some(mut stdin) = child.stdin.take() else {
-            terminate_child(&mut child);
-            return Err(EngineHostError::InvalidConfiguration(
-                "Python stdin pipe was not created".to_owned(),
-            ));
-        };
-        let Some(stdout) = child.stdout.take() else {
-            terminate_child(&mut child);
-            return Err(EngineHostError::InvalidConfiguration(
-                "Python stdout pipe was not created".to_owned(),
-            ));
-        };
-        let Some(stderr) = child.stderr.take() else {
-            terminate_child(&mut child);
-            return Err(EngineHostError::InvalidConfiguration(
-                "Python stderr pipe was not created".to_owned(),
-            ));
-        };
+        let (mut child, mut stdin, stdout, stderr) = spawn_engine_process(&self.config)?;
 
         let (receiver, reader_thread) = spawn_stdout_reader(stdout);
         let stderr_capture = Arc::new(Mutex::new(String::new()));
-        let stderr_thread = spawn_stderr_reader(stderr, Arc::clone(&stderr_capture));
+        let stderr_thread = spawn_stderr_reader(
+            stderr,
+            Arc::clone(&stderr_capture),
+            Arc::clone(&trace_capture),
+            self.config.request_id.clone(),
+            self.config.trace_limit,
+        );
         let request = EngineHandshakeRequest {
             command: HANDSHAKE_COMMAND.to_owned(),
             host_version: env!("CARGO_PKG_VERSION").to_owned(),
@@ -224,16 +228,62 @@ impl EngineHost {
             }
         };
 
+        let completion_log = match runtime_log(
+            "INFO",
+            "native",
+            "engine-host",
+            "native.handshake.completed",
+            "Native host memverifikasi identitas dan health engine.",
+            &self.config.request_id,
+            4,
+        ) {
+            Ok(event) => event,
+            Err(error) => {
+                drop(stdin);
+                terminate_child(&mut child);
+                join_thread(reader_thread);
+                join_thread(stderr_thread);
+                return Err(error);
+            }
+        };
+
+        push_trace(&trace_capture, completion_log, self.config.trace_limit);
+
         Ok(RunningEngine {
             child: Some(child),
             stdin: Some(stdin),
             reader_thread: Some(reader_thread),
             stderr_thread: Some(stderr_thread),
             stderr_capture,
+            trace_capture,
             health: response,
             shutdown_timeout: self.config.shutdown_timeout,
         })
     }
+}
+
+fn spawn_engine_process(
+    config: &EngineHostConfig,
+) -> Result<(Child, ChildStdin, ChildStdout, ChildStderr), EngineHostError> {
+    let mut child = Command::new(&config.python_executable)
+        .args(["-B", "-m", ENGINE_MODULE])
+        .current_dir(&config.engine_module_root)
+        .env("PYTHONPATH", &config.engine_module_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(EngineHostError::Spawn)?;
+
+    let pipes = (child.stdin.take(), child.stdout.take(), child.stderr.take());
+    let (Some(stdin), Some(stdout), Some(stderr)) = pipes else {
+        terminate_child(&mut child);
+        return Err(EngineHostError::InvalidConfiguration(
+            "Python process did not expose all configured standard I/O pipes".to_owned(),
+        ));
+    };
+
+    Ok((child, stdin, stdout, stderr))
 }
 
 /// A handshaken Python process owned exclusively by the native engine host.
@@ -244,6 +294,7 @@ pub struct RunningEngine {
     reader_thread: Option<JoinHandle<()>>,
     stderr_thread: Option<JoinHandle<()>>,
     stderr_capture: Arc<Mutex<String>>,
+    trace_capture: Arc<Mutex<Vec<RuntimeLogEvent>>>,
     health: EngineHandshakeResponse,
     shutdown_timeout: Duration,
 }
@@ -277,6 +328,17 @@ impl RunningEngine {
         self.stderr_capture
             .lock()
             .map_or_else(|_| String::new(), |capture| capture.clone())
+    }
+
+    /// Return an ordered snapshot of safe structured events for diagnostics.
+    #[must_use]
+    pub fn trace(&self) -> Vec<RuntimeLogEvent> {
+        let mut events = self
+            .trace_capture
+            .lock()
+            .map_or_else(|_| Vec::new(), |trace| trace.clone());
+        events.sort_by_key(|event| event.sequence);
+        events
     }
 
     /// Close stdin and wait for the sidecar's normal EOF shutdown path.
@@ -332,9 +394,9 @@ impl Drop for RunningEngine {
 }
 
 fn validate_config(config: &EngineHostConfig) -> Result<(), EngineHostError> {
-    if config.request_id.trim().is_empty() {
+    if !is_uuid_v7(&config.request_id) {
         return Err(EngineHostError::InvalidConfiguration(
-            "request_id cannot be empty".to_owned(),
+            "request_id must be UUID v7".to_owned(),
         ));
     }
     if !config.engine_module_root.is_dir() {
@@ -343,9 +405,12 @@ fn validate_config(config: &EngineHostConfig) -> Result<(), EngineHostError> {
             config.engine_module_root.display()
         )));
     }
-    if config.handshake_timeout.is_zero() || config.shutdown_timeout.is_zero() {
+    if config.handshake_timeout.is_zero()
+        || config.shutdown_timeout.is_zero()
+        || config.trace_limit == 0
+    {
         return Err(EngineHostError::InvalidConfiguration(
-            "timeouts must be greater than zero".to_owned(),
+            "timeouts and trace_limit must be greater than zero".to_owned(),
         ));
     }
     Ok(())
@@ -437,9 +502,21 @@ fn spawn_stdout_reader(stdout: ChildStdout) -> (Receiver<io::Result<String>>, Jo
     (receiver, handle)
 }
 
-fn spawn_stderr_reader(stderr: ChildStderr, capture: Arc<Mutex<String>>) -> JoinHandle<()> {
+fn spawn_stderr_reader(
+    stderr: ChildStderr,
+    capture: Arc<Mutex<String>>,
+    trace: Arc<Mutex<Vec<RuntimeLogEvent>>>,
+    correlation_id: String,
+    trace_limit: usize,
+) -> JoinHandle<()> {
     thread::spawn(move || {
         for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+            if let Ok(event) = serde_json::from_str::<RuntimeLogEvent>(&line) {
+                if validate_runtime_log(&event, &correlation_id) {
+                    push_trace(&trace, event, trace_limit);
+                    continue;
+                }
+            }
             let Ok(mut target) = capture.lock() else {
                 break;
             };
@@ -452,6 +529,68 @@ fn spawn_stderr_reader(stderr: ChildStderr, capture: Arc<Mutex<String>>) -> Join
             target.push('\n');
         }
     })
+}
+
+fn runtime_log(
+    level: &str,
+    layer: &str,
+    component: &str,
+    event: &str,
+    message: &str,
+    correlation_id: &str,
+    sequence: i64,
+) -> Result<RuntimeLogEvent, EngineHostError> {
+    let timestamp = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .map_err(EngineHostError::Timestamp)?;
+    Ok(RuntimeLogEvent {
+        component: component.to_owned(),
+        correlation_id: correlation_id.to_owned(),
+        event: event.to_owned(),
+        layer: layer.to_owned(),
+        level: level.to_owned(),
+        message: message.to_owned(),
+        sequence,
+        timestamp,
+    })
+}
+
+fn validate_runtime_log(event: &RuntimeLogEvent, correlation_id: &str) -> bool {
+    matches!(event.level.as_str(), "DEBUG" | "ERROR" | "INFO" | "WARNING")
+        && matches!(event.layer.as_str(), "desktop" | "engine" | "native")
+        && event.correlation_id == correlation_id
+        && event.sequence > 0
+        && event.timestamp.ends_with('Z')
+        && !event.component.trim().is_empty()
+        && !event.event.trim().is_empty()
+        && !event.message.trim().is_empty()
+}
+
+fn push_trace(
+    trace: &Arc<Mutex<Vec<RuntimeLogEvent>>>,
+    event: RuntimeLogEvent,
+    trace_limit: usize,
+) {
+    if let Ok(mut events) = trace.lock() {
+        if events.len() < trace_limit {
+            events.push(event);
+        }
+    }
+}
+
+fn is_uuid_v7(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes[8] == b'-'
+        && bytes[13] == b'-'
+        && bytes[14] == b'7'
+        && bytes[18] == b'-'
+        && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+        && bytes[23] == b'-'
+        && bytes
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| matches!(index, 8 | 13 | 18 | 23) || byte.is_ascii_hexdigit())
 }
 
 fn terminate_child(child: &mut Child) {
@@ -537,10 +676,20 @@ mod tests {
         assert_eq!(engine.health().engine_version, "0.1.0");
         assert!(engine.health().healthy);
         assert!(engine.is_running().expect("engine process state"));
-        assert!(engine.stderr_tail().is_empty());
         engine
             .shutdown()
             .expect("engine should stop after stdin closes");
+        assert!(engine.stderr_tail().is_empty());
+        let trace = engine.trace();
+        assert_eq!(trace.len(), 4);
+        assert_eq!(
+            trace.iter().map(|event| event.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert!(trace.iter().all(|event| event.correlation_id == REQUEST_ID));
+        assert_eq!(trace[0].layer, "native");
+        assert_eq!(trace[1].layer, "engine");
+        assert_eq!(trace[3].event, "native.handshake.completed");
     }
 
     #[test]
@@ -577,6 +726,17 @@ mod tests {
         assert!(matches!(
             validate_response(&config, response),
             Err(EngineHostError::PythonVersionMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_correlation_before_process_start() {
+        let mut config = test_config();
+        config.request_id = "00000000-0000-4000-8000-000000000007".to_owned();
+
+        assert!(matches!(
+            EngineHost::new(config).start(),
+            Err(EngineHostError::InvalidConfiguration(_))
         ));
     }
 

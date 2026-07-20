@@ -80,6 +80,9 @@ importers:
       '@tauri-apps/api':
         specifier: 'catalog:'
         version: 2.11.1
+      '@teratai/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
       lucide-react:
         specifier: 'catalog:'
         version: 1.25.0(react@19.2.7)

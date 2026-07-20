@@ -43,3 +43,7 @@ Enum, union, nested object, references, maps, dan runtime validation belum diduk
 - Generated output harus diregenerasi dan contract tests tiga bahasa harus lulus pada setiap perubahan schema.
 
 Crate `teratai-contracts` di `packages/contracts/rust` menjadi dependency bersama bagi runtime Rust. Generated contract tidak ditempatkan di consumer tertentu agar `app-core` dan `engine-host` tidak membentuk dependency cycle.
+
+## Runtime log safety
+
+`RuntimeLogEvent` adalah kontrak trace lintas desktop, native, dan engine. Event hanya membawa metadata operasional yang terdefinisi, UUID v7 correlation ID, dan sequence positif. Source row, nilai dataset, secret, credential, absolute path, serta arbitrary context map dilarang agar observability tidak menjadi jalur kebocoran data.

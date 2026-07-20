@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/runtime/runtime-log-event.schema.json",
+  "title": "RuntimeLogEvent",
+  "description": "Safe structured runtime log shared by desktop, native host, and Python engine layers.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "timestamp",
+    "level",
+    "layer",
+    "component",
+    "event",
+    "message",
+    "correlation_id",
+    "sequence"
+  ],
+  "properties": {
+    "timestamp": {
+      "description": "ISO-8601 UTC timestamp ending in Z.",
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T.*Z$"
+    },
+    "level": {
+      "description": "Severity name: DEBUG, INFO, WARNING, or ERROR.",
+      "type": "string"
+    },
+    "layer": {
+      "description": "Runtime boundary that emitted the event: desktop, native, or engine.",
+      "type": "string"
+    },
+    "component": {
+      "description": "Stable component identifier without machine-specific paths.",
+      "type": "string"
+    },
+    "event": {
+      "description": "Stable dot-separated event identifier.",
+      "type": "string"
+    },
+    "message": {
+      "description": "User-safe diagnostic that excludes source data and secrets.",
+      "type": "string"
+    },
+    "correlation_id": {
+      "description": "UUID v7 joining events for one end-to-end operation.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+    },
+    "sequence": {
+      "description": "Monotonic sequence within the correlated runtime exchange.",
+      "type": "integer",
+      "minimum": 1
+    }
+  }
+}

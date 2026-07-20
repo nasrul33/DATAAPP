@@ -226,7 +226,7 @@ function EmptyDashboard() {
           <dl className="mt-6 space-y-5">
             <StatusRow label="Desktop shell" status="Siap" tone="ready" />
             <StatusRow label="Ruang kerja" status="Belum dipilih" tone="neutral" />
-            <StatusRow label="Analytics engine" status="Menunggu T-0006" tone="neutral" />
+            <StatusRow label="Engine integration" status="Belum diaktifkan" tone="neutral" />
           </dl>
           <div className="mt-6 border-t border-stone-200 pt-5">
             <p className="text-xs font-bold uppercase tracking-[0.14em] text-stone-500">Aktivitas terbaru</p>

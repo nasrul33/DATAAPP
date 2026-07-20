@@ -16,6 +16,7 @@
 - Generator revision 1 supports the bounded subset documented in `packages/contracts/README.md`; unsupported constructs fail generation.
 - T-0004 adds `ContractMetadata` as a generation/serialization proof.
 - T-0006 adds canonical engine handshake request/response and typed engine error schemas. Runtime messages use bounded newline-delimited JSON over controlled process stdio.
+- T-0007 adds `RuntimeLogEvent` as the canonical structured runtime trace shared by TypeScript, Rust, and Python.
 
 ## Engine startup handshake
 
@@ -28,6 +29,14 @@ The native host launches the configured Python 3.12 executable with an explicit 
 - `ready` health state and the `health` capability.
 
 The sidecar remains alive after a successful handshake and exits normally when the host closes stdin. Startup timeout and shutdown timeout are mandatory; shutdown falls back to process termination without modifying project data.
+
+## Runtime trace contract
+
+Every runtime event contains an ISO-8601 UTC timestamp, `DEBUG|INFO|WARNING|ERROR` level, `desktop|native|engine` layer, component, stable event name, safe message, UUID v7 `correlation_id`, and positive sequence number. Sequence is the deterministic cross-layer ordering key; wall-clock timestamps are diagnostic metadata only.
+
+The desktop starts a trace, the native host validates correlation and collects a bounded in-memory trace, and the engine emits structured events on stderr. Engine stdout remains reserved for bounded IPC protocol messages. Invalid or unstructured stderr is isolated as bounded diagnostics and is never promoted into the canonical trace.
+
+Runtime messages must not contain source rows, dataset values, secrets, credentials, or absolute filesystem paths. New metadata fields require schema review before use; arbitrary context maps are intentionally unsupported.
 
 ## Command envelope
 ```json

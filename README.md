@@ -7,7 +7,7 @@ Target utama: Windows, Tauri 2.x, Python 3.12
 
 ## Prasyarat
 
-Toolchain yang telah diverifikasi untuk T-0001 sampai T-0005:
+Toolchain yang telah diverifikasi untuk T-0001 sampai T-0007:
 
 - Node.js 24.17.0 atau kompatibel dengan `>=24.0.0`.
 - pnpm 11.9.0.
@@ -134,6 +134,20 @@ uv run pytest engine/tests/test_sidecar_handshake.py
 
 Sidecar menggunakan newline-delimited JSON maksimal 64 KiB per lifecycle message. Proses tetap hidup setelah handshake dan berhenti secara graceful ketika stdin ditutup; forced termination hanya digunakan setelah shutdown timeout.
 
+## Runtime logging dan correlation ID
+
+T-0007 menyediakan event log terstruktur yang sama untuk layer desktop, native, dan engine. Setiap trace menggunakan UUID v7, sequence positif, timestamp UTC, dan metadata aman. Python menulis log ke stderr agar stdout tetap eksklusif untuk protokol IPC; Rust memvalidasi dan menyimpan trace in-memory dengan batas yang dapat dikonfigurasi.
+
+Verifikasi trace lintas layer:
+
+```powershell
+pnpm test:unit
+cargo test -p teratai-engine-host --locked
+uv run pytest engine/tests/test_runtime_logging.py engine/tests/test_sidecar_handshake.py
+```
+
+Log tidak boleh memuat source row, nilai dataset, secret, credential, atau absolute path. Persistensi audit/log dan integrasi command Tauri belum diaktifkan pada tahap ini.
+
 ## Prinsip produk
 
 - Desktop-first, offline-first, dan local data ownership.
@@ -187,6 +201,6 @@ tests/golden              Analytics golden test boundary
 
 ## Batas implementasi saat ini
 
-T-0001 sampai T-0004 membentuk fondasi dan kontrak lintas bahasa. T-0005 menambahkan desktop shell Tauri/React. T-0006 menambahkan lifecycle handshake Rust-Python tanpa operasi analitik, job runtime, persistence, atau command produk. Dependency runtime desktop tetap dibatasi pada React, Tauri API, dan Lucide; sidecar Python tetap dependency-free.
+T-0001 sampai T-0004 membentuk fondasi dan kontrak lintas bahasa. T-0005 menambahkan desktop shell Tauri/React. T-0006 menambahkan lifecycle handshake Rust-Python. T-0007 menambahkan trace terstruktur dan correlation ID lintas runtime tanpa operasi analitik, job runtime, persistence, atau command produk. Dependency runtime desktop tetap dibatasi pada workspace contracts, React, Tauri API, dan Lucide; sidecar Python tetap dependency-free.
 
 MVP berakhir ketika pengguna dapat mengimpor Excel/CSV, melakukan profiling, cleaning, transformasi, join, deteksi duplikasi/outlier/rule, melihat visualisasi, menyimpan workflow, menjalankannya ulang, dan mengekspor hasil beserta audit trail.

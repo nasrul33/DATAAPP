@@ -66,6 +66,7 @@ Codex must read AGENTS, Product, Architecture, Primitives, IPC Contracts, curren
 | T-0004 | Completed | 2026-07-19 | one canonical JSON Schema deterministically generates and round-trips TypeScript, Python, and Rust types |
 | T-0005 | Completed | 2026-07-20 | Tauri 2.x opens a tested React/Vite dashboard shell with explicit loading, error, and empty states |
 | T-0006 | Completed | 2026-07-20 | Rust launches and supervises the Python 3.12 sidecar while verifying protocol, version, correlation, health, timeout, and typed failures |
+| T-0007 | Completed | 2026-07-20 | Canonical structured emitters cover desktop, native, and engine layers; the supervised Rust-Python trace preserves one UUID v7 correlation with deterministic sequence and bounded capture |
 
 ## T-0001 decisions and deviations
 | ID | Decision/deviation | Reason | Follow-up |
@@ -131,3 +132,14 @@ T-0005 introduces only the navigational/dashboard shell. Project creation, files
 | DEC-F029 | Keep the sidecar alive after handshake and use stdin EOF for graceful shutdown with a bounded forced-termination fallback | Establishes a supervised process lifecycle without inventing a product command or risking an orphan process | Later engine commands reuse the supervised process and canonical envelopes |
 
 T-0006 adds only lifecycle handshake and typed startup failure behavior. It does not expose a Tauri command, execute analytics, access project files, create jobs, or persist metadata.
+
+## T-0007 decisions and deviations
+| ID | Decision/deviation | Reason | Follow-up |
+|---|---|---|---|
+| DEC-F030 | Define one flat, additive `RuntimeLogEvent` schema for TypeScript, Rust, and Python | Keep cross-layer observability deterministic and prevent consumer-specific event drift | Extend the canonical schema before adding runtime metadata; do not introduce arbitrary context maps |
+| DEC-F031 | Generate UUID v7 correlation IDs without a new TypeScript dependency and validate them at Rust/Python boundaries | Preserve time-sortable request identity while minimizing supply-chain surface | Future commands must propagate the initiating correlation ID instead of generating an unrelated child ID |
+| DEC-F032 | Reserve engine stdout for IPC and emit structured runtime events on stderr | Prevent logs from corrupting newline-delimited protocol framing | Future engine commands must retain the stdout/stderr separation |
+| DEC-F033 | Keep a configurable bounded in-memory trace ordered by sequence and isolate invalid stderr as bounded diagnostics | Avoid unbounded memory growth and prevent malformed messages from entering trusted trace data | Persistent audit/log storage belongs to its owning metadata/audit task |
+| DEC-F034 | Enable the `formatting` feature on pinned `time` 0.3.53 already present transitively | Native UTC RFC 3339 formatting is required; no additional resolved Rust package is introduced | Reassess the direct dependency during dedicated dependency maintenance |
+
+T-0007 adds observability only. It does not persist logs, record user/source data, expose an engine Tauri command, execute analytics, create jobs, or enable telemetry.

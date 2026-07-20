@@ -9,6 +9,7 @@ const generatedContracts = [
   ["engine-error", "engine_error", "EngineError"],
   ["engine-handshake-request", "engine_handshake_request", "EngineHandshakeRequest"],
   ["engine-handshake-response", "engine_handshake_response", "EngineHandshakeResponse"],
+  ["runtime-log-event", "runtime_log_event", "RuntimeLogEvent"],
 ];
 
 test("canonical schemas generate deterministically into three languages", async () => {
