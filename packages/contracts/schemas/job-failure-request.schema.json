@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/job/job-failure-request.schema.json",
+  "title": "JobFailureRequest",
+  "description": "Safe flat failure update for one persistent background job.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "job_id",
+    "correlation_id",
+    "expected_revision",
+    "error_code",
+    "error_message",
+    "error_retriable"
+  ],
+  "properties": {
+    "job_id": { "description": "UUID v7 identity of the job to fail.", "type": "string" },
+    "correlation_id": { "description": "UUID v7 trace identity for the atomic failure mutation.", "type": "string" },
+    "expected_revision": { "description": "Revision required to prevent a lost concurrent update.", "type": "integer" },
+    "error_code": { "description": "Stable safe failure code.", "type": "string" },
+    "error_message": { "description": "Safe actionable failure message without raw errors.", "type": "string" },
+    "error_retriable": { "description": "Whether retrying the failed job is safe and permitted.", "type": "boolean" }
+  }
+}

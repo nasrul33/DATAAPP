@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/job/job-descriptor.schema.json",
+  "title": "JobDescriptor",
+  "description": "Persistent, safe summary of a background job without source rows or local paths.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "job_id",
+    "project_id",
+    "kind",
+    "status",
+    "correlation_id",
+    "revision",
+    "created_at",
+    "updated_at",
+    "progress_current"
+  ],
+  "properties": {
+    "job_id": { "description": "UUID v7 immutable job identity.", "type": "string" },
+    "project_id": { "description": "UUID v7 project identity that owns the job.", "type": "string" },
+    "kind": { "description": "Stable job kind identifier.", "type": "string" },
+    "status": { "description": "Current lifecycle status such as QUEUED or RUNNING.", "type": "string" },
+    "correlation_id": { "description": "UUID v7 trace identity for the job mutation.", "type": "string" },
+    "revision": { "description": "Positive optimistic-concurrency revision.", "type": "integer" },
+    "created_at": { "description": "ISO-8601 UTC timestamp when the job was created.", "type": "string" },
+    "updated_at": { "description": "ISO-8601 UTC timestamp of the latest job change.", "type": "string" },
+    "progress_current": { "description": "Completed progress amount.", "type": "integer" },
+    "started_at": { "description": "ISO-8601 UTC timestamp when execution started.", "type": "string" },
+    "finished_at": { "description": "ISO-8601 UTC timestamp when execution finished.", "type": "string" },
+    "progress_total": { "description": "Known total progress amount.", "type": "integer" },
+    "progress_unit": { "description": "Safe progress measurement unit.", "type": "string" },
+    "progress_phase": { "description": "Stable safe execution phase identifier.", "type": "string" },
+    "progress_message": { "description": "Safe Indonesian progress message without source data.", "type": "string" },
+    "error_code": { "description": "Stable safe failure code.", "type": "string" },
+    "error_message": { "description": "Safe actionable failure message without raw errors.", "type": "string" },
+    "error_retriable": { "description": "Whether retrying the job is safe and permitted.", "type": "boolean" }
+  }
+}

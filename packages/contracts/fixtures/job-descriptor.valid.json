@@ -1,0 +1,13 @@
+{
+  "correlation_id": "00000000-0000-7000-8000-000000000211",
+  "created_at": "2026-07-20T12:00:00Z",
+  "job_id": "00000000-0000-7000-8000-000000000211",
+  "kind": "system.mock_long",
+  "progress_current": 0,
+  "progress_total": 100,
+  "progress_unit": "step",
+  "project_id": "00000000-0000-7000-8000-000000000210",
+  "revision": 1,
+  "status": "QUEUED",
+  "updated_at": "2026-07-20T12:00:00Z"
+}

@@ -1,0 +1,7 @@
+{
+  "correlation_id": "00000000-0000-7000-8000-000000000212",
+  "job_id": "00000000-0000-7000-8000-000000000212",
+  "kind": "system.mock_long",
+  "progress_total": 100,
+  "progress_unit": "step"
+}

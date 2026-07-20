@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/job/job-progress-update-request.schema.json",
+  "title": "JobProgressUpdateRequest",
+  "description": "Safe flat progress update for one persistent background job.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["job_id", "correlation_id", "expected_revision", "current", "phase", "message"],
+  "properties": {
+    "job_id": { "description": "UUID v7 identity of the job to update.", "type": "string" },
+    "correlation_id": { "description": "UUID v7 trace identity for the atomic progress mutation.", "type": "string" },
+    "expected_revision": { "description": "Revision required to prevent a lost concurrent update.", "type": "integer" },
+    "current": { "description": "Completed progress amount after the update.", "type": "integer" },
+    "phase": { "description": "Stable safe execution phase identifier.", "type": "string" },
+    "message": { "description": "Safe Indonesian progress message without source data.", "type": "string" },
+    "total": { "description": "Optional known total progress amount.", "type": "integer" },
+    "unit": { "description": "Optional safe progress measurement unit.", "type": "string" }
+  }
+}
