@@ -1,5 +1,9 @@
 #![doc = "Safe local filesystem capability boundary."]
 
+mod project_upgrade;
+
+pub use project_upgrade::{begin_project_upgrade, ProjectUpgrade};
+
 use std::ffi::OsStr;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -248,6 +252,21 @@ pub fn validate_project_layout(root: &Path) -> Result<ProjectLayout, FilesystemE
     let marker = canonical_root.join(RECOVERY_MARKER_FILE);
     if marker.exists() {
         return Err(FilesystemError::RecoveryRequired(marker));
+    }
+    for recovery_artifact in [
+        canonical_root.join(project_upgrade::UPGRADE_MARKER_FILE),
+        canonical_root
+            .join("recovery")
+            .join(project_upgrade::METADATA_BACKUP_FILE),
+        canonical_root
+            .join("recovery")
+            .join(project_upgrade::MANIFEST_BACKUP_FILE),
+    ] {
+        match fs::symlink_metadata(&recovery_artifact) {
+            Ok(_) => return Err(FilesystemError::RecoveryRequired(recovery_artifact)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(FilesystemError::Io(error)),
+        }
     }
     for directory in REQUIRED_PROJECT_DIRECTORIES {
         let entry = canonical_root.join(directory);
