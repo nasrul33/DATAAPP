@@ -1,5 +1,7 @@
 #![doc = "Application orchestration boundary for Teratai Analytics Desktop."]
 
+pub mod job;
+
 use std::fmt::{self, Display, Formatter};
 use std::path::Path;
 
