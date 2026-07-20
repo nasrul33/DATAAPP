@@ -1,0 +1,10 @@
+{
+  "code": "ENGINE_UNAVAILABLE",
+  "message": "Versi protokol engine tidak kompatibel.",
+  "detail": "expected protocol 1.0, received 2.0",
+  "retriable": false,
+  "correlation_id": "00000000-0000-7000-8000-000000000006",
+  "field_errors": [
+    "protocol_version tidak didukung"
+  ]
+}

@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/engine/engine-handshake-response.schema.json",
+  "title": "EngineHandshakeResponse",
+  "description": "Engine identity and health returned after a successful startup handshake.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "protocol_version",
+    "request_id",
+    "engine_version",
+    "python_version",
+    "status",
+    "healthy",
+    "capabilities"
+  ],
+  "properties": {
+    "protocol_version": {
+      "description": "Major and minor protocol version implemented by the engine.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$"
+    },
+    "request_id": {
+      "description": "Request identifier copied from the handshake request.",
+      "type": "string",
+      "minLength": 1
+    },
+    "engine_version": {
+      "description": "Semantic version of the Python analytics engine.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "python_version": {
+      "description": "Major, minor, and patch version of the active Python runtime.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "status": {
+      "description": "User-safe lifecycle status; a healthy engine reports ready.",
+      "type": "string",
+      "minLength": 1
+    },
+    "healthy": {
+      "description": "True only after all startup health checks complete.",
+      "type": "boolean"
+    },
+    "capabilities": {
+      "description": "Stable capability identifiers available in this engine process.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}

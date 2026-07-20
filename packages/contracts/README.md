@@ -17,7 +17,7 @@ pnpm contracts:check
 |---|---|
 | TypeScript | `packages/contracts/src/generated` |
 | Python | `engine/teratai_engine/generated` |
-| Rust | `crates/app-core/src/generated` |
+| Rust | `packages/contracts/rust/src/generated` |
 
 Setiap file generated menyimpan path schema dan SHA-256 dari bytes canonical schema. Generator tidak menambahkan timestamp agar output sama pada setiap mesin.
 
@@ -41,3 +41,5 @@ Enum, union, nested object, references, maps, dan runtime validation belum diduk
 - Required field baru, rename, type change, atau field removal: breaking; naikkan protocol major dan sediakan migration/versioned decoder.
 - `schema_version` menggunakan semantic version.
 - Generated output harus diregenerasi dan contract tests tiga bahasa harus lulus pada setiap perubahan schema.
+
+Crate `teratai-contracts` di `packages/contracts/rust` menjadi dependency bersama bagi runtime Rust. Generated contract tidak ditempatkan di consumer tertentu agar `app-core` dan `engine-host` tidak membentuk dependency cycle.

@@ -4,11 +4,30 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "tsc -p tsconfig.json",
+    "build": "pnpm typecheck && vite build",
+    "desktop:build": "tauri build",
+    "desktop:dev": "tauri dev",
+    "dev": "vite",
+    "preview": "vite preview",
+    "tauri": "tauri",
     "typecheck": "tsc --noEmit -p tsconfig.json"
   },
+  "dependencies": {
+    "@tauri-apps/api": "catalog:",
+    "lucide-react": "catalog:",
+    "react": "catalog:",
+    "react-dom": "catalog:"
+  },
   "devDependencies": {
-    "typescript": "catalog:"
+    "@tailwindcss/vite": "catalog:",
+    "@tauri-apps/cli": "catalog:",
+    "@types/node": "catalog:",
+    "@types/react": "catalog:",
+    "@types/react-dom": "catalog:",
+    "@vitejs/plugin-react": "catalog:",
+    "tailwindcss": "catalog:",
+    "typescript": "catalog:",
+    "vite": "catalog:"
   },
   "teratai": {
     "tauriTarget": "2.x"

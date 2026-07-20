@@ -1,12 +1,15 @@
 {
   "extends": "./packages/config/tsconfig.base.json",
   "compilerOptions": {
+    "jsx": "react-jsx",
     "noEmit": true,
     "types": ["vitest/globals"]
   },
   "include": [
     "apps/*/tests/**/*.ts",
+    "apps/*/tests/**/*.tsx",
     "packages/*/tests/**/*.ts",
+    "packages/*/tests/**/*.tsx",
     "vitest.config.ts"
   ]
 }

@@ -7,3 +7,7 @@ license.workspace = true
 
 [lints]
 workspace = true
+
+[dependencies]
+serde_json.workspace = true
+teratai-contracts.workspace = true

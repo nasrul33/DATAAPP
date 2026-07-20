@@ -1,0 +1,11 @@
+{
+  "protocol_version": "1.0",
+  "request_id": "00000000-0000-7000-8000-000000000006",
+  "engine_version": "0.1.0",
+  "python_version": "3.12.6",
+  "status": "ready",
+  "healthy": true,
+  "capabilities": [
+    "health"
+  ]
+}

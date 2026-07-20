@@ -1,9 +1,11 @@
 [workspace]
 members = [
+    "apps/desktop/src-tauri",
     "crates/app-core",
     "crates/engine-host",
     "crates/filesystem",
     "crates/secure-store",
+    "packages/contracts/rust",
 ]
 resolver = "2"
 
@@ -26,3 +28,6 @@ tauri-version = "2.x"
 [workspace.dependencies]
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.145"
+teratai-contracts = { path = "packages/contracts/rust" }
+tauri = "=2.11.2"
+tauri-build = "=2.6.2"

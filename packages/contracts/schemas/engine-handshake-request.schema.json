@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/engine/engine-handshake-request.schema.json",
+  "title": "EngineHandshakeRequest",
+  "description": "Initial host request used to verify the Python engine protocol before accepting work.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "protocol_version",
+    "request_id",
+    "command",
+    "host_version"
+  ],
+  "properties": {
+    "protocol_version": {
+      "description": "Major and minor engine protocol version expected by the host.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+$"
+    },
+    "request_id": {
+      "description": "Caller-generated identifier echoed by the engine for correlation.",
+      "type": "string",
+      "minLength": 1
+    },
+    "command": {
+      "description": "Lifecycle command name; the handshake value is engine.handshake.",
+      "type": "string",
+      "minLength": 1
+    },
+    "host_version": {
+      "description": "Semantic version of the native engine host.",
+      "type": "string",
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    }
+  }
+}

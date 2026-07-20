@@ -14,7 +14,20 @@
 - Run `pnpm contracts:check` to detect missing or stale TypeScript, Python, or Rust output.
 - Generated files include a canonical schema SHA-256 and must never be edited manually.
 - Generator revision 1 supports the bounded subset documented in `packages/contracts/README.md`; unsupported constructs fail generation.
-- T-0004 adds `ContractMetadata` as a generation/serialization proof only. It does not add an IPC command or event.
+- T-0004 adds `ContractMetadata` as a generation/serialization proof.
+- T-0006 adds canonical engine handshake request/response and typed engine error schemas. Runtime messages use bounded newline-delimited JSON over controlled process stdio.
+
+## Engine startup handshake
+
+The native host launches the configured Python 3.12 executable with an explicit engine module root, sends `engine.handshake`, and verifies:
+
+- request correlation;
+- protocol version `1.0`;
+- engine package version;
+- Python `3.12.x` runtime;
+- `ready` health state and the `health` capability.
+
+The sidecar remains alive after a successful handshake and exits normally when the host closes stdin. Startup timeout and shutdown timeout are mandatory; shutdown falls back to process termination without modifying project data.
 
 ## Command envelope
 ```json

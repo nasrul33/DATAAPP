@@ -9,6 +9,9 @@ export function createTerataiEslintConfig(rootDirectory) {
     {
       ignores: [
         "**/.venv/**",
+        "**/.mypy_cache/**",
+        "**/.pytest_cache/**",
+        "**/.ruff_cache/**",
         "**/coverage/**",
         "**/dist/**",
         "**/node_modules/**",

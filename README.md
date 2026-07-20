@@ -7,13 +7,14 @@ Target utama: Windows, Tauri 2.x, Python 3.12
 
 ## Prasyarat
 
-Toolchain yang telah diverifikasi untuk T-0001 sampai T-0003:
+Toolchain yang telah diverifikasi untuk T-0001 sampai T-0005:
 
 - Node.js 24.17.0 atau kompatibel dengan `>=24.0.0`.
 - pnpm 11.9.0.
 - Rust stable dengan Cargo dan komponen `rustfmt` serta `clippy` (diverifikasi pada Rust 1.97.1).
 - uv 0.11.29 atau lebih baru yang kompatibel.
 - Python 3.12; uv akan memilih atau menyiapkan interpreter yang sesuai.
+- Microsoft Edge WebView2 Runtime dan Microsoft C++ Build Tools untuk menjalankan/build target Tauri di Windows.
 
 Versi CI dikunci melalui `.node-version`, `.python-version`, `rust-toolchain.toml`, field `packageManager`, dan `tool.uv.required-version`. Perubahan versi harus dilakukan secara eksplisit dan diverifikasi dengan seluruh quality gate.
 
@@ -28,6 +29,29 @@ uv sync --frozen
 ```
 
 Perintah tersebut telah diverifikasi pada Windows 11 dengan Python 3.12.6. Lockfile `pnpm-lock.yaml`, `Cargo.lock`, dan `uv.lock` harus ikut disimpan agar resolusi workspace konsisten.
+
+## Menjalankan desktop shell
+
+Jalankan UI di browser untuk pengembangan frontend:
+
+```powershell
+pnpm --dir apps/desktop dev
+```
+
+Jalankan aplikasi native Tauri 2.x:
+
+```powershell
+pnpm --dir apps/desktop desktop:dev
+```
+
+Build frontend atau executable desktop secara eksplisit:
+
+```powershell
+pnpm --filter @teratai/desktop build
+pnpm --dir apps/desktop desktop:build
+```
+
+Dashboard shell saat ini sengaja menampilkan empty state. Pembuatan proyek, dataset, workflow, temuan, dan ekspor tetap nonaktif sampai task pemilik fiturnya diimplementasikan.
 
 ## Quality gates
 
@@ -97,6 +121,19 @@ pnpm test
 
 Generator dependency-free menghasilkan TypeScript, Python, dan Rust dari source yang sama. CI menolak generated output yang hilang atau stale. Detail supported subset dan compatibility rules tersedia di `packages/contracts/README.md`.
 
+## Engine sidecar handshake
+
+T-0006 menyediakan host Rust yang meluncurkan Python 3.12 melalui executable dan module root yang diberikan secara eksplisit. Host memverifikasi protocol `1.0`, engine version, Python version, health, capability, correlation ID, timeout, dan typed error envelope.
+
+Verifikasi handshake terisolasi:
+
+```powershell
+cargo test -p teratai-engine-host --locked
+uv run pytest engine/tests/test_sidecar_handshake.py
+```
+
+Sidecar menggunakan newline-delimited JSON maksimal 64 KiB per lifecycle message. Proses tetap hidup setelah handshake dan berhenti secara graceful ketika stdin ditutup; forced termination hanya digunakan setelah shutdown timeout.
+
 ## Prinsip produk
 
 - Desktop-first, offline-first, dan local data ownership.
@@ -121,7 +158,7 @@ Generator dependency-free menghasilkan TypeScript, Python, dan Rust dari source 
 ## Struktur workspace
 
 ```text
-apps/desktop              TypeScript desktop boundary; shell Tauri dibuat pada T-0005
+apps/desktop              Tauri 2.x + React/Vite desktop shell
 crates/app-core           Rust application orchestration boundary
 crates/filesystem         Rust safe filesystem boundary
 crates/engine-host        Rust Python sidecar lifecycle/IPC boundary
@@ -148,8 +185,8 @@ tests/golden              Analytics golden test boundary
 8. `skills/SKILLS.md`
 9. `docs/CONTEXT_PACK.md`
 
-## Batas fondasi
+## Batas implementasi saat ini
 
-T-0001 sampai T-0004 tidak mengimplementasikan product feature, React UI, Tauri shell, analytics runtime, IPC runtime, atau persistence. Dependency yang ditambahkan hanya TypeScript, quality tooling, dan serde untuk generated Rust contract serialization; product dependency tetap masuk melalui task pemiliknya.
+T-0001 sampai T-0004 membentuk fondasi dan kontrak lintas bahasa. T-0005 menambahkan desktop shell Tauri/React. T-0006 menambahkan lifecycle handshake Rust-Python tanpa operasi analitik, job runtime, persistence, atau command produk. Dependency runtime desktop tetap dibatasi pada React, Tauri API, dan Lucide; sidecar Python tetap dependency-free.
 
 MVP berakhir ketika pengguna dapat mengimpor Excel/CSV, melakukan profiling, cleaning, transformasi, join, deteksi duplikasi/outlier/rule, melihat visualisasi, menyimpan workflow, menjalankannya ulang, dan mengekspor hasil beserta audit trail.

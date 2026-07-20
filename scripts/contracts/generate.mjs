@@ -24,7 +24,7 @@ const outputDefinitions = [
   {
     extension: ".rs",
     language: "rust",
-    outputDirectory: join(repositoryRoot, "crates", "app-core", "src", "generated"),
+    outputDirectory: join(repositoryRoot, "packages", "contracts", "rust", "src", "generated"),
   },
 ];
 
@@ -250,6 +250,7 @@ async function main() {
   assertCondition(schemaFileNames.length > 0, "No canonical contract schemas were found.");
 
   const driftedFiles = [];
+  const generatedModules = [];
   for (const schemaFileName of schemaFileNames) {
     const schemaPath = join(schemaDirectory, schemaFileName);
     const schemaSource = await readFile(schemaPath, "utf8");
@@ -257,6 +258,7 @@ async function main() {
     validateSchema(schema, schemaPath);
     const sourcePath = relative(repositoryRoot, schemaPath).replaceAll("\\", "/");
     const fingerprint = createHash("sha256").update(schemaSource).digest("hex");
+    generatedModules.push(snakeCaseFileName(schemaPath));
 
     for (const outputDefinition of outputDefinitions) {
       const outputName = outputDefinition.language === "typescript"
@@ -275,6 +277,23 @@ async function main() {
       await mkdir(dirname(outputPath), { recursive: true });
       await writeFile(outputPath, expected, "utf8");
       log(`Generated ${relative(repositoryRoot, outputPath)}`);
+    }
+  }
+
+  const rustModulePath = join(repositoryRoot, "packages", "contracts", "rust", "src", "generated", "mod.rs");
+  const expectedRustModules = [
+    "//! Types generated from canonical cross-language contract schemas.",
+    "",
+    ...generatedModules.map((moduleName) => `pub mod ${moduleName};`),
+    "",
+  ].join("\n");
+  const existingRustModules = await readExisting(rustModulePath);
+  if (existingRustModules !== expectedRustModules) {
+    if (checkMode) driftedFiles.push(relative(repositoryRoot, rustModulePath).replaceAll("\\", "/"));
+    else {
+      await mkdir(dirname(rustModulePath), { recursive: true });
+      await writeFile(rustModulePath, expectedRustModules, "utf8");
+      log(`Generated ${relative(repositoryRoot, rustModulePath)}`);
     }
   }
 

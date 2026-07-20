@@ -64,6 +64,8 @@ Codex must read AGENTS, Product, Architecture, Primitives, IPC Contracts, curren
 | T-0002 | Completed | 2026-07-19 | strict ESLint/TypeScript, Ruff/mypy/Pytest, Clippy, Vitest, and aggregate root gates pass |
 | T-0003 | Completed | 2026-07-19 | hardened Windows GitHub Actions workflow runs frozen install, lint, typecheck, test, and build gates |
 | T-0004 | Completed | 2026-07-19 | one canonical JSON Schema deterministically generates and round-trips TypeScript, Python, and Rust types |
+| T-0005 | Completed | 2026-07-20 | Tauri 2.x opens a tested React/Vite dashboard shell with explicit loading, error, and empty states |
+| T-0006 | Completed | 2026-07-20 | Rust launches and supervises the Python 3.12 sidecar while verifying protocol, version, correlation, health, timeout, and typed failures |
 
 ## T-0001 decisions and deviations
 | ID | Decision/deviation | Reason | Follow-up |
@@ -107,3 +109,25 @@ T-0003 adds no deployment, release, migration, secret, or product-runtime behavi
 | DEC-F019 | Explicitly require additive-field compatibility in canonical schemas | Preserves the confirmed IPC rule that unknown additive fields are tolerated | Breaking changes require protocol major versioning and a migration/versioned decoder |
 
 T-0004 adds only the `ContractMetadata` generation proof. No command, event, job, error code, or product behavior was introduced.
+
+## T-0005 decisions and deviations
+| ID | Decision/deviation | Reason | Follow-up |
+|---|---|---|---|
+| DEC-F020 | Pin the desktop runtime to Tauri 2.11.2 with an explicit main-window capability and restrictive CSP | Establish a deterministic, least-privilege native shell without pre-authorizing product APIs | Add plugin permissions only in the task that owns each native capability |
+| DEC-F021 | Use React 19.2.7, Vite 8.1.5, Tailwind CSS 4.3.3, and Lucide as the complete T-0005 UI dependency set | Deliver the approved shell while avoiding state, query, grid, chart, and analytics dependencies before their owning features | Re-evaluate dependencies per feature task; do not preload the target stack |
+| DEC-F022 | Render explicit loading, recoverable error, and empty dashboard states while disabling all planned feature actions | Make shell behavior accessible and truthful without implementing project or analytics features | T-0100 owns enabling project creation; T-0006 owns the engine-ready state |
+| DEC-F023 | Generate and retain the standard Tauri icon set from one Teratai source asset | Windows resource compilation requires `icon.ico`, while the standard set keeps later packaging targets consistent | Installer branding and signing remain owned by the release task |
+| DEC-F024 | Default standalone frontend builds to the Windows Chromium target and select Safari only when Tauri reports macOS | The MVP is Windows-first and Vite 8 cannot downlevel the current bundle to Safari 13 in a host-agnostic standalone build | Re-verify platform targets when macOS packaging enters scope |
+
+T-0005 introduces only the navigational/dashboard shell. Project creation, filesystem access, analytics execution, persistence, IPC commands, and product data remain unimplemented.
+
+## T-0006 decisions and deviations
+| ID | Decision/deviation | Reason | Follow-up |
+|---|---|---|---|
+| DEC-F025 | Move generated Rust contracts into the shared `packages/contracts/rust` crate | Both `app-core` and `engine-host` consume canonical types; placing them in either consumer would create duplication or a future dependency cycle | All Rust runtime layers must depend on `teratai-contracts` instead of copying generated wire structs |
+| DEC-F026 | Use bounded newline-delimited JSON over child stdio for lifecycle messages | Provides deterministic framing without network ports or a transport dependency, while enforcing a 64 KiB startup-message limit | Large analytical payloads remain file/Arrow references; T-0006 framing is not permission for tabular JSON |
+| DEC-F027 | Inject the Python executable, engine module root, correlation ID, and timeouts through `EngineHostConfig` | Avoid hardcoded installation paths and make startup/shutdown behavior testable across packaged and development environments | Packaging task must resolve the bundled Python executable and engine root before constructing the host |
+| DEC-F028 | Verify protocol `1.0`, engine version, Python `3.12.x`, request correlation, `ready` health, and `health` capability before trusting the process | Prevent an incompatible or unhealthy sidecar from accepting analytical work | T-0007 adds correlation-aware runtime logging; job commands remain out of scope |
+| DEC-F029 | Keep the sidecar alive after handshake and use stdin EOF for graceful shutdown with a bounded forced-termination fallback | Establishes a supervised process lifecycle without inventing a product command or risking an orphan process | Later engine commands reuse the supervised process and canonical envelopes |
+
+T-0006 adds only lifecycle handshake and typed startup failure behavior. It does not expose a Tauri command, execute analytics, access project files, create jobs, or persist metadata.

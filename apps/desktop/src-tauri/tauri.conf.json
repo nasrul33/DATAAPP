@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Teratai Analytics",
+  "version": "0.1.0",
+  "identifier": "id.teratai.analytics",
+  "build": {
+    "beforeDevCommand": "pnpm dev",
+    "beforeBuildCommand": "pnpm build",
+    "devUrl": "http://localhost:1420",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Teratai Analytics",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 960,
+        "minHeight": 640,
+        "center": true,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "capabilities": ["main-capability"],
+      "csp": "default-src 'self'; img-src 'self' asset: http://asset.localhost; style-src 'self' 'unsafe-inline'; connect-src ipc: http://ipc.localhost",
+      "freezePrototype": true
+    }
+  },
+  "bundle": {
+    "active": false
+  }
+}

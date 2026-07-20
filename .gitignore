@@ -16,6 +16,7 @@ test-results/
 !.env.example
 
 target/
+apps/desktop/src-tauri/gen/
 
 .venv/
 __pycache__/

@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/engine/engine-error.schema.json",
+  "title": "EngineError",
+  "description": "Typed user-safe error returned by the Python engine protocol.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "code",
+    "message",
+    "detail",
+    "retriable",
+    "correlation_id",
+    "field_errors"
+  ],
+  "properties": {
+    "code": {
+      "description": "Stable machine-readable error taxonomy code.",
+      "type": "string",
+      "minLength": 1
+    },
+    "message": {
+      "description": "User-safe explanation suitable for the desktop UI.",
+      "type": "string",
+      "minLength": 1
+    },
+    "detail": {
+      "description": "Technical diagnostic without source data or secrets.",
+      "type": "string"
+    },
+    "retriable": {
+      "description": "Whether retrying the same request can be offered safely.",
+      "type": "boolean"
+    },
+    "correlation_id": {
+      "description": "Identifier joining the error to its originating request.",
+      "type": "string",
+      "minLength": 1
+    },
+    "field_errors": {
+      "description": "Bounded validation messages for invalid request fields.",
+      "type": "array",
+      "items": {
+        "type": "string"
+      }
+    }
+  }
+}
