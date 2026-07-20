@@ -261,6 +261,9 @@ pub fn validate_project_layout(root: &Path) -> Result<ProjectLayout, FilesystemE
         canonical_root
             .join("recovery")
             .join(project_upgrade::MANIFEST_BACKUP_FILE),
+        canonical_root
+            .join("recovery")
+            .join(project_upgrade::UPGRADE_LOCK_FILE),
     ] {
         match fs::symlink_metadata(&recovery_artifact) {
             Ok(_) => return Err(FilesystemError::RecoveryRequired(recovery_artifact)),

@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::{
@@ -7,8 +7,49 @@ use crate::{
 };
 
 pub(crate) const UPGRADE_MARKER_FILE: &str = ".project-upgrade-recovery.json";
+pub(crate) const UPGRADE_LOCK_FILE: &str = ".project-upgrade.lock";
 pub(crate) const METADATA_BACKUP_FILE: &str = "metadata-schema-1.sqlite.backup";
 pub(crate) const MANIFEST_BACKUP_FILE: &str = "manifest-schema-1.json.backup";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BeginStage {
+    BackupsCopied,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FinalizeStage {
+    CreateCleanupDirectory,
+    MoveMetadataBackup,
+    MoveManifestBackup,
+    MoveLock,
+    MoveMarker,
+    CleanupMetadataBackup,
+    CleanupManifestBackup,
+    CleanupLock,
+    CleanupMarker,
+    CleanupDirectory,
+}
+
+#[derive(Clone, Copy)]
+enum ProofFile {
+    MetadataBackup,
+    ManifestBackup,
+    Marker,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FileIdentity {
+    volume: u64,
+    file: u64,
+    length: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ContentProof {
+    length: u64,
+    digest_a: u64,
+    digest_b: u64,
+}
 
 /// A durable guard for an in-place project metadata upgrade.
 #[derive(Debug)]
@@ -17,8 +58,23 @@ pub struct ProjectUpgrade {
     marker_path: PathBuf,
     metadata_backup_path: PathBuf,
     manifest_backup_path: PathBuf,
+    metadata_backup_file: File,
+    manifest_backup_file: File,
+    metadata_backup_identity: FileIdentity,
+    manifest_backup_identity: FileIdentity,
+    metadata_backup_proof: ContentProof,
+    manifest_backup_proof: ContentProof,
+    lock_path: PathBuf,
+    lock_file: Option<File>,
+    lock_identity: FileIdentity,
+    root_directory: File,
+    root_identity: FileIdentity,
+    recovery_directory: File,
+    recovery_identity: FileIdentity,
     correlation_id: String,
+    cleanup_directory: Option<PathBuf>,
     committed: bool,
+    finalize_failure: Option<FinalizeStage>,
 }
 
 impl ProjectUpgrade {
@@ -29,8 +85,9 @@ impl ProjectUpgrade {
     /// Returns an error when the marker is missing, linked, non-regular, too
     /// large, or cannot be durably replaced.
     pub fn write_marker(&self, contents: &[u8]) -> Result<(), FilesystemError> {
-        ensure_regular_file(&self.marker_path, "upgrade recovery marker")?;
-        write_bounded_file(
+        self.validate_owned_state()?;
+        let _marker = open_verified_regular(&self.marker_path, "upgrade recovery marker", false)?;
+        durable_bounded_write(
             &self.marker_path,
             contents,
             MANIFEST_LIMIT_BYTES,
@@ -45,9 +102,10 @@ impl ProjectUpgrade {
     /// Returns an error when the manifest is linked, non-regular, too large,
     /// or cannot be durably replaced.
     pub fn write_manifest(&self, contents: &[u8]) -> Result<(), FilesystemError> {
+        self.validate_owned_state()?;
         let manifest_path = self.layout.manifest_path();
-        ensure_regular_file(&manifest_path, "project manifest")?;
-        write_bounded_file(
+        let _manifest = open_verified_regular(&manifest_path, "project manifest", false)?;
+        durable_bounded_write(
             &manifest_path,
             contents,
             MANIFEST_LIMIT_BYTES,
@@ -69,30 +127,35 @@ impl ProjectUpgrade {
         if self.committed {
             return Ok(());
         }
-        self.validate_recovery_artifacts()?;
+        self.validate_owned_state()?;
+        self.validate_backup_proofs()?;
 
         restore_regular_backup(
-            &self.metadata_backup_path,
+            &self.metadata_backup_file,
+            self.metadata_backup_proof.length,
             &self.layout.metadata_path(),
             &self.correlation_id,
         )?;
         restore_regular_backup(
-            &self.manifest_backup_path,
+            &self.manifest_backup_file,
+            self.manifest_backup_proof.length,
             &self.layout.manifest_path(),
             &self.correlation_id,
         )?;
 
-        if !files_equal(&self.metadata_backup_path, &self.layout.metadata_path())?
-            || !files_equal(&self.manifest_backup_path, &self.layout.manifest_path())?
+        let (metadata, _) =
+            open_verified_regular(&self.layout.metadata_path(), "restored metadata", false)?;
+        let (manifest, _) =
+            open_verified_regular(&self.layout.manifest_path(), "restored manifest", false)?;
+        if !files_equal(&self.metadata_backup_file, &metadata)?
+            || !files_equal(&self.manifest_backup_file, &manifest)?
         {
             return Err(FilesystemError::InvalidLayout(
                 "restored project control files could not be verified".to_owned(),
             ));
         }
 
-        self.remove_recovery_artifacts()?;
-        self.committed = true;
-        Ok(())
+        self.finalize_recovery_artifacts()
     }
 
     /// Commit an already-validated upgrade by clearing its recovery artifacts.
@@ -105,26 +168,193 @@ impl ProjectUpgrade {
     /// Returns an error when a control/recovery entry is unsafe or an artifact
     /// cannot be removed. Dropping the returned error path attempts restoration.
     pub fn commit(mut self) -> Result<(), FilesystemError> {
-        ensure_regular_file(&self.layout.metadata_path(), "project metadata")?;
-        ensure_regular_file(&self.layout.manifest_path(), "project manifest")?;
-        self.validate_recovery_artifacts()?;
-        self.remove_recovery_artifacts()?;
+        self.validate_owned_state()?;
+        self.validate_backup_proofs()?;
+        let _metadata =
+            open_verified_regular(&self.layout.metadata_path(), "project metadata", true)?;
+        let _manifest =
+            open_verified_regular(&self.layout.manifest_path(), "project manifest", true)?;
+        self.finalize_recovery_artifacts()
+    }
+
+    fn validate_owned_state(&self) -> Result<(), FilesystemError> {
+        validate_directory_handle(
+            self.layout.root(),
+            &self.root_directory,
+            self.root_identity,
+            "project root",
+        )?;
+        validate_directory_handle(
+            &self.layout.root().join("recovery"),
+            &self.recovery_directory,
+            self.recovery_identity,
+            "recovery directory",
+        )?;
+        let lock_file = self.lock_file.as_ref().ok_or_else(|| {
+            FilesystemError::InvalidLayout("project upgrade lock ownership was lost".to_owned())
+        })?;
+        validate_file_handle(
+            &self.lock_path,
+            lock_file,
+            self.lock_identity,
+            "project upgrade lock",
+        )?;
+        let _marker = open_verified_regular(&self.marker_path, "upgrade recovery marker", false)?;
+        Ok(())
+    }
+
+    fn validate_backup_proofs(&self) -> Result<(), FilesystemError> {
+        validate_file_handle(
+            &self.metadata_backup_path,
+            &self.metadata_backup_file,
+            self.metadata_backup_identity,
+            "metadata recovery backup",
+        )?;
+        validate_file_handle(
+            &self.manifest_backup_path,
+            &self.manifest_backup_file,
+            self.manifest_backup_identity,
+            "manifest recovery backup",
+        )?;
+        if content_proof(&self.metadata_backup_file)? != self.metadata_backup_proof
+            || content_proof(&self.manifest_backup_file)? != self.manifest_backup_proof
+        {
+            return Err(FilesystemError::InvalidLayout(
+                "project recovery backup content changed".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn finalize_recovery_artifacts(&mut self) -> Result<(), FilesystemError> {
+        let cleanup_directory = if let Some(path) = &self.cleanup_directory {
+            path.clone()
+        } else {
+            self.fail_finalize_stage(FinalizeStage::CreateCleanupDirectory)?;
+            let path = self
+                .layout
+                .root()
+                .join(format!(".project-upgrade-cleanup-{}", self.correlation_id));
+            fs::create_dir(&path)?;
+            self.cleanup_directory = Some(path.clone());
+            sync_directory(self.layout.root())?;
+            path
+        };
+
+        self.move_proof_file(
+            FinalizeStage::MoveMetadataBackup,
+            ProofFile::MetadataBackup,
+            &cleanup_directory.join(METADATA_BACKUP_FILE),
+        )?;
+        self.move_proof_file(
+            FinalizeStage::MoveManifestBackup,
+            ProofFile::ManifestBackup,
+            &cleanup_directory.join(MANIFEST_BACKUP_FILE),
+        )?;
+        self.move_proof_file(
+            FinalizeStage::MoveMarker,
+            ProofFile::Marker,
+            &cleanup_directory.join(UPGRADE_MARKER_FILE),
+        )?;
+
+        // The marker move plus directory sync is the commit point. The owned
+        // lock remains at its contract path until after this point, preventing
+        // a cooperating owner from entering during a failed marker sync.
+        // Windows std does not expose MOVEFILE_WRITE_THROUGH; the safe
+        // best-available sequence is synced file contents, atomic rename, then
+        // directory-handle sync_all.
         self.committed = true;
+        if !self.skip_cleanup_stage(FinalizeStage::MoveLock) {
+            let lock_destination = cleanup_directory.join(UPGRADE_LOCK_FILE);
+            if fs::rename(&self.lock_path, &lock_destination).is_ok() {
+                self.lock_path = lock_destination;
+                let _ = sync_directory(&cleanup_directory);
+                let _ = sync_directory(&self.layout.root().join("recovery"));
+            }
+        }
+        drop(self.lock_file.take());
+        let cleanup = [
+            (
+                FinalizeStage::CleanupMetadataBackup,
+                Some(self.metadata_backup_path.clone()),
+            ),
+            (
+                FinalizeStage::CleanupManifestBackup,
+                Some(self.manifest_backup_path.clone()),
+            ),
+            (
+                FinalizeStage::CleanupLock,
+                (self.lock_path.parent() == Some(cleanup_directory.as_path()))
+                    .then(|| self.lock_path.clone()),
+            ),
+            (FinalizeStage::CleanupMarker, Some(self.marker_path.clone())),
+        ];
+        for (stage, path) in cleanup {
+            if !self.skip_cleanup_stage(stage) {
+                if let Some(path) = path {
+                    let _ = fs::remove_file(&path);
+                    let _ = sync_directory(&cleanup_directory);
+                }
+            }
+        }
+        if !self.skip_cleanup_stage(FinalizeStage::CleanupDirectory) {
+            let _ = fs::remove_dir(&cleanup_directory);
+            let _ = sync_directory(self.layout.root());
+        }
         Ok(())
     }
 
-    fn validate_recovery_artifacts(&self) -> Result<(), FilesystemError> {
-        ensure_regular_directory(&self.layout.root().join("recovery"), "recovery directory")?;
-        ensure_regular_file(&self.marker_path, "upgrade recovery marker")?;
-        ensure_regular_file(&self.metadata_backup_path, "metadata recovery backup")?;
-        ensure_regular_file(&self.manifest_backup_path, "manifest recovery backup")
+    fn move_proof_file(
+        &mut self,
+        stage: FinalizeStage,
+        proof: ProofFile,
+        destination: &Path,
+    ) -> Result<(), FilesystemError> {
+        let source = match proof {
+            ProofFile::MetadataBackup => self.metadata_backup_path.clone(),
+            ProofFile::ManifestBackup => self.manifest_backup_path.clone(),
+            ProofFile::Marker => self.marker_path.clone(),
+        };
+        if source == destination {
+            return Ok(());
+        }
+        self.fail_finalize_stage(stage)?;
+        fs::rename(&source, destination)?;
+        let destination_owned = destination.to_owned();
+        match proof {
+            ProofFile::MetadataBackup => self.metadata_backup_path = destination_owned,
+            ProofFile::ManifestBackup => self.manifest_backup_path = destination_owned,
+            ProofFile::Marker => self.marker_path = destination_owned,
+        }
+        sync_directory(destination.parent().ok_or_else(|| {
+            FilesystemError::InvalidPath("cleanup artifact parent is missing".to_owned())
+        })?)?;
+        sync_directory(source.parent().ok_or_else(|| {
+            FilesystemError::InvalidPath("recovery artifact parent is missing".to_owned())
+        })?)
     }
 
-    fn remove_recovery_artifacts(&self) -> Result<(), FilesystemError> {
-        fs::remove_file(&self.metadata_backup_path)?;
-        fs::remove_file(&self.manifest_backup_path)?;
-        fs::remove_file(&self.marker_path)?;
+    #[cfg(test)]
+    fn inject_finalize_failure(&mut self, stage: FinalizeStage) {
+        self.finalize_failure = Some(stage);
+    }
+
+    fn fail_finalize_stage(&mut self, stage: FinalizeStage) -> Result<(), FilesystemError> {
+        if self.finalize_failure == Some(stage) {
+            self.finalize_failure = None;
+            return Err(FilesystemError::Io(io::Error::other(
+                "injected finalize failure",
+            )));
+        }
         Ok(())
+    }
+
+    fn skip_cleanup_stage(&mut self, stage: FinalizeStage) -> bool {
+        if self.finalize_failure == Some(stage) {
+            self.finalize_failure = None;
+            return true;
+        }
+        false
     }
 }
 
@@ -152,30 +382,97 @@ pub fn begin_project_upgrade(
     correlation_id: &str,
     marker_contents: &[u8],
 ) -> Result<ProjectUpgrade, FilesystemError> {
+    begin_project_upgrade_inner(layout, correlation_id, marker_contents, |_, _| {})
+}
+
+#[cfg(test)]
+fn begin_project_upgrade_observed<F>(
+    layout: &ProjectLayout,
+    correlation_id: &str,
+    marker_contents: &[u8],
+    observer: F,
+) -> Result<ProjectUpgrade, FilesystemError>
+where
+    F: FnMut(BeginStage, &ProjectLayout),
+{
+    begin_project_upgrade_inner(layout, correlation_id, marker_contents, observer)
+}
+
+fn begin_project_upgrade_inner<F>(
+    layout: &ProjectLayout,
+    correlation_id: &str,
+    marker_contents: &[u8],
+    mut observer: F,
+) -> Result<ProjectUpgrade, FilesystemError>
+where
+    F: FnMut(BeginStage, &ProjectLayout),
+{
     validate_safe_token(correlation_id, "correlation_id")?;
     let marker_path = layout.root().join(UPGRADE_MARKER_FILE);
     ensure_bounded(marker_contents, MANIFEST_LIMIT_BYTES, &marker_path)?;
 
     let recovery_directory = layout.root().join("recovery");
-    ensure_regular_directory(&recovery_directory, "recovery directory")?;
-    ensure_regular_file(&layout.metadata_path(), "project metadata")?;
-    ensure_regular_file(&layout.manifest_path(), "project manifest")?;
+    let (root_directory, root_identity) = open_verified_directory(layout.root(), "project root")?;
+    let (recovery_directory_file, recovery_identity) =
+        open_verified_directory(&recovery_directory, "recovery directory")?;
+    let (metadata_source, metadata_source_identity) =
+        open_verified_regular(&layout.metadata_path(), "project metadata", false)?;
+    let (manifest_source, manifest_source_identity) =
+        open_verified_regular(&layout.manifest_path(), "project manifest", false)?;
+    if manifest_source_identity.length > MANIFEST_LIMIT_BYTES {
+        return Err(FilesystemError::FileTooLarge {
+            path: layout.manifest_path(),
+            limit: MANIFEST_LIMIT_BYTES,
+        });
+    }
 
     let metadata_backup_path = recovery_directory.join(METADATA_BACKUP_FILE);
     let manifest_backup_path = recovery_directory.join(MANIFEST_BACKUP_FILE);
-    for artifact in [&marker_path, &metadata_backup_path, &manifest_backup_path] {
+    let lock_path = recovery_directory.join(UPGRADE_LOCK_FILE);
+    for artifact in [
+        &marker_path,
+        &metadata_backup_path,
+        &manifest_backup_path,
+        &lock_path,
+    ] {
         if entry_exists_no_follow(artifact)? {
             return Err(FilesystemError::RecoveryRequired(artifact.clone()));
         }
     }
 
-    create_durable_backup(&layout.metadata_path(), &metadata_backup_path, None)?;
-    create_durable_backup(
-        &layout.manifest_path(),
-        &manifest_backup_path,
-        Some(MANIFEST_LIMIT_BYTES),
+    let (lock_file, lock_identity) = create_owned_file(&lock_path, correlation_id.as_bytes())?;
+    sync_directory(&recovery_directory)?;
+    let (metadata_backup_file, metadata_backup_identity, metadata_backup_proof) =
+        create_durable_backup(
+            &metadata_source,
+            metadata_source_identity,
+            &metadata_backup_path,
+        )?;
+    sync_directory(&recovery_directory)?;
+    let (manifest_backup_file, manifest_backup_identity, manifest_backup_proof) =
+        create_durable_backup(
+            &manifest_source,
+            manifest_source_identity,
+            &manifest_backup_path,
+        )?;
+    sync_directory(&recovery_directory)?;
+
+    observer(BeginStage::BackupsCopied, layout);
+    validate_source_snapshot(
+        &layout.metadata_path(),
+        &metadata_source,
+        metadata_source_identity,
+        &metadata_backup_file,
+        "project metadata",
     )?;
-    write_bounded_file(
+    validate_source_snapshot(
+        &layout.manifest_path(),
+        &manifest_source,
+        manifest_source_identity,
+        &manifest_backup_file,
+        "project manifest",
+    )?;
+    durable_bounded_write(
         &marker_path,
         marker_contents,
         MANIFEST_LIMIT_BYTES,
@@ -187,8 +484,23 @@ pub fn begin_project_upgrade(
         marker_path,
         metadata_backup_path,
         manifest_backup_path,
+        metadata_backup_file,
+        manifest_backup_file,
+        metadata_backup_identity,
+        manifest_backup_identity,
+        metadata_backup_proof,
+        manifest_backup_proof,
+        lock_path,
+        lock_file: Some(lock_file),
+        lock_identity,
+        root_directory,
+        root_identity,
+        recovery_directory: recovery_directory_file,
+        recovery_identity,
         correlation_id: correlation_id.to_owned(),
+        cleanup_directory: None,
         committed: false,
+        finalize_failure: None,
     })
 }
 
@@ -202,14 +514,19 @@ fn ensure_bounded(contents: &[u8], limit: u64, path: &Path) -> Result<(), Filesy
     Ok(())
 }
 
-fn write_bounded_file(
+fn durable_bounded_write(
     path: &Path,
     contents: &[u8],
     limit: u64,
     token: &str,
 ) -> Result<(), FilesystemError> {
     ensure_bounded(contents, limit, path)?;
-    atomic_write(path, contents, token)
+    atomic_write(path, contents, token)?;
+    sync_directory(
+        path.parent().ok_or_else(|| {
+            FilesystemError::InvalidPath("control file parent is missing".to_owned())
+        })?,
+    )
 }
 
 fn entry_exists_no_follow(path: &Path) -> Result<bool, FilesystemError> {
@@ -220,62 +537,97 @@ fn entry_exists_no_follow(path: &Path) -> Result<bool, FilesystemError> {
     }
 }
 
-fn ensure_regular_file(path: &Path, label: &str) -> Result<(), FilesystemError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+fn open_verified_regular(
+    path: &Path,
+    label: &str,
+    exclusive: bool,
+) -> Result<(File, FileIdentity), FilesystemError> {
+    let before = fs::symlink_metadata(path)?;
+    validate_regular_metadata(&before, label)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    if exclusive {
+        configure_exclusive_file_open(&mut options);
+    }
+    let file = options.open(path)?;
+    let handle_identity = identity_from_metadata(&file.metadata()?, label, true)?;
+    let after = fs::symlink_metadata(path)?;
+    validate_regular_metadata(&after, label)?;
+    let path_identity = identity_from_metadata(&after, label, true)?;
+    if handle_identity != path_identity {
         return Err(FilesystemError::InvalidLayout(format!(
-            "{label} must be a regular file"
+            "{label} identity changed while opening"
         )));
     }
-    Ok(())
+    Ok((file, handle_identity))
 }
 
-fn ensure_regular_directory(path: &Path, label: &str) -> Result<(), FilesystemError> {
-    let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+fn open_verified_directory(
+    path: &Path,
+    label: &str,
+) -> Result<(File, FileIdentity), FilesystemError> {
+    let before = fs::symlink_metadata(path)?;
+    validate_directory_metadata(&before, label)?;
+    let mut options = OpenOptions::new();
+    options.read(true);
+    configure_owned_directory_open(&mut options);
+    let directory = options.open(path)?;
+    let handle_identity = identity_from_metadata(&directory.metadata()?, label, false)?;
+    let after = fs::symlink_metadata(path)?;
+    validate_directory_metadata(&after, label)?;
+    let path_identity = identity_from_metadata(&after, label, false)?;
+    if handle_identity != path_identity {
         return Err(FilesystemError::InvalidLayout(format!(
-            "{label} must be a regular directory"
+            "{label} identity changed while opening"
         )));
     }
-    Ok(())
+    Ok((directory, handle_identity))
 }
 
 fn create_durable_backup(
-    source_path: &Path,
+    source: &File,
+    source_identity: FileIdentity,
     backup_path: &Path,
-    limit: Option<u64>,
-) -> Result<(), FilesystemError> {
-    ensure_regular_file(source_path, "project control file")?;
-    let mut source = File::open(source_path)?;
-    let source_length = source.metadata()?.len();
-    if let Some(limit) = limit {
-        if source_length > limit {
-            return Err(FilesystemError::FileTooLarge {
-                path: source_path.to_owned(),
-                limit,
-            });
-        }
-    }
-
-    let mut backup = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(backup_path)?;
-    io::copy(&mut source, &mut backup)?;
+) -> Result<(File, FileIdentity, ContentProof), FilesystemError> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).read(true).write(true);
+    configure_exclusive_file_open(&mut options);
+    let mut backup = options.open(backup_path)?;
+    let mut source_reader = source.try_clone()?;
+    source_reader.seek(SeekFrom::Start(0))?;
+    copy_exact_snapshot(&mut source_reader, &mut backup, source_identity.length)?;
     backup.flush()?;
     backup.sync_all()?;
-    Ok(())
+    let identity = identity_from_metadata(&backup.metadata()?, "project recovery backup", true)?;
+    let path_identity = identity_from_metadata(
+        &fs::symlink_metadata(backup_path)?,
+        "project recovery backup",
+        true,
+    )?;
+    if identity != path_identity {
+        return Err(FilesystemError::InvalidLayout(
+            "project recovery backup identity changed".to_owned(),
+        ));
+    }
+    let proof = content_proof(&backup)?;
+    Ok((backup, identity, proof))
 }
 
 fn restore_regular_backup(
-    backup_path: &Path,
+    backup: &File,
+    backup_length: u64,
     destination_path: &Path,
     token: &str,
 ) -> Result<(), FilesystemError> {
-    ensure_regular_file(backup_path, "project recovery backup")?;
-    if entry_exists_no_follow(destination_path)? {
-        ensure_regular_file(destination_path, "project control file")?;
-    }
+    let _destination = if entry_exists_no_follow(destination_path)? {
+        Some(open_verified_regular(
+            destination_path,
+            "project control file",
+            true,
+        )?)
+    } else {
+        None
+    };
 
     let file_name = destination_path
         .file_name()
@@ -283,29 +635,33 @@ fn restore_regular_backup(
         .ok_or_else(|| FilesystemError::InvalidPath("file name is not UTF-8".to_owned()))?;
     let temporary_path =
         destination_path.with_file_name(format!(".{file_name}.{token}.restore.tmp"));
-    let restore_result = (|| -> Result<(), io::Error> {
-        let mut backup = File::open(backup_path)?;
-        let mut temporary = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temporary_path)?;
-        io::copy(&mut backup, &mut temporary)?;
+    let restore_result = (|| -> Result<(), FilesystemError> {
+        let mut backup_reader = backup.try_clone()?;
+        backup_reader.seek(SeekFrom::Start(0))?;
+        let mut options = OpenOptions::new();
+        options.create_new(true).read(true).write(true);
+        configure_exclusive_file_open(&mut options);
+        let mut temporary = options.open(&temporary_path)?;
+        copy_exact_snapshot(&mut backup_reader, &mut temporary, backup_length)?;
         temporary.flush()?;
         temporary.sync_all()?;
         drop(temporary);
-        fs::rename(&temporary_path, destination_path)
+        fs::rename(&temporary_path, destination_path)?;
+        sync_directory(destination_path.parent().ok_or_else(|| {
+            FilesystemError::InvalidPath("control file parent is missing".to_owned())
+        })?)
     })();
     if restore_result.is_err() {
         let _ = fs::remove_file(&temporary_path);
     }
-    restore_result.map_err(FilesystemError::Io)
+    restore_result
 }
 
-fn files_equal(left_path: &Path, right_path: &Path) -> Result<bool, FilesystemError> {
-    ensure_regular_file(left_path, "project recovery backup")?;
-    ensure_regular_file(right_path, "restored project control file")?;
-    let mut left = File::open(left_path)?;
-    let mut right = File::open(right_path)?;
+fn files_equal(left: &File, right: &File) -> Result<bool, FilesystemError> {
+    let mut left = left.try_clone()?;
+    let mut right = right.try_clone()?;
+    left.seek(SeekFrom::Start(0))?;
+    right.seek(SeekFrom::Start(0))?;
     if left.metadata()?.len() != right.metadata()?.len() {
         return Ok(false);
     }
@@ -323,6 +679,266 @@ fn files_equal(left_path: &Path, right_path: &Path) -> Result<bool, FilesystemEr
         }
     }
 }
+
+fn copy_exact_snapshot<R: Read, W: Write>(
+    source: &mut R,
+    destination: &mut W,
+    expected_length: u64,
+) -> Result<(), FilesystemError> {
+    let mut remaining = expected_length;
+    let mut buffer = [0_u8; 8192];
+    while remaining > 0 {
+        let bounded = usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+        let read = source.read(&mut buffer[..bounded])?;
+        if read == 0 {
+            return Err(FilesystemError::InvalidLayout(
+                "project control file shrank while being backed up".to_owned(),
+            ));
+        }
+        destination.write_all(&buffer[..read])?;
+        remaining -= u64::try_from(read).unwrap_or(u64::MAX);
+    }
+    let mut growth = [0_u8; 1];
+    if source.read(&mut growth)? != 0 {
+        return Err(FilesystemError::InvalidLayout(
+            "project control file grew while being backed up".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_source_snapshot(
+    path: &Path,
+    source: &File,
+    expected_identity: FileIdentity,
+    backup: &File,
+    label: &str,
+) -> Result<(), FilesystemError> {
+    validate_file_handle(path, source, expected_identity, label)?;
+    if !files_equal(source, backup)? {
+        return Err(FilesystemError::InvalidLayout(format!(
+            "{label} content changed while recovery proof was created"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_file_handle(
+    path: &Path,
+    file: &File,
+    expected: FileIdentity,
+    label: &str,
+) -> Result<(), FilesystemError> {
+    let current = identity_from_metadata(&file.metadata()?, label, true)?;
+    let path_metadata = fs::symlink_metadata(path)?;
+    validate_regular_metadata(&path_metadata, label)?;
+    let path_identity = identity_from_metadata(&path_metadata, label, true)?;
+    if current != expected || path_identity != expected {
+        return Err(FilesystemError::InvalidLayout(format!(
+            "{label} identity changed"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_directory_handle(
+    path: &Path,
+    directory: &File,
+    expected: FileIdentity,
+    label: &str,
+) -> Result<(), FilesystemError> {
+    let current = identity_from_metadata(&directory.metadata()?, label, false)?;
+    let path_metadata = fs::symlink_metadata(path)?;
+    validate_directory_metadata(&path_metadata, label)?;
+    let path_identity = identity_from_metadata(&path_metadata, label, false)?;
+    if current != expected || path_identity != expected {
+        return Err(FilesystemError::InvalidLayout(format!(
+            "{label} identity changed"
+        )));
+    }
+    Ok(())
+}
+
+fn create_owned_file(
+    path: &Path,
+    contents: &[u8],
+) -> Result<(File, FileIdentity), FilesystemError> {
+    let mut options = OpenOptions::new();
+    options.create_new(true).read(true).write(true);
+    configure_exclusive_file_open(&mut options);
+    let mut file = options.open(path)?;
+    file.write_all(contents)?;
+    file.flush()?;
+    file.sync_all()?;
+    let identity = identity_from_metadata(&file.metadata()?, "project upgrade lock", true)?;
+    Ok((file, identity))
+}
+
+fn content_proof(file: &File) -> Result<ContentProof, FilesystemError> {
+    let mut reader = file.try_clone()?;
+    reader.seek(SeekFrom::Start(0))?;
+    let mut digest_a = 0xcbf2_9ce4_8422_2325_u64;
+    let mut digest_b = 0x9e37_79b9_7f4a_7c15_u64;
+    let mut length = 0_u64;
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        length = length.saturating_add(u64::try_from(read).unwrap_or(u64::MAX));
+        for byte in &buffer[..read] {
+            digest_a ^= u64::from(*byte);
+            digest_a = digest_a.wrapping_mul(0x0000_0100_0000_01b3);
+            digest_b = digest_b.rotate_left(7) ^ u64::from(*byte);
+            digest_b = digest_b.wrapping_mul(0x9e37_79b1_85eb_ca87);
+        }
+    }
+    Ok(ContentProof {
+        length,
+        digest_a,
+        digest_b,
+    })
+}
+
+fn sync_directory(path: &Path) -> Result<(), FilesystemError> {
+    let metadata = fs::symlink_metadata(path)?;
+    validate_directory_metadata(&metadata, "filesystem namespace directory")?;
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    configure_sync_directory_open(&mut options);
+    options.open(path)?.sync_all()?;
+    Ok(())
+}
+
+fn validate_regular_metadata(metadata: &fs::Metadata, label: &str) -> Result<(), FilesystemError> {
+    if metadata.file_type().is_symlink() || !metadata.is_file() || is_reparse_point(metadata) {
+        return Err(FilesystemError::InvalidLayout(format!(
+            "{label} must be a non-linked regular file"
+        )));
+    }
+    let _ = identity_from_metadata(metadata, label, true)?;
+    Ok(())
+}
+
+fn validate_directory_metadata(
+    metadata: &fs::Metadata,
+    label: &str,
+) -> Result<(), FilesystemError> {
+    if metadata.file_type().is_symlink() || !metadata.is_dir() || is_reparse_point(metadata) {
+        return Err(FilesystemError::InvalidLayout(format!(
+            "{label} must be a non-linked directory"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn identity_from_metadata(
+    metadata: &fs::Metadata,
+    label: &str,
+    require_single_link: bool,
+) -> Result<FileIdentity, FilesystemError> {
+    use std::os::windows::fs::MetadataExt;
+
+    if is_reparse_point(metadata) {
+        return Err(FilesystemError::InvalidLayout(format!(
+            "{label} must not be a reparse point"
+        )));
+    }
+    // Stable std exposes timestamps/size and reparse attributes, but Windows
+    // file ID and hardlink count remain behind `windows_by_handle`. The held
+    // handles plus content proof close cooperating mutation races; full Windows
+    // hardlink rejection requires an audited OS API boundary outside this crate.
+    Ok(FileIdentity {
+        volume: metadata.creation_time(),
+        file: if require_single_link {
+            metadata.last_write_time()
+        } else {
+            0
+        },
+        length: if require_single_link {
+            metadata.file_size()
+        } else {
+            0
+        },
+    })
+}
+
+#[cfg(unix)]
+fn identity_from_metadata(
+    metadata: &fs::Metadata,
+    label: &str,
+    require_single_link: bool,
+) -> Result<FileIdentity, FilesystemError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if require_single_link && metadata.nlink() != 1 {
+        return Err(FilesystemError::InvalidLayout(format!(
+            "{label} must not have hardlinks"
+        )));
+    }
+    Ok(FileIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+        length: metadata.size(),
+    })
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[cfg(windows)]
+fn configure_exclusive_file_open(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    options.share_mode(FILE_SHARE_DELETE);
+}
+
+#[cfg(not(windows))]
+fn configure_exclusive_file_open(_options: &mut OpenOptions) {}
+
+#[cfg(windows)]
+fn configure_owned_directory_open(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    options
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+}
+
+#[cfg(not(windows))]
+fn configure_owned_directory_open(_options: &mut OpenOptions) {}
+
+#[cfg(windows)]
+fn configure_sync_directory_open(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    options
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS);
+}
+
+#[cfg(not(windows))]
+fn configure_sync_directory_open(_options: &mut OpenOptions) {}
 
 #[cfg(test)]
 mod tests {
@@ -426,6 +1042,7 @@ mod tests {
             ".project-upgrade-recovery.json",
             "recovery/metadata-schema-1.sqlite.backup",
             "recovery/manifest-schema-1.json.backup",
+            "recovery/.project-upgrade.lock",
         ] {
             let fixture = project_fixture("recovery-artifact");
             let layout = fixture.layout();
@@ -545,5 +1162,246 @@ mod tests {
             upgrade.write_manifest(&oversized),
             Err(FilesystemError::FileTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn finalize_failures_before_marker_move_restore_original_controls() {
+        for stage in [
+            FinalizeStage::CreateCleanupDirectory,
+            FinalizeStage::MoveMetadataBackup,
+            FinalizeStage::MoveManifestBackup,
+            FinalizeStage::MoveMarker,
+        ] {
+            let fixture = project_fixture("finalize-before-marker");
+            let layout = fixture.layout();
+            let before = control_file_bytes(layout.root());
+            let mut upgrade = begin_project_upgrade(layout, CORRELATION_ID, MARKER).unwrap();
+            fs::write(layout.metadata_path(), b"mutated metadata").unwrap();
+            upgrade.write_manifest(b"mutated manifest").unwrap();
+            upgrade.inject_finalize_failure(stage);
+
+            assert!(upgrade.commit().is_err(), "stage {stage:?}");
+            assert_eq!(control_file_bytes(layout.root()), before, "stage {stage:?}");
+            validate_project_layout(layout.root()).expect("restored layout");
+        }
+    }
+
+    #[test]
+    fn cleanup_failures_after_marker_move_do_not_report_failed_commit() {
+        for stage in [
+            FinalizeStage::MoveLock,
+            FinalizeStage::CleanupMetadataBackup,
+            FinalizeStage::CleanupManifestBackup,
+            FinalizeStage::CleanupLock,
+            FinalizeStage::CleanupMarker,
+            FinalizeStage::CleanupDirectory,
+        ] {
+            let fixture = project_fixture("finalize-after-marker");
+            let layout = fixture.layout();
+            let mut upgrade = begin_project_upgrade(layout, CORRELATION_ID, MARKER).unwrap();
+            upgrade.write_manifest(b"committed manifest").unwrap();
+            upgrade.inject_finalize_failure(stage);
+
+            upgrade.commit().expect("logical commit after marker move");
+            if stage == FinalizeStage::MoveLock {
+                assert!(matches!(
+                    validate_project_layout(layout.root()),
+                    Err(FilesystemError::RecoveryRequired(_))
+                ));
+            } else {
+                validate_project_layout(layout.root()).expect("committed layout");
+            }
+            assert_eq!(
+                fs::read(layout.manifest_path()).unwrap(),
+                b"committed manifest",
+                "stage {stage:?}"
+            );
+            assert!(!layout
+                .root()
+                .join(".project-upgrade-recovery.json")
+                .exists());
+            assert!(!layout
+                .root()
+                .join("recovery/metadata-schema-1.sqlite.backup")
+                .exists());
+            assert!(!layout
+                .root()
+                .join("recovery/manifest-schema-1.json.backup")
+                .exists());
+            assert_eq!(
+                layout
+                    .root()
+                    .join("recovery/.project-upgrade.lock")
+                    .exists(),
+                stage == FinalizeStage::MoveLock
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn begin_rejects_hardlinked_control_file() {
+        let fixture = project_fixture("hardlink-control");
+        let layout = fixture.layout();
+        fs::hard_link(
+            layout.metadata_path(),
+            layout.root().join("metadata-hardlink.sqlite"),
+        )
+        .unwrap();
+
+        assert!(matches!(
+            begin_project_upgrade(layout, CORRELATION_ID, MARKER),
+            Err(FilesystemError::InvalidLayout(_))
+        ));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn begin_rejects_reparse_recovery_directory() {
+        use std::os::windows::fs::symlink_dir;
+
+        let fixture = project_fixture("reparse-recovery");
+        let layout = fixture.layout();
+        let recovery_path = layout.root().join("recovery");
+        let actual_path = layout.root().join("actual-recovery");
+        fs::remove_dir(&recovery_path).unwrap();
+        fs::create_dir(&actual_path).unwrap();
+        if let Err(error) = symlink_dir(&actual_path, &recovery_path) {
+            if error.kind() == io::ErrorKind::PermissionDenied || error.raw_os_error() == Some(1314)
+            {
+                return;
+            }
+            panic!("recovery reparse point: {error}");
+        }
+
+        assert!(matches!(
+            begin_project_upgrade(layout, CORRELATION_ID, MARKER),
+            Err(FilesystemError::InvalidLayout(_))
+        ));
+    }
+
+    #[test]
+    fn bounded_copy_rejects_growth_without_writing_past_snapshot() {
+        let bytes = b"originalgrowth";
+        let mut source = io::Cursor::new(bytes);
+        let mut destination = Vec::new();
+
+        assert!(matches!(
+            copy_exact_snapshot(
+                &mut source,
+                &mut destination,
+                u64::try_from(b"original".len()).unwrap(),
+            ),
+            Err(FilesystemError::InvalidLayout(_))
+        ));
+        assert_eq!(destination, b"original");
+    }
+
+    #[test]
+    fn concurrent_mutation_before_marker_keeps_original_backup_and_blocks_open() {
+        let fixture = project_fixture("concurrent-mutation");
+        let layout = fixture.layout();
+        let original_metadata = fs::read(layout.metadata_path()).unwrap();
+
+        let result = begin_project_upgrade_observed(
+            layout,
+            CORRELATION_ID,
+            MARKER,
+            |stage, observed_layout| {
+                if stage == BeginStage::BackupsCopied {
+                    fs::write(observed_layout.metadata_path(), b"concurrent mutation").unwrap();
+                }
+            },
+        );
+
+        assert!(matches!(result, Err(FilesystemError::InvalidLayout(_))));
+        assert_eq!(
+            fs::read(
+                layout
+                    .root()
+                    .join("recovery/metadata-schema-1.sqlite.backup")
+            )
+            .unwrap(),
+            original_metadata
+        );
+        assert!(matches!(
+            validate_project_layout(layout.root()),
+            Err(FilesystemError::RecoveryRequired(_))
+        ));
+    }
+
+    #[test]
+    fn upgrade_lock_prevents_a_second_owner() {
+        let fixture = project_fixture("exclusive-owner");
+        let layout = fixture.layout();
+        let upgrade = begin_project_upgrade(layout, CORRELATION_ID, MARKER).unwrap();
+
+        assert!(layout
+            .root()
+            .join("recovery/.project-upgrade.lock")
+            .is_file());
+        assert!(matches!(
+            begin_project_upgrade(layout, CORRELATION_ID, MARKER),
+            Err(FilesystemError::RecoveryRequired(_))
+        ));
+        drop(upgrade);
+    }
+
+    #[test]
+    fn changed_backup_content_keeps_recovery_marker() {
+        let fixture = project_fixture("changed-proof");
+        let layout = fixture.layout();
+        let upgrade = begin_project_upgrade(layout, CORRELATION_ID, MARKER).unwrap();
+        let mut backup = upgrade.metadata_backup_file.try_clone().unwrap();
+        let length = usize::try_from(backup.metadata().unwrap().len()).unwrap();
+        backup.seek(SeekFrom::Start(0)).unwrap();
+        backup.write_all(&vec![b'x'; length]).unwrap();
+        backup.sync_all().unwrap();
+
+        assert!(upgrade.commit().is_err());
+        assert!(layout
+            .root()
+            .join(".project-upgrade-recovery.json")
+            .is_file());
+        assert!(layout
+            .root()
+            .join("recovery/metadata-schema-1.sqlite.backup")
+            .is_file());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_restore_destination_keeps_recovery_proof() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let fixture = project_fixture("locked-destination");
+        let layout = fixture.layout();
+        let mut upgrade = begin_project_upgrade(layout, CORRELATION_ID, MARKER).unwrap();
+        fs::write(layout.metadata_path(), b"mutated metadata").unwrap();
+        let locked = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0)
+            .open(layout.metadata_path())
+            .unwrap();
+
+        assert!(upgrade.restore().is_err());
+        assert!(layout
+            .root()
+            .join(".project-upgrade-recovery.json")
+            .is_file());
+        assert!(layout
+            .root()
+            .join("recovery/metadata-schema-1.sqlite.backup")
+            .is_file());
+        drop(locked);
+        upgrade.restore().expect("restore after lock release");
+    }
+
+    #[test]
+    fn project_namespace_directory_can_use_best_available_sync() {
+        let fixture = project_fixture("directory-sync");
+        sync_directory(fixture.layout().root()).expect("directory sync");
+        sync_directory(&fixture.layout().root().join("recovery")).expect("recovery directory sync");
     }
 }
