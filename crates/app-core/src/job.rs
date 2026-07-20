@@ -1,6 +1,13 @@
 use std::fmt::{self, Display, Formatter};
+use std::path::{Path, PathBuf};
 
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior};
+use sha2::{Digest, Sha256};
 pub use teratai_contracts::generated::job_descriptor::JobDescriptor;
+pub use teratai_contracts::generated::job_enqueue_request::JobEnqueueRequest;
+use teratai_filesystem::validate_project_layout;
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
 
 /// Metadata schema 1-to-2 migration for persistent job snapshots and history.
 pub const JOB_MIGRATION: &str =
@@ -81,11 +88,427 @@ impl From<rusqlite::Error> for JobError {
     }
 }
 
+/// Stable keyset cursor for descending job snapshot pagination.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JobListCursor {
+    pub updated_at: String,
+    pub job_id: String,
+}
+
+/// One bounded page of project-scoped job snapshots.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JobPage {
+    pub items: Vec<JobDescriptor>,
+    pub next_cursor: Option<JobListCursor>,
+}
+
+/// Persistent, project-scoped job snapshot and history store.
+#[derive(Debug)]
+pub struct JobStore {
+    metadata_path: PathBuf,
+    project_id: String,
+}
+
+impl JobStore {
+    /// Open a validated schema-two project without mutating its control files.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for unsafe layouts, incompatible schemas, invalid
+    /// project identity, or database failures.
+    pub fn open(project_path: &Path) -> Result<Self, JobError> {
+        let layout = validate_project_layout(project_path).map_err(|_| {
+            JobError::DataIntegrity("project layout is unavailable or unsafe".to_owned())
+        })?;
+        let metadata_path = layout.metadata_path();
+        let connection = open_connection(&metadata_path)?;
+        let actual = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if actual != 2 {
+            return Err(JobError::IncompatibleSchema {
+                expected: 2,
+                actual,
+            });
+        }
+        let migration_name: Option<String> = connection
+            .query_row(
+                "SELECT name FROM schema_migrations WHERE version = 2",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if migration_name.as_deref() != Some("job_runtime") {
+            return Err(JobError::DataIntegrity(
+                "job metadata migration history is invalid".to_owned(),
+            ));
+        }
+        let project_id: String = connection.query_row(
+            "SELECT project_id FROM project WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if !crate::is_uuid_v7(&project_id) {
+            return Err(JobError::DataIntegrity(
+                "project identity is not a lowercase UUID v7".to_owned(),
+            ));
+        }
+        drop(connection);
+        Ok(Self {
+            metadata_path,
+            project_id,
+        })
+    }
+
+    /// Persist a new queued job and matching immutable history atomically.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when validation, timestamp creation, or the
+    /// immediate `SQLite` transaction fails.
+    pub fn enqueue(&self, request: &JobEnqueueRequest) -> Result<JobDescriptor, JobError> {
+        let timestamp = OffsetDateTime::now_utc()
+            .format(&Rfc3339)
+            .map_err(|error| JobError::Timestamp(error.to_string()))?;
+        self.enqueue_at(request, &timestamp)
+    }
+
+    /// Return one safe job snapshot by lowercase UUID v7 identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidRequest`, `JobNotFound`, or a safe database failure.
+    pub fn get(&self, job_id: &str) -> Result<JobDescriptor, JobError> {
+        validate_uuid(job_id, "job_id")?;
+        let connection = self.connection()?;
+        connection
+            .query_row(
+                "SELECT job_id, project_id, kind, status, correlation_id, revision,
+                        created_at, started_at, finished_at, updated_at,
+                        progress_current, progress_total, progress_unit, progress_phase,
+                        progress_message, error_code, error_message, error_retriable
+                 FROM job
+                 WHERE project_id = ?1 AND job_id = ?2",
+                params![self.project_id, job_id],
+                row_to_descriptor,
+            )
+            .optional()?
+            .ok_or_else(|| JobError::JobNotFound("job identity does not exist".to_owned()))
+    }
+
+    /// List one deterministic bounded page ordered newest-first.
+    ///
+    /// # Errors
+    ///
+    /// Returns `InvalidRequest` for a page size outside `1..=100` or an
+    /// invalid cursor, and a safe database failure for query errors.
+    pub fn list(&self, limit: usize, cursor: Option<JobListCursor>) -> Result<JobPage, JobError> {
+        if !(1..=100).contains(&limit) {
+            return Err(JobError::InvalidRequest(
+                "page size must be between 1 and 100".to_owned(),
+            ));
+        }
+        if let Some(value) = cursor.as_ref() {
+            validate_timestamp(&value.updated_at).map_err(|_| {
+                JobError::InvalidRequest("cursor timestamp must be UTC RFC 3339".to_owned())
+            })?;
+            validate_uuid(&value.job_id, "cursor job_id")?;
+        }
+        let fetch_limit = i64::try_from(limit + 1).map_err(|_| {
+            JobError::InvalidRequest("page size cannot be represented safely".to_owned())
+        })?;
+        let connection = self.connection()?;
+        let mut items = if let Some(value) = cursor {
+            let mut statement = connection.prepare(
+                "SELECT job_id, project_id, kind, status, correlation_id, revision,
+                        created_at, started_at, finished_at, updated_at,
+                        progress_current, progress_total, progress_unit, progress_phase,
+                        progress_message, error_code, error_message, error_retriable
+                 FROM job
+                 WHERE project_id = ?1
+                   AND (updated_at < ?2 OR (updated_at = ?2 AND job_id < ?3))
+                 ORDER BY updated_at DESC, job_id DESC
+                 LIMIT ?4",
+            )?;
+            let collected = statement
+                .query_map(
+                    params![self.project_id, value.updated_at, value.job_id, fetch_limit],
+                    row_to_descriptor,
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            collected
+        } else {
+            let mut statement = connection.prepare(
+                "SELECT job_id, project_id, kind, status, correlation_id, revision,
+                        created_at, started_at, finished_at, updated_at,
+                        progress_current, progress_total, progress_unit, progress_phase,
+                        progress_message, error_code, error_message, error_retriable
+                 FROM job
+                 WHERE project_id = ?1
+                 ORDER BY updated_at DESC, job_id DESC
+                 LIMIT ?2",
+            )?;
+            let collected = statement
+                .query_map(params![self.project_id, fetch_limit], row_to_descriptor)?
+                .collect::<Result<Vec<_>, _>>()?;
+            collected
+        };
+        let has_more = items.len() > limit;
+        if has_more {
+            items.truncate(limit);
+        }
+        let next_cursor = if has_more {
+            let last = items.last().ok_or_else(|| {
+                JobError::DataIntegrity("bounded list returned an invalid page".to_owned())
+            })?;
+            Some(JobListCursor {
+                updated_at: last.updated_at.clone(),
+                job_id: last.job_id.clone(),
+            })
+        } else {
+            None
+        };
+        Ok(JobPage { items, next_cursor })
+    }
+
+    fn enqueue_at(
+        &self,
+        request: &JobEnqueueRequest,
+        timestamp: &str,
+    ) -> Result<JobDescriptor, JobError> {
+        validate_enqueue(request)?;
+        validate_timestamp(timestamp)?;
+        let job_event_id = event_id_at("job-event", &request.job_id, 1, "job.queued", timestamp)?;
+        let audit_event_id =
+            event_id_at("audit-event", &request.job_id, 1, "job.queued", timestamp)?;
+        let descriptor = JobDescriptor {
+            correlation_id: request.correlation_id.clone(),
+            created_at: timestamp.to_owned(),
+            job_id: request.job_id.clone(),
+            kind: request.kind.clone(),
+            progress_current: 0,
+            project_id: self.project_id.clone(),
+            revision: 1,
+            status: "QUEUED".to_owned(),
+            updated_at: timestamp.to_owned(),
+            error_code: None,
+            error_message: None,
+            error_retriable: None,
+            finished_at: None,
+            progress_message: None,
+            progress_phase: None,
+            progress_total: request.progress_total,
+            progress_unit: request.progress_unit.clone(),
+            started_at: None,
+        };
+        let after_hash = snapshot_hash(&descriptor)?;
+
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        transaction.execute(
+            "INSERT INTO job (
+                job_id, project_id, kind, status, correlation_id, revision,
+                created_at, updated_at, progress_current, progress_total, progress_unit
+             ) VALUES (?1, ?2, ?3, 'QUEUED', ?4, 1, ?5, ?5, 0, ?6, ?7)",
+            params![
+                descriptor.job_id,
+                descriptor.project_id,
+                descriptor.kind,
+                descriptor.correlation_id,
+                descriptor.created_at,
+                descriptor.progress_total,
+                descriptor.progress_unit,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO job_event (
+                event_id, job_id, event_type, from_status, to_status, revision,
+                progress_current, progress_total, progress_unit, occurred_at, correlation_id
+             ) VALUES (?1, ?2, 'job.queued', NULL, 'QUEUED', 1, 0, ?3, ?4, ?5, ?6)",
+            params![
+                job_event_id,
+                descriptor.job_id,
+                descriptor.progress_total,
+                descriptor.progress_unit,
+                descriptor.created_at,
+                descriptor.correlation_id,
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO audit_event (
+                event_id, actor, action, target_type, target_id,
+                before_hash, after_hash, occurred_at, correlation_id
+             ) VALUES (?1, 'local-user', 'job.queued', 'job', ?2, NULL, ?3, ?4, ?5)",
+            params![
+                audit_event_id,
+                descriptor.job_id,
+                after_hash,
+                descriptor.created_at,
+                descriptor.correlation_id,
+            ],
+        )?;
+        transaction.commit()?;
+        Ok(descriptor)
+    }
+
+    fn connection(&self) -> Result<Connection, JobError> {
+        open_connection(&self.metadata_path)
+    }
+}
+
+fn open_connection(path: &Path) -> Result<Connection, JobError> {
+    let connection = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    Ok(connection)
+}
+
+fn validate_enqueue(request: &JobEnqueueRequest) -> Result<(), JobError> {
+    validate_uuid(&request.job_id, "job_id")?;
+    validate_uuid(&request.correlation_id, "correlation_id")?;
+    if !is_safe_token(&request.kind, 120) {
+        return Err(JobError::InvalidRequest(
+            "kind must match [a-z][a-z0-9._-]{0,119}".to_owned(),
+        ));
+    }
+    if request.progress_total.is_some_and(|total| total <= 0) {
+        return Err(JobError::InvalidRequest(
+            "progress_total must be positive when present".to_owned(),
+        ));
+    }
+    if request
+        .progress_unit
+        .as_deref()
+        .is_some_and(|unit| !is_safe_token(unit, 32))
+    {
+        return Err(JobError::InvalidRequest(
+            "progress_unit must be a bounded safe identifier".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_uuid(value: &str, field: &str) -> Result<(), JobError> {
+    if crate::is_uuid_v7(value) {
+        Ok(())
+    } else {
+        Err(JobError::InvalidRequest(format!(
+            "{field} must be a lowercase UUID v7"
+        )))
+    }
+}
+
+fn validate_timestamp(value: &str) -> Result<OffsetDateTime, JobError> {
+    if !value.ends_with('Z') {
+        return Err(JobError::Timestamp(
+            "timestamp must use UTC Z notation".to_owned(),
+        ));
+    }
+    OffsetDateTime::parse(value, &Rfc3339).map_err(|error| JobError::Timestamp(error.to_string()))
+}
+
+fn is_safe_token(value: &str, maximum: usize) -> bool {
+    let bytes = value.as_bytes();
+    (1..=maximum).contains(&bytes.len())
+        && bytes[0].is_ascii_lowercase()
+        && bytes[1..].iter().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'.' | b'_' | b'-')
+        })
+}
+
+fn event_id_at(
+    label: &str,
+    job_id: &str,
+    revision: i64,
+    event_type: &str,
+    timestamp: &str,
+) -> Result<String, JobError> {
+    let parsed = validate_timestamp(timestamp)?;
+    let milliseconds = parsed.unix_timestamp_nanos() / 1_000_000;
+    let milliseconds = u64::try_from(milliseconds)
+        .map_err(|_| JobError::Timestamp("timestamp precedes the UUID v7 Unix epoch".to_owned()))?;
+    if milliseconds > 0x0000_ffff_ffff_ffff {
+        return Err(JobError::Timestamp(
+            "timestamp exceeds the UUID v7 range".to_owned(),
+        ));
+    }
+    let mut digest = Sha256::new();
+    digest.update(label.as_bytes());
+    digest.update([0]);
+    digest.update(job_id.as_bytes());
+    digest.update([0]);
+    digest.update(revision.to_be_bytes());
+    digest.update([0]);
+    digest.update(event_type.as_bytes());
+    let digest = digest.finalize();
+    let mut bytes = [0_u8; 16];
+    bytes[..6].copy_from_slice(&milliseconds.to_be_bytes()[2..]);
+    bytes[6..].copy_from_slice(&digest[..10]);
+    bytes[6] = (bytes[6] & 0x0f) | 0x70;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(format_uuid(bytes))
+}
+
+fn snapshot_hash(descriptor: &JobDescriptor) -> Result<String, JobError> {
+    let canonical = serde_json::to_vec(descriptor).map_err(|_| {
+        JobError::DataIntegrity("job snapshot could not be hashed safely".to_owned())
+    })?;
+    Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
+}
+
+fn format_uuid(bytes: [u8; 16]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut result = String::with_capacity(36);
+    for (index, byte) in bytes.into_iter().enumerate() {
+        if matches!(index, 4 | 6 | 8 | 10) {
+            result.push('-');
+        }
+        result.push(char::from(HEX[usize::from(byte >> 4)]));
+        result.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    result
+}
+
+fn row_to_descriptor(row: &Row<'_>) -> rusqlite::Result<JobDescriptor> {
+    Ok(JobDescriptor {
+        job_id: row.get(0)?,
+        project_id: row.get(1)?,
+        kind: row.get(2)?,
+        status: row.get(3)?,
+        correlation_id: row.get(4)?,
+        revision: row.get(5)?,
+        created_at: row.get(6)?,
+        started_at: row.get(7)?,
+        finished_at: row.get(8)?,
+        updated_at: row.get(9)?,
+        progress_current: row.get(10)?,
+        progress_total: row.get(11)?,
+        progress_unit: row.get(12)?,
+        progress_phase: row.get(13)?,
+        progress_message: row.get(14)?,
+        error_code: row.get(15)?,
+        error_message: row.get(16)?,
+        error_retriable: row.get::<_, Option<i64>>(17)?.map(|value| value != 0),
+    })
+}
+
 #[cfg(test)]
 mod tests {
-    use rusqlite::{params, Connection, Result, TransactionBehavior};
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    use super::{JobError, JobErrorKind, JOB_MIGRATION};
+    use rusqlite::{params, Connection, Result, TransactionBehavior};
+    use sha2::{Digest, Sha256};
+    use teratai_contracts::generated::job_enqueue_request::JobEnqueueRequest;
+    use teratai_contracts::generated::project_create_request::ProjectCreateRequest;
+    use teratai_contracts::generated::project_manifest::ProjectManifest;
+    use teratai_filesystem::REQUIRED_PROJECT_DIRECTORIES;
+
+    use super::{
+        event_id_at, snapshot_hash, JobError, JobErrorKind, JobListCursor, JobStore, JOB_MIGRATION,
+    };
+    use crate::ProjectService;
 
     const PROJECT_MIGRATION: &str =
         include_str!("../../../migrations/metadata-sqlite/0001_project_core.sql");
@@ -100,6 +523,249 @@ mod tests {
         "2026-01-10T23:60:00Z",
         "2026-01-10T23:59:60Z",
     ];
+
+    #[test]
+    fn jobs_survive_reopen_and_list_is_bounded() {
+        let path = create_schema_two_project("list");
+        let store = JobStore::open(&path).expect("open store");
+        for index in 0..3 {
+            store
+                .enqueue_at(&enqueue(index), &timestamp(index))
+                .expect("enqueue job");
+        }
+        drop(store);
+
+        let reopened = JobStore::open(&path).expect("reopen store");
+        let first = reopened.list(2, None).expect("first page");
+        assert_eq!(
+            first
+                .items
+                .iter()
+                .map(|item| item.job_id.clone())
+                .collect::<Vec<_>>(),
+            vec![job_id(2), job_id(1)]
+        );
+        assert_eq!(
+            first.next_cursor,
+            Some(JobListCursor {
+                updated_at: timestamp(1),
+                job_id: job_id(1),
+            })
+        );
+
+        let second = reopened.list(2, first.next_cursor).expect("second page");
+        assert_eq!(second.items.len(), 1);
+        assert_eq!(second.items[0].job_id, job_id(0));
+        assert!(second.next_cursor.is_none());
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn list_breaks_timestamp_ties_by_descending_job_id_without_duplicates() {
+        let path = create_schema_two_project("list-ties");
+        let store = JobStore::open(&path).expect("open store");
+        for index in 0..3 {
+            store.enqueue_at(&enqueue(index), NOW).expect("enqueue job");
+        }
+
+        let first = store.list(1, None).expect("first page");
+        let second = store.list(1, first.next_cursor).expect("second page");
+        let third = store.list(1, second.next_cursor).expect("third page");
+        assert_eq!(first.items[0].job_id, job_id(2));
+        assert_eq!(second.items[0].job_id, job_id(1));
+        assert_eq!(third.items[0].job_id, job_id(0));
+        assert!(third.next_cursor.is_none());
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn store_rejects_schema_one_without_mutation() {
+        let path = create_schema_one_project("job-v1");
+        let before = control_file_bytes(&path);
+
+        assert!(matches!(
+            JobStore::open(&path),
+            Err(JobError::IncompatibleSchema {
+                expected: 2,
+                actual: 1
+            })
+        ));
+        assert_eq!(control_file_bytes(&path), before);
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn enqueue_validates_exact_flat_fields_before_writing() {
+        let path = create_schema_two_project("validation");
+        let store = JobStore::open(&path).expect("open store");
+        let invalid_requests = [
+            JobEnqueueRequest {
+                job_id: "not-a-uuid".to_owned(),
+                ..enqueue(0)
+            },
+            JobEnqueueRequest {
+                correlation_id: "00000000-0000-6000-8000-000000000301".to_owned(),
+                ..enqueue(0)
+            },
+            JobEnqueueRequest {
+                kind: "Invalid.Kind".to_owned(),
+                ..enqueue(0)
+            },
+            JobEnqueueRequest {
+                kind: format!("a{}", "b".repeat(120)),
+                ..enqueue(0)
+            },
+            JobEnqueueRequest {
+                progress_total: Some(0),
+                ..enqueue(0)
+            },
+            JobEnqueueRequest {
+                progress_unit: Some(" step".to_owned()),
+                ..enqueue(0)
+            },
+            JobEnqueueRequest {
+                progress_unit: Some("x".repeat(33)),
+                ..enqueue(0)
+            },
+        ];
+
+        for request in invalid_requests {
+            assert!(matches!(
+                store.enqueue_at(&request, NOW),
+                Err(JobError::InvalidRequest(_))
+            ));
+        }
+        assert_eq!(job_event_audit_counts(&path), (0, 0, 1));
+        assert!(matches!(
+            store.list(0, None),
+            Err(JobError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            store.list(101, None),
+            Err(JobError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            store.list(
+                1,
+                Some(JobListCursor {
+                    updated_at: "not-a-timestamp".to_owned(),
+                    job_id: job_id(0),
+                })
+            ),
+            Err(JobError::InvalidRequest(_))
+        ));
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn enqueue_persists_snapshot_event_and_audit_atomically() {
+        let path = create_schema_two_project("atomic-enqueue");
+        let store = JobStore::open(&path).expect("open store");
+        let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        connection
+            .execute_batch(
+                "CREATE TRIGGER fail_job_enqueue_audit
+                 BEFORE INSERT ON audit_event
+                 WHEN NEW.action = 'job.queued'
+                 BEGIN SELECT RAISE(ABORT, 'test audit failure'); END;",
+            )
+            .expect("install abort trigger");
+        drop(connection);
+
+        assert!(matches!(
+            store.enqueue_at(&enqueue(0), NOW),
+            Err(JobError::Database(_))
+        ));
+        assert_eq!(job_event_audit_counts(&path), (0, 0, 1));
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn enqueue_event_ids_are_distinct_lowercase_uuid_v7_values() {
+        let path = create_schema_two_project("event-ids");
+        let store = JobStore::open(&path).expect("open store");
+        store
+            .enqueue_at(&enqueue(0), NOW)
+            .expect("enqueue job with events");
+        let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        let job_event_id: String = connection
+            .query_row("SELECT event_id FROM job_event", [], |row| row.get(0))
+            .expect("read job event ID");
+        let audit_event_id: String = connection
+            .query_row(
+                "SELECT event_id FROM audit_event WHERE action = 'job.queued'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read audit event ID");
+        assert!(is_lowercase_uuid_v7(&job_event_id));
+        assert!(is_lowercase_uuid_v7(&audit_event_id));
+        assert!(job_event_id.starts_with("019f7f65-b600-7"));
+        assert!(audit_event_id.starts_with("019f7f65-b600-7"));
+        assert_ne!(job_event_id, audit_event_id);
+        assert_ne!(
+            event_id_at("job-event", &job_id(0), 1, "job.queued", NOW).expect("revision one ID"),
+            event_id_at("job-event", &job_id(0), 2, "job.queued", NOW).expect("revision two ID")
+        );
+        drop(connection);
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn enqueue_audit_hash_matches_the_persisted_snapshot() {
+        let path = create_schema_two_project("audit-hash");
+        let store = JobStore::open(&path).expect("open store");
+        let enqueued = store
+            .enqueue_at(&enqueue(0), NOW)
+            .expect("enqueue job with audit");
+        let persisted = store.get(&enqueued.job_id).expect("read persisted job");
+        let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        let (before_hash, after_hash): (Option<String>, Option<String>) = connection
+            .query_row(
+                "SELECT before_hash, after_hash FROM audit_event WHERE action = 'job.queued'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read audit hashes");
+
+        assert!(before_hash.is_none());
+        assert_eq!(
+            after_hash.as_deref(),
+            Some(snapshot_hash(&persisted).expect("hash snapshot").as_str())
+        );
+        drop(connection);
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn get_rejects_invalid_id_and_reports_missing_job_safely() {
+        let path = create_schema_two_project("get-errors");
+        let store = JobStore::open(&path).expect("open store");
+
+        assert!(matches!(
+            store.get("not-a-uuid"),
+            Err(JobError::InvalidRequest(_))
+        ));
+        assert!(matches!(
+            store.get(&job_id(9)),
+            Err(JobError::JobNotFound(_))
+        ));
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn every_store_connection_enables_foreign_keys() {
+        let path = create_schema_two_project("foreign-keys");
+        let store = JobStore::open(&path).expect("open store");
+        let connection = store.connection().expect("open store connection");
+        let foreign_keys: i64 = connection
+            .pragma_query_value(None, "foreign_keys", |row| row.get(0))
+            .expect("read foreign key setting");
+
+        assert_eq!(foreign_keys, 1);
+        drop(connection);
+        cleanup_project(&path);
+    }
 
     #[test]
     fn schema_two_enforces_job_shape_and_append_only_events() {
@@ -247,6 +913,149 @@ mod tests {
                 error.kind() as u8
             );
         }
+    }
+
+    fn create_schema_two_project(label: &str) -> PathBuf {
+        let path = fixture_target(label);
+        let request = ProjectCreateRequest {
+            name: format!("Job {label}"),
+            project_id: PROJECT_ID.to_owned(),
+            project_path: path.to_string_lossy().into_owned(),
+            request_id: "00000000-0000-7000-8000-000000000101".to_owned(),
+        };
+        ProjectService::create_at(&request, NOW).expect("create schema-two project");
+        path
+    }
+
+    fn create_schema_one_project(label: &str) -> PathBuf {
+        let path = fixture_target(label);
+        fs::create_dir(&path).expect("create schema-one project");
+        for directory in REQUIRED_PROJECT_DIRECTORIES {
+            fs::create_dir_all(path.join(directory)).expect("create project directory");
+        }
+        let manifest = ProjectManifest {
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            created_at: NOW.to_owned(),
+            metadata_schema_version: 1,
+            name: format!("Job {label}"),
+            project_id: PROJECT_ID.to_owned(),
+            schema_version: "1.0.0".to_owned(),
+        };
+        let mut manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("encode manifest");
+        manifest_bytes.push(b'\n');
+        fs::write(path.join("manifest.json"), &manifest_bytes).expect("write manifest");
+        let manifest_hash = format!("sha256:{:x}", Sha256::digest(&manifest_bytes));
+        let mut connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        connection
+            .pragma_update(None, "foreign_keys", true)
+            .expect("enable foreign keys");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("start schema-one transaction");
+        transaction
+            .execute_batch(PROJECT_MIGRATION)
+            .expect("apply schema one");
+        transaction
+            .execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (1, 'project_core', ?1)",
+                [NOW],
+            )
+            .expect("record schema one");
+        transaction
+            .execute(
+                "INSERT INTO project (singleton, project_id, name, created_at, app_version, manifest_schema_version)
+                 VALUES (1, ?1, ?2, ?3, ?4, '1.0.0')",
+                params![PROJECT_ID, manifest.name, NOW, manifest.app_version],
+            )
+            .expect("seed project");
+        transaction
+            .execute(
+                "INSERT INTO audit_event (
+                    event_id, actor, action, target_type, target_id,
+                    before_hash, after_hash, occurred_at, correlation_id
+                 ) VALUES (?1, 'local-user', 'project.created', 'project', ?2, NULL, ?3, ?4, ?1)",
+                params![
+                    "00000000-0000-7000-8000-000000000101",
+                    PROJECT_ID,
+                    manifest_hash,
+                    NOW,
+                ],
+            )
+            .expect("seed project audit");
+        transaction.commit().expect("commit schema one");
+        drop(connection);
+        path
+    }
+
+    fn fixture_target(label: &str) -> PathBuf {
+        static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+        let fixture = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
+        let parent = std::env::temp_dir().join(format!(
+            "teratai-job-{label}-{}-{fixture}",
+            std::process::id()
+        ));
+        fs::create_dir(&parent).expect("create fixture parent");
+        parent.join(format!("{label}.teratai"))
+    }
+
+    fn enqueue(index: u8) -> JobEnqueueRequest {
+        JobEnqueueRequest {
+            correlation_id: format!("00000000-0000-7000-8000-0000000003{index:02}"),
+            job_id: job_id(index),
+            kind: "system.mock_long".to_owned(),
+            progress_total: Some(100),
+            progress_unit: Some("step".to_owned()),
+        }
+    }
+
+    fn job_id(index: u8) -> String {
+        format!("00000000-0000-7000-8000-0000000002{index:02}")
+    }
+
+    fn timestamp(index: u8) -> String {
+        format!("2026-07-20T12:00:{index:02}Z")
+    }
+
+    fn cleanup_project(path: &Path) {
+        fs::remove_dir_all(path.parent().expect("fixture parent")).expect("cleanup fixture");
+    }
+
+    fn control_file_bytes(path: &Path) -> (Vec<u8>, Vec<u8>) {
+        (
+            fs::read(path.join("manifest.json")).expect("read manifest"),
+            fs::read(path.join("metadata.sqlite")).expect("read metadata"),
+        )
+    }
+
+    fn job_event_audit_counts(path: &Path) -> (i64, i64, i64) {
+        let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        (
+            connection
+                .query_row("SELECT COUNT(*) FROM job", [], |row| row.get(0))
+                .expect("job count"),
+            connection
+                .query_row("SELECT COUNT(*) FROM job_event", [], |row| row.get(0))
+                .expect("job event count"),
+            connection
+                .query_row("SELECT COUNT(*) FROM audit_event", [], |row| row.get(0))
+                .expect("audit event count"),
+        )
+    }
+
+    fn is_lowercase_uuid_v7(value: &str) -> bool {
+        let bytes = value.as_bytes();
+        bytes.len() == 36
+            && bytes[8] == b'-'
+            && bytes[13] == b'-'
+            && bytes[14] == b'7'
+            && bytes[18] == b'-'
+            && matches!(bytes[19], b'8' | b'9' | b'a' | b'b')
+            && bytes[23] == b'-'
+            && bytes.iter().enumerate().all(|(index, byte)| {
+                matches!(index, 8 | 13 | 18 | 23)
+                    || byte.is_ascii_digit()
+                    || (b'a'..=b'f').contains(byte)
+            })
     }
 
     fn migrated_memory_database() -> Connection {

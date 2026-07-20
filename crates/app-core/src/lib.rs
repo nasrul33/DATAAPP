@@ -3,6 +3,10 @@
 pub mod job;
 mod project_upgrade;
 
+pub use job::{
+    JobDescriptor, JobEnqueueRequest, JobError, JobErrorKind, JobListCursor, JobPage, JobStore,
+};
+
 use std::fmt::{self, Display, Formatter};
 use std::path::Path;
 
@@ -529,7 +533,7 @@ fn validate_timestamp(value: &str) -> Result<(), ProjectError> {
         .map_err(|error| ProjectError::Timestamp(error.to_string()))
 }
 
-fn is_uuid_v7(value: &str) -> bool {
+pub(crate) fn is_uuid_v7(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 36
         && bytes[8] == b'-'
