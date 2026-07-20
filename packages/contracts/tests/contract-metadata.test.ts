@@ -5,6 +5,9 @@ import type {
   EngineError,
   EngineHandshakeRequest,
   EngineHandshakeResponse,
+  ProjectCreateRequest,
+  ProjectDescriptor,
+  ProjectManifest,
   RuntimeLogEvent,
 } from "../src/index";
 import { createCorrelationId, createRuntimeLogEvent } from "../src/index";
@@ -19,6 +22,36 @@ describe("generated contract metadata", () => {
     } satisfies ContractMetadata;
 
     expect(JSON.parse(JSON.stringify(metadata))).toEqual(metadata);
+  });
+});
+
+describe("project lifecycle contracts", () => {
+  it("keeps create, manifest, and descriptor identities aligned", () => {
+    const request = {
+      name: "Audit Belanja 2026",
+      project_id: "00000000-0000-7000-8000-000000000100",
+      project_path: "D:\\Projects\\Audit Belanja 2026.teratai",
+      request_id: "00000000-0000-7000-8000-000000000101",
+    } satisfies ProjectCreateRequest;
+    const manifest = {
+      app_version: "0.1.0",
+      created_at: "2026-07-20T12:00:00Z",
+      metadata_schema_version: 1,
+      name: request.name,
+      project_id: request.project_id,
+      schema_version: "1.0.0",
+    } satisfies ProjectManifest;
+    const descriptor = {
+      created_at: manifest.created_at,
+      metadata_schema_version: manifest.metadata_schema_version,
+      name: manifest.name,
+      project_id: manifest.project_id,
+      project_path: request.project_path,
+      schema_version: manifest.schema_version,
+    } satisfies ProjectDescriptor;
+
+    expect(descriptor.project_id).toBe(request.project_id);
+    expect(descriptor.metadata_schema_version).toBe(1);
   });
 });
 

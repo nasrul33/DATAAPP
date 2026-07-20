@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/project/project-create-request.schema.json",
+  "title": "ProjectCreateRequest",
+  "description": "Validated native request for creating one local project directory.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["request_id", "project_id", "project_path", "name"],
+  "properties": {
+    "request_id": { "description": "UUID v7 correlation identifier.", "type": "string" },
+    "project_id": { "description": "UUID v7 identity assigned to the new project.", "type": "string" },
+    "project_path": { "description": "Absolute user-approved target directory ending in .teratai.", "type": "string" },
+    "name": { "description": "Human-readable project name.", "type": "string" }
+  }
+}

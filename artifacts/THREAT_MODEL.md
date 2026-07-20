@@ -16,11 +16,11 @@
 ## Priority threats and controls
 | Threat | Control |
 |---|---|
-| Arbitrary path access | scoped file grants, canonical path checks |
+| Arbitrary path access | user-approved absolute target, canonical parent checks, traversal rejection, and linked control-entry rejection |
 | Formula/code injection | safe AST; no eval/shell composition |
 | Malicious spreadsheet values | treat cells as data; escape exports |
 | Sidecar command injection | fixed executable and structured args |
-| Data corruption on interruption | atomic writes, temp+rename, recovery marker |
-| Silent result manipulation | fingerprints, immutable runs, append-only events |
+| Data corruption on interruption | sibling staging directory, durable atomic control-file writes, transactional SQLite migration, same-volume publish rename, recovery marker |
+| Silent result manipulation | manifest SHA-256, manifest/SQLite identity comparison, SQLite integrity check, immutable runs, append-only events |
 | Sensitive data leakage | offline default, masking, explicit export summary |
 | Dependency compromise | lockfiles, SBOM, signature/checksum release |

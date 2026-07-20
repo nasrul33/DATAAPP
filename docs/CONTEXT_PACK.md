@@ -2,7 +2,7 @@
 
 ## Project identity
 - Objective: desktop no-code/low-code analytics for audit and data analysis.
-- Current phase: planning/foundation.
+- Current phase: Phase 1 project core.
 - Primary OS MVP: Windows.
 - Locale: Indonesian UI, Asia/Jakarta display time, locale-safe data parsing.
 
@@ -67,6 +67,7 @@ Codex must read AGENTS, Product, Architecture, Primitives, IPC Contracts, curren
 | T-0005 | Completed | 2026-07-20 | Tauri 2.x opens a tested React/Vite dashboard shell with explicit loading, error, and empty states |
 | T-0006 | Completed | 2026-07-20 | Rust launches and supervises the Python 3.12 sidecar while verifying protocol, version, correlation, health, timeout, and typed failures |
 | T-0007 | Completed | 2026-07-20 | Canonical structured emitters cover desktop, native, and engine layers; the supervised Rust-Python trace preserves one UUID v7 correlation with deterministic sequence and bounded capture |
+| T-0100 | Completed | 2026-07-20 | Transactional project create/open/validate uses recovery-marked staging, atomic publication, SQLite schema 1, manifest fingerprint validation, and append-only initial audit history |
 
 ## T-0001 decisions and deviations
 | ID | Decision/deviation | Reason | Follow-up |
@@ -143,3 +144,15 @@ T-0006 adds only lifecycle handshake and typed startup failure behavior. It does
 | DEC-F034 | Enable the `formatting` feature on pinned `time` 0.3.53 already present transitively | Native UTC RFC 3339 formatting is required; no additional resolved Rust package is introduced | Reassess the direct dependency during dedicated dependency maintenance |
 
 T-0007 adds observability only. It does not persist logs, record user/source data, expose an engine Tauri command, execute analytics, create jobs, or enable telemetry.
+
+## T-0100 decisions and deviations
+| ID | Decision/deviation | Reason | Follow-up |
+|---|---|---|---|
+| DEC-F035 | Split Project Core into T-0100 native storage and T-0101 desktop integration | Keep the first Phase 1 change independently reviewable and avoid granting UI filesystem capabilities before the native boundary is tested | T-0101 supersedes the T-0100 UI-enablement label in DEC-F022 and owns typed Tauri commands plus all UI states |
+| DEC-F036 | Create projects in a recovery-marked sibling staging directory and publish through same-volume rename | Prevent partially initialized projects from appearing valid after interruption | T-0101 must present recovery-required errors without deleting user data automatically |
+| DEC-F037 | Establish SQLite schema 1 with strict project/migration tables and append-only audit triggers | Provide durable identity and an immutable first audit event before adding domain entities | Future schema changes require numbered migration, transaction, data dictionary update, and rollback note |
+| DEC-F038 | Hash exact manifest bytes with SHA-256 and compare them with the first audit event during every open | Detect additive or identity-preserving manifest tampering that field comparison alone misses | Future authorized manifest changes require an explicit compensating audit event/versioned workflow |
+| DEC-F039 | Pin `rusqlite` 0.40.1 with default features disabled and bundled SQLite enabled | Use one deterministic Windows-compatible SQLite runtime without host installation dependency; reviewed license is MIT | Reassess bundle size and SQLite CVEs during release hardening; extensions remain disabled |
+| DEC-F040 | Reject parent traversal, non-`.teratai` targets, linked control entries, oversized manifests, schema mismatch, integrity failure, and manifest/database identity drift | Enforce the local filesystem trust boundary before any desktop command exposes it | Windows reparse-point and permission UX receives end-to-end coverage in T-0101 |
+
+T-0100 does not expose Tauri commands, file pickers, or UI project actions. It does not import data, execute analytics, create jobs, or mutate an existing valid project during open/validate.

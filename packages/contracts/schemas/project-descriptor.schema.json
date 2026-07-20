@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/project/project-descriptor.schema.json",
+  "title": "ProjectDescriptor",
+  "description": "Validated project identity returned by the native project core.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "project_id",
+    "name",
+    "project_path",
+    "created_at",
+    "schema_version",
+    "metadata_schema_version"
+  ],
+  "properties": {
+    "project_id": { "description": "UUID v7 immutable project identity.", "type": "string" },
+    "name": { "description": "Human-readable project name.", "type": "string" },
+    "project_path": { "description": "Canonical absolute project directory.", "type": "string" },
+    "created_at": { "description": "ISO-8601 UTC creation timestamp.", "type": "string" },
+    "schema_version": { "description": "Validated project manifest semantic version.", "type": "string" },
+    "metadata_schema_version": { "description": "Validated `SQLite` metadata schema version.", "type": "integer" }
+  }
+}

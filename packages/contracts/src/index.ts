@@ -4,6 +4,9 @@ export type { ContractMetadata } from "./generated/contract-metadata";
 export type { EngineError } from "./generated/engine-error";
 export type { EngineHandshakeRequest } from "./generated/engine-handshake-request";
 export type { EngineHandshakeResponse } from "./generated/engine-handshake-response";
+export type { ProjectCreateRequest } from "./generated/project-create-request";
+export type { ProjectDescriptor } from "./generated/project-descriptor";
+export type { ProjectManifest } from "./generated/project-manifest";
 export type { RuntimeLogEvent } from "./generated/runtime-log-event";
 export {
   createCorrelationId,

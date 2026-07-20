@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/project/project-manifest.schema.json",
+  "title": "ProjectManifest",
+  "description": "Immutable identity and compatibility metadata stored at a Teratai project root.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "schema_version",
+    "project_id",
+    "name",
+    "created_at",
+    "app_version",
+    "metadata_schema_version"
+  ],
+  "properties": {
+    "schema_version": { "description": "Project manifest semantic version.", "type": "string" },
+    "project_id": { "description": "UUID v7 immutable project identity.", "type": "string" },
+    "name": { "description": "Human-readable project name.", "type": "string" },
+    "created_at": { "description": "ISO-8601 UTC creation timestamp.", "type": "string" },
+    "app_version": { "description": "Teratai version that created the project.", "type": "string" },
+    "metadata_schema_version": { "description": "Required `SQLite` metadata schema version.", "type": "integer" }
+  }
+}
