@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -20,9 +21,12 @@ enum BeginStage {
 enum FinalizeStage {
     CreateCleanupDirectory,
     MoveMetadataBackup,
+    AfterMetadataBackupRename,
     MoveManifestBackup,
+    AfterManifestBackupRename,
     MoveLock,
     MoveMarker,
+    AfterMarkerRename,
     CleanupMetadataBackup,
     CleanupManifestBackup,
     CleanupLock,
@@ -51,11 +55,18 @@ struct ContentProof {
     digest_b: u64,
 }
 
+#[derive(Debug)]
+struct OwnedFile {
+    file: File,
+    identity: FileIdentity,
+}
+
 /// A durable guard for an in-place project metadata upgrade.
 #[derive(Debug)]
 pub struct ProjectUpgrade {
     layout: ProjectLayout,
     marker_path: PathBuf,
+    marker_file: RefCell<OwnedFile>,
     metadata_backup_path: PathBuf,
     manifest_backup_path: PathBuf,
     metadata_backup_file: File,
@@ -73,6 +84,8 @@ pub struct ProjectUpgrade {
     recovery_identity: FileIdentity,
     correlation_id: String,
     cleanup_directory: Option<PathBuf>,
+    cleanup_directory_file: Option<File>,
+    cleanup_identity: Option<FileIdentity>,
     committed: bool,
     finalize_failure: Option<FinalizeStage>,
 }
@@ -86,13 +99,16 @@ impl ProjectUpgrade {
     /// large, or cannot be durably replaced.
     pub fn write_marker(&self, contents: &[u8]) -> Result<(), FilesystemError> {
         self.validate_owned_state()?;
-        let _marker = open_verified_regular(&self.marker_path, "upgrade recovery marker", false)?;
         durable_bounded_write(
             &self.marker_path,
             contents,
             MANIFEST_LIMIT_BYTES,
             &self.correlation_id,
-        )
+        )?;
+        let (file, identity) =
+            open_verified_regular(&self.marker_path, "upgrade recovery marker", true)?;
+        *self.marker_file.borrow_mut() = OwnedFile { file, identity };
+        Ok(())
     }
 
     /// Atomically replace the bounded project manifest.
@@ -199,7 +215,14 @@ impl ProjectUpgrade {
             self.lock_identity,
             "project upgrade lock",
         )?;
-        let _marker = open_verified_regular(&self.marker_path, "upgrade recovery marker", false)?;
+        let marker = self.marker_file.borrow();
+        validate_file_handle(
+            &self.marker_path,
+            &marker.file,
+            marker.identity,
+            "upgrade recovery marker",
+        )?;
+        self.validate_cleanup_directory()?;
         Ok(())
     }
 
@@ -227,19 +250,7 @@ impl ProjectUpgrade {
     }
 
     fn finalize_recovery_artifacts(&mut self) -> Result<(), FilesystemError> {
-        let cleanup_directory = if let Some(path) = &self.cleanup_directory {
-            path.clone()
-        } else {
-            self.fail_finalize_stage(FinalizeStage::CreateCleanupDirectory)?;
-            let path = self
-                .layout
-                .root()
-                .join(format!(".project-upgrade-cleanup-{}", self.correlation_id));
-            fs::create_dir(&path)?;
-            self.cleanup_directory = Some(path.clone());
-            sync_directory(self.layout.root())?;
-            path
-        };
+        let cleanup_directory = self.prepare_cleanup_directory()?;
 
         self.move_proof_file(
             FinalizeStage::MoveMetadataBackup,
@@ -298,10 +309,52 @@ impl ProjectUpgrade {
             }
         }
         if !self.skip_cleanup_stage(FinalizeStage::CleanupDirectory) {
+            drop(self.cleanup_directory_file.take());
+            self.cleanup_identity = None;
             let _ = fs::remove_dir(&cleanup_directory);
             let _ = sync_directory(self.layout.root());
         }
         Ok(())
+    }
+
+    fn prepare_cleanup_directory(&mut self) -> Result<PathBuf, FilesystemError> {
+        if let Some(path) = &self.cleanup_directory {
+            self.validate_cleanup_directory()?;
+            return Ok(path.clone());
+        }
+        self.fail_finalize_stage(FinalizeStage::CreateCleanupDirectory)?;
+        let path = self
+            .layout
+            .root()
+            .join(format!(".project-upgrade-cleanup-{}", self.correlation_id));
+        fs::create_dir(&path)?;
+        self.cleanup_directory = Some(path.clone());
+        let (directory, identity) = open_verified_directory(&path, "upgrade cleanup directory")?;
+        self.cleanup_directory_file = Some(directory);
+        self.cleanup_identity = Some(identity);
+        sync_directory(self.layout.root())?;
+        Ok(path)
+    }
+
+    fn validate_cleanup_directory(&self) -> Result<(), FilesystemError> {
+        match (
+            &self.cleanup_directory,
+            &self.cleanup_directory_file,
+            self.cleanup_identity,
+        ) {
+            (Some(path), Some(directory), Some(identity)) => {
+                validate_directory_handle(path, directory, identity, "upgrade cleanup directory")
+            }
+            (None, None, None) => Ok(()),
+            _ => Err(FilesystemError::InvalidLayout(
+                "upgrade cleanup directory ownership is incomplete".to_owned(),
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    fn prepare_cleanup_directory_for_test(&mut self) -> Result<PathBuf, FilesystemError> {
+        self.prepare_cleanup_directory()
     }
 
     fn move_proof_file(
@@ -316,7 +369,14 @@ impl ProjectUpgrade {
             ProofFile::Marker => self.marker_path.clone(),
         };
         if source == destination {
+            self.validate_moved_proof(proof, destination)?;
             return Ok(());
+        }
+        self.validate_cleanup_directory()?;
+        self.validate_proof_parent(&source)?;
+        self.validate_moved_proof(proof, &source)?;
+        if entry_exists_no_follow(destination)? {
+            return Err(FilesystemError::RecoveryRequired(destination.to_owned()));
         }
         self.fail_finalize_stage(stage)?;
         fs::rename(&source, destination)?;
@@ -326,12 +386,81 @@ impl ProjectUpgrade {
             ProofFile::ManifestBackup => self.manifest_backup_path = destination_owned,
             ProofFile::Marker => self.marker_path = destination_owned,
         }
+        let after_rename_stage = match proof {
+            ProofFile::MetadataBackup => FinalizeStage::AfterMetadataBackupRename,
+            ProofFile::ManifestBackup => FinalizeStage::AfterManifestBackupRename,
+            ProofFile::Marker => FinalizeStage::AfterMarkerRename,
+        };
+        self.fail_finalize_stage(after_rename_stage)?;
+        if entry_exists_no_follow(&source)? {
+            return Err(FilesystemError::InvalidLayout(
+                "recovery proof source remained after rename".to_owned(),
+            ));
+        }
+        self.validate_moved_proof(proof, destination)?;
+        self.validate_cleanup_directory()?;
+        self.validate_proof_parent(&source)?;
         sync_directory(destination.parent().ok_or_else(|| {
             FilesystemError::InvalidPath("cleanup artifact parent is missing".to_owned())
         })?)?;
         sync_directory(source.parent().ok_or_else(|| {
             FilesystemError::InvalidPath("recovery artifact parent is missing".to_owned())
         })?)
+    }
+
+    fn validate_moved_proof(&self, proof: ProofFile, path: &Path) -> Result<(), FilesystemError> {
+        match proof {
+            ProofFile::MetadataBackup => validate_file_handle(
+                path,
+                &self.metadata_backup_file,
+                self.metadata_backup_identity,
+                "metadata recovery backup",
+            ),
+            ProofFile::ManifestBackup => validate_file_handle(
+                path,
+                &self.manifest_backup_file,
+                self.manifest_backup_identity,
+                "manifest recovery backup",
+            ),
+            ProofFile::Marker => {
+                let marker = self.marker_file.borrow();
+                validate_file_handle(
+                    path,
+                    &marker.file,
+                    marker.identity,
+                    "upgrade recovery marker",
+                )
+            }
+        }
+    }
+
+    fn validate_proof_parent(&self, source: &Path) -> Result<(), FilesystemError> {
+        let parent = source.parent().ok_or_else(|| {
+            FilesystemError::InvalidPath("recovery proof parent is missing".to_owned())
+        })?;
+        let recovery_path = self.layout.root().join("recovery");
+        if parent == self.layout.root() {
+            return validate_directory_handle(
+                self.layout.root(),
+                &self.root_directory,
+                self.root_identity,
+                "project root",
+            );
+        }
+        if parent == recovery_path {
+            return validate_directory_handle(
+                &recovery_path,
+                &self.recovery_directory,
+                self.recovery_identity,
+                "recovery directory",
+            );
+        }
+        if self.cleanup_directory.as_deref() == Some(parent) {
+            return self.validate_cleanup_directory();
+        }
+        Err(FilesystemError::InvalidLayout(
+            "recovery proof parent is not owned by this guard".to_owned(),
+        ))
     }
 
     #[cfg(test)]
@@ -478,10 +607,16 @@ where
         MANIFEST_LIMIT_BYTES,
         correlation_id,
     )?;
+    let (marker_file, marker_identity) =
+        open_verified_regular(&marker_path, "upgrade recovery marker", true)?;
 
     Ok(ProjectUpgrade {
         layout: layout.clone(),
         marker_path,
+        marker_file: RefCell::new(OwnedFile {
+            file: marker_file,
+            identity: marker_identity,
+        }),
         metadata_backup_path,
         manifest_backup_path,
         metadata_backup_file,
@@ -499,6 +634,8 @@ where
         recovery_identity,
         correlation_id: correlation_id.to_owned(),
         cleanup_directory: None,
+        cleanup_directory_file: None,
+        cleanup_identity: None,
         committed: false,
         finalize_failure: None,
     })
@@ -1187,6 +1324,27 @@ mod tests {
     }
 
     #[test]
+    fn partial_move_faults_before_directory_sync_restore_original_controls() {
+        for stage in [
+            FinalizeStage::AfterMetadataBackupRename,
+            FinalizeStage::AfterManifestBackupRename,
+            FinalizeStage::AfterMarkerRename,
+        ] {
+            let fixture = project_fixture("partial-proof-move");
+            let layout = fixture.layout();
+            let before = control_file_bytes(layout.root());
+            let mut upgrade = begin_project_upgrade(layout, CORRELATION_ID, MARKER).unwrap();
+            fs::write(layout.metadata_path(), b"mutated metadata").unwrap();
+            upgrade.write_manifest(b"mutated manifest").unwrap();
+            upgrade.inject_finalize_failure(stage);
+
+            assert!(upgrade.commit().is_err(), "stage {stage:?}");
+            assert_eq!(control_file_bytes(layout.root()), before, "stage {stage:?}");
+            validate_project_layout(layout.root()).expect("restored layout");
+        }
+    }
+
+    #[test]
     fn cleanup_failures_after_marker_move_do_not_report_failed_commit() {
         for stage in [
             FinalizeStage::MoveLock,
@@ -1344,6 +1502,38 @@ mod tests {
             begin_project_upgrade(layout, CORRELATION_ID, MARKER),
             Err(FilesystemError::RecoveryRequired(_))
         ));
+        drop(upgrade);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn marker_handle_remains_exclusively_owned_until_finalization() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let fixture = project_fixture("owned-marker");
+        let layout = fixture.layout();
+        let upgrade = begin_project_upgrade(layout, CORRELATION_ID, MARKER).unwrap();
+        let marker_path = layout.root().join(".project-upgrade-recovery.json");
+
+        assert!(OpenOptions::new()
+            .read(true)
+            .write(true)
+            .share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004)
+            .open(marker_path)
+            .is_err());
+        drop(upgrade);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn cleanup_directory_cannot_be_swapped_while_guard_owns_it() {
+        let fixture = project_fixture("owned-cleanup-directory");
+        let layout = fixture.layout();
+        let mut upgrade = begin_project_upgrade(layout, CORRELATION_ID, MARKER).unwrap();
+        let cleanup = upgrade.prepare_cleanup_directory_for_test().unwrap();
+        let swapped = layout.root().join("swapped-cleanup-directory");
+
+        assert!(fs::rename(&cleanup, &swapped).is_err());
         drop(upgrade);
     }
 
