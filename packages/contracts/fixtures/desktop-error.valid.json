@@ -1,0 +1,9 @@
+{
+  "code": "PERMISSION_DENIED",
+  "correlation_id": "00000000-0000-7000-8000-000000000111",
+  "detail": "operating system denied project path access",
+  "field_errors": [],
+  "message": "Teratai tidak memiliki izin untuk lokasi tersebut.",
+  "remediation": "Pilih lokasi yang dapat ditulis.",
+  "retriable": true
+}

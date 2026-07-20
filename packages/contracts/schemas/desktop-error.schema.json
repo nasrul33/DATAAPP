@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/runtime/desktop-error.schema.json",
+  "title": "DesktopError",
+  "description": "User-safe typed error returned by native desktop commands.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "code",
+    "message",
+    "detail",
+    "retriable",
+    "correlation_id",
+    "field_errors"
+  ],
+  "properties": {
+    "code": { "description": "Stable error taxonomy code.", "type": "string" },
+    "message": { "description": "Localized user-safe summary.", "type": "string" },
+    "detail": { "description": "Safe technical category without secret or path leakage.", "type": "string" },
+    "retriable": { "description": "Whether retrying unchanged input can be safe.", "type": "boolean" },
+    "correlation_id": { "description": "UUID v7 joining UI and native diagnostics.", "type": "string" },
+    "field_errors": { "description": "Actionable field validation messages.", "type": "array", "items": { "type": "string" } },
+    "remediation": { "description": "Optional user-safe recovery guidance.", "type": "string" }
+  }
+}

@@ -2,12 +2,15 @@ import { describe, expect, it } from "vitest";
 
 import type {
   ContractMetadata,
+  CorrelationRequest,
+  DesktopError,
   EngineError,
   EngineHandshakeRequest,
   EngineHandshakeResponse,
   ProjectCreateRequest,
   ProjectDescriptor,
   ProjectManifest,
+  ProjectOpenRequest,
   RuntimeLogEvent,
 } from "../src/index";
 import { createCorrelationId, createRuntimeLogEvent } from "../src/index";
@@ -52,6 +55,28 @@ describe("project lifecycle contracts", () => {
 
     expect(descriptor.project_id).toBe(request.project_id);
     expect(descriptor.metadata_schema_version).toBe(1);
+  });
+
+  it("represents typed desktop project commands and failures", () => {
+    const correlation = {
+      request_id: "00000000-0000-7000-8000-000000000111",
+    } satisfies CorrelationRequest;
+    const open = {
+      project_path: "D:\\Projects\\Audit Belanja 2026.teratai",
+      request_id: correlation.request_id,
+    } satisfies ProjectOpenRequest;
+    const error = {
+      code: "PERMISSION_DENIED",
+      correlation_id: open.request_id,
+      detail: "operating system denied project path access",
+      field_errors: [],
+      message: "Teratai tidak memiliki izin untuk lokasi tersebut.",
+      remediation: "Pilih lokasi lain.",
+      retriable: true,
+    } satisfies DesktopError;
+
+    expect(error.correlation_id).toBe(correlation.request_id);
+    expect(error.code).toBe("PERMISSION_DENIED");
   });
 });
 

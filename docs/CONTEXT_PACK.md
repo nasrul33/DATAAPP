@@ -68,6 +68,7 @@ Codex must read AGENTS, Product, Architecture, Primitives, IPC Contracts, curren
 | T-0006 | Completed | 2026-07-20 | Rust launches and supervises the Python 3.12 sidecar while verifying protocol, version, correlation, health, timeout, and typed failures |
 | T-0007 | Completed | 2026-07-20 | Canonical structured emitters cover desktop, native, and engine layers; the supervised Rust-Python trace preserves one UUID v7 correlation with deterministic sequence and bounded capture |
 | T-0100 | Completed | 2026-07-20 | Transactional project create/open/validate uses recovery-marked staging, atomic publication, SQLite schema 1, manifest fingerprint validation, and append-only initial audit history |
+| T-0101 | Completed | 2026-07-20 | Typed Tauri lifecycle commands, system path selection, safe desktop error mapping, in-memory active session, and complete loading/empty/permission/recovery/error/active UI states |
 
 ## T-0001 decisions and deviations
 | ID | Decision/deviation | Reason | Follow-up |
@@ -156,3 +157,15 @@ T-0007 adds observability only. It does not persist logs, record user/source dat
 | DEC-F040 | Reject parent traversal, non-`.teratai` targets, linked control entries, oversized manifests, schema mismatch, integrity failure, and manifest/database identity drift | Enforce the local filesystem trust boundary before any desktop command exposes it | Windows reparse-point and permission UX receives end-to-end coverage in T-0101 |
 
 T-0100 does not expose Tauri commands, file pickers, or UI project actions. It does not import data, execute analytics, create jobs, or mutate an existing valid project during open/validate.
+
+## T-0101 decisions and deviations
+| ID | Decision/deviation | Reason | Follow-up |
+|---|---|---|---|
+| DEC-F041 | Pin `@tauri-apps/plugin-dialog` and `tauri-plugin-dialog` 2.7.2, licensed MIT/Apache-2.0, and grant only open/save dialog permissions | Use the standard Tauri 2 system picker without broad frontend filesystem capability; the npm package adds about 33 KiB unpacked | Reassess plugin versions only in dedicated dependency maintenance with full gates |
+| DEC-F042 | Expose create/open/validate/current/close through a Tauri adapter that depends on `app-core` and canonical contracts | Preserve architecture boundaries and prevent UI code from performing storage validation | Future project commands must reuse the same typed adapter and correlation rules |
+| DEC-F043 | Classify project-core failures with `ProjectErrorKind` before mapping them to `DesktopError` | Give UI actionable states without leaking raw SQLite failures or sensitive absolute paths | Expand the stable error taxonomy only alongside contract and UI-state tests |
+| DEC-F044 | Keep the active project session in process memory and keep open/validate read-only | Meet lifecycle scope without inventing recent-project persistence or mutating a valid project | Durable recent-project history requires a separately owned metadata task |
+| DEC-F045 | Render a permission state in standalone browser preview | Browser preview cannot invoke Tauri or safely emulate native filesystem grants | Native create/open picker behavior remains verified by Rust integration tests and desktop manual QA |
+| DEC-F046 | Make recovery/corruption UI non-destructive and omit automatic retry/delete actions | Preserve user data when recovery markers or integrity checks fail | A future recovery workflow requires its own audited design and tests |
+
+T-0101 closes the UI/filesystem-boundary follow-ups in DEC-F022, DEC-F035, DEC-F036, and DEC-F040. No analytics operation, job runtime, source import, schema migration, or automatic project recovery was added.

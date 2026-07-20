@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/project/project-open-request.schema.json",
+  "title": "ProjectOpenRequest",
+  "description": "Native request for opening or validating one user-approved project directory.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["request_id", "project_path"],
+  "properties": {
+    "request_id": {
+      "description": "Lowercase UUID v7 correlation identifier.",
+      "type": "string"
+    },
+    "project_path": {
+      "description": "Absolute user-approved `.teratai` project directory.",
+      "type": "string"
+    }
+  }
+}

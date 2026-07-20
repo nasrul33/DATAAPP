@@ -39,6 +39,54 @@ pub enum ProjectError {
     Timestamp(String),
 }
 
+/// Stable adapter-facing classification that does not expose paths or raw database errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProjectErrorKind {
+    InvalidRequest,
+    TargetExists,
+    RecoveryRequired,
+    PermissionDenied,
+    InvalidPath,
+    InvalidLayout,
+    ControlFileTooLarge,
+    Filesystem,
+    Database,
+    Serialization,
+    IncompatibleProject,
+    DataIntegrity,
+    Timestamp,
+}
+
+impl ProjectError {
+    /// Return a path-safe category for IPC and presentation adapters.
+    #[must_use]
+    pub fn kind(&self) -> ProjectErrorKind {
+        match self {
+            Self::InvalidRequest(_) => ProjectErrorKind::InvalidRequest,
+            Self::Filesystem(FilesystemError::AlreadyExists(_)) => ProjectErrorKind::TargetExists,
+            Self::Filesystem(FilesystemError::RecoveryRequired(_)) => {
+                ProjectErrorKind::RecoveryRequired
+            }
+            Self::Filesystem(FilesystemError::Io(error))
+                if error.kind() == std::io::ErrorKind::PermissionDenied =>
+            {
+                ProjectErrorKind::PermissionDenied
+            }
+            Self::Filesystem(FilesystemError::InvalidPath(_)) => ProjectErrorKind::InvalidPath,
+            Self::Filesystem(FilesystemError::InvalidLayout(_)) => ProjectErrorKind::InvalidLayout,
+            Self::Filesystem(FilesystemError::FileTooLarge { .. }) => {
+                ProjectErrorKind::ControlFileTooLarge
+            }
+            Self::Filesystem(FilesystemError::Io(_)) => ProjectErrorKind::Filesystem,
+            Self::Serialization(_) => ProjectErrorKind::Serialization,
+            Self::Database(_) => ProjectErrorKind::Database,
+            Self::IncompatibleProject(_) => ProjectErrorKind::IncompatibleProject,
+            Self::DataIntegrity(_) => ProjectErrorKind::DataIntegrity,
+            Self::Timestamp(_) => ProjectErrorKind::Timestamp,
+        }
+    }
+}
+
 impl Display for ProjectError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
@@ -518,6 +566,20 @@ mod tests {
         ));
         assert_eq!(fs::read_dir(&parent).expect("read parent").count(), 0);
         fs::remove_dir_all(parent).expect("test cleanup");
+    }
+
+    #[test]
+    fn classifies_errors_without_exposing_sensitive_details() {
+        let permission = ProjectError::Filesystem(FilesystemError::Io(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "D:\\sensitive\\project.teratai",
+        )));
+        let recovery = ProjectError::Filesystem(FilesystemError::RecoveryRequired(PathBuf::from(
+            "D:\\sensitive\\marker.json",
+        )));
+
+        assert_eq!(permission.kind(), ProjectErrorKind::PermissionDenied);
+        assert_eq!(recovery.kind(), ProjectErrorKind::RecoveryRequired);
     }
 
     #[test]
