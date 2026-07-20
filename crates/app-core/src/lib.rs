@@ -1,6 +1,7 @@
 #![doc = "Application orchestration boundary for Teratai Analytics Desktop."]
 
 pub mod job;
+mod project_upgrade;
 
 use std::fmt::{self, Display, Formatter};
 use std::path::Path;
@@ -169,6 +170,21 @@ impl ProjectService {
     /// Returns the same typed validation failures as [`Self::open`].
     pub fn validate(path: &Path) -> Result<ProjectDescriptor, ProjectError> {
         Self::open(path)
+    }
+
+    /// Explicitly upgrade a validated metadata schema-one project to schema two.
+    ///
+    /// Schema-two projects are returned unchanged. This method is the only
+    /// project lifecycle operation allowed to mutate an existing schema-one
+    /// project.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the correlation identifier, source project,
+    /// migration transaction, manifest replacement, validation, or durable
+    /// recovery process fails.
+    pub fn upgrade(path: &Path, correlation_id: &str) -> Result<ProjectDescriptor, ProjectError> {
+        project_upgrade::upgrade_project(path, correlation_id)
     }
 
     fn create_at(
@@ -371,14 +387,74 @@ fn validate_database(
             "project has no append-only audit history".to_owned(),
         ));
     }
-    let audited_hash: String = connection.query_row(
-        "SELECT after_hash FROM audit_event WHERE sequence = 1 AND action = 'project.created'",
-        [],
-        |row| row.get(0),
+    validate_manifest_authorization_chain(&connection, &manifest.project_id, manifest_hash)?;
+    Ok(())
+}
+
+fn validate_manifest_authorization_chain(
+    connection: &Connection,
+    project_id: &str,
+    manifest_hash: &str,
+) -> Result<(), ProjectError> {
+    let mut statement = connection.prepare(
+        "SELECT sequence, action, before_hash, after_hash
+         FROM audit_event
+         WHERE target_type = 'project' AND target_id = ?1
+         ORDER BY sequence",
     )?;
-    if audited_hash != manifest_hash {
+    let rows = statement.query_map([project_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, Option<String>>(3)?,
+        ))
+    })?;
+
+    let mut previous_hash: Option<String> = None;
+    let mut previous_sequence = 0_i64;
+    let mut chain_length = 0_usize;
+    for row in rows {
+        let (sequence, action, before_hash, after_hash) = row?;
+        if sequence != previous_sequence + 1 {
+            return Err(ProjectError::DataIntegrity(
+                "manifest authorization chain contains a sequence gap".to_owned(),
+            ));
+        }
+        let after_hash = after_hash.filter(|hash| !hash.is_empty()).ok_or_else(|| {
+            ProjectError::DataIntegrity(
+                "manifest authorization chain contains an empty after hash".to_owned(),
+            )
+        })?;
+
+        match chain_length {
+            0 if sequence == 1 && action == "project.created" && before_hash.is_none() => {}
+            0 => {
+                return Err(ProjectError::DataIntegrity(
+                    "manifest authorization chain must begin with project.created".to_owned(),
+                ));
+            }
+            _ if action != "project.metadata_migrated" => {
+                return Err(ProjectError::DataIntegrity(
+                    "manifest authorization chain contains an unknown action".to_owned(),
+                ));
+            }
+            _ if before_hash.as_deref() != previous_hash.as_deref() => {
+                return Err(ProjectError::DataIntegrity(
+                    "manifest authorization chain contains a broken link".to_owned(),
+                ));
+            }
+            _ => {}
+        }
+
+        previous_hash = Some(after_hash);
+        previous_sequence = sequence;
+        chain_length += 1;
+    }
+
+    if chain_length == 0 || previous_hash.as_deref() != Some(manifest_hash) {
         return Err(ProjectError::DataIntegrity(
-            "manifest fingerprint differs from the initial audit event".to_owned(),
+            "current manifest is not authorized by the audit chain".to_owned(),
         ));
     }
     Ok(())

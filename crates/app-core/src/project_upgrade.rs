@@ -1,0 +1,456 @@
+use std::path::Path;
+
+use rusqlite::{params, Connection, TransactionBehavior};
+use sha2::{Digest, Sha256};
+use teratai_contracts::generated::project_descriptor::ProjectDescriptor;
+use teratai_filesystem::{begin_project_upgrade, validate_project_layout};
+use time::format_description::well_known::Rfc3339;
+use time::OffsetDateTime;
+
+use crate::{
+    descriptor, is_uuid_v7, read_manifest, validate_database, validate_manifest, ProjectError,
+    METADATA_SCHEMA_VERSION,
+};
+
+#[cfg(not(test))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpgradeFault {
+    None,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UpgradeFault {
+    None,
+    AfterDatabaseCommit,
+    DuringRestoreVerification,
+}
+
+pub(super) fn upgrade_project(
+    path: &Path,
+    correlation_id: &str,
+) -> Result<ProjectDescriptor, ProjectError> {
+    upgrade_project_inner(path, correlation_id, UpgradeFault::None)
+}
+
+fn upgrade_project_inner(
+    path: &Path,
+    correlation_id: &str,
+    fault: UpgradeFault,
+) -> Result<ProjectDescriptor, ProjectError> {
+    #[cfg(not(test))]
+    let _ = fault;
+    if !is_uuid_v7(correlation_id) {
+        return Err(ProjectError::InvalidRequest(
+            "correlation_id must be a lowercase UUID v7 value".to_owned(),
+        ));
+    }
+
+    let layout = validate_project_layout(path)?;
+    let (manifest, before_hash) = read_manifest(&layout)?;
+    validate_manifest(&manifest)?;
+    validate_database(&layout, &manifest, &before_hash)?;
+    let before_descriptor = descriptor(&layout, &manifest)?;
+    if manifest.metadata_schema_version == METADATA_SCHEMA_VERSION {
+        return Ok(before_descriptor);
+    }
+
+    let mut upgraded_manifest = manifest.clone();
+    upgraded_manifest.metadata_schema_version = METADATA_SCHEMA_VERSION;
+    let mut upgraded_manifest_bytes = serde_json::to_vec_pretty(&upgraded_manifest)?;
+    upgraded_manifest_bytes.push(b'\n');
+    let after_hash = format!("sha256:{:x}", Sha256::digest(&upgraded_manifest_bytes));
+    let migrated_at = OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .map_err(|error| ProjectError::Timestamp(error.to_string()))?;
+    let marker = serde_json::to_vec(&serde_json::json!({
+        "after_hash": after_hash,
+        "before_hash": before_hash,
+        "correlation_id": correlation_id,
+        "from_metadata_schema_version": manifest.metadata_schema_version,
+        "project_id": manifest.project_id,
+        "state": "UPGRADING",
+        "to_metadata_schema_version": METADATA_SCHEMA_VERSION
+    }))?;
+    let mut guard = begin_project_upgrade(&layout, correlation_id, &marker)?;
+
+    let upgrade_result = (|| -> Result<ProjectDescriptor, ProjectError> {
+        migrate_database(
+            &layout,
+            &manifest.project_id,
+            correlation_id,
+            &migrated_at,
+            &before_hash,
+            &after_hash,
+        )?;
+        #[cfg(test)]
+        inject_after_database_commit(fault)?;
+        guard.write_manifest(&upgraded_manifest_bytes)?;
+        validate_database(&layout, &upgraded_manifest, &after_hash)?;
+        descriptor(&layout, &upgraded_manifest)
+    })();
+
+    match upgrade_result {
+        Ok(upgraded_descriptor) => {
+            guard.commit()?;
+            Ok(upgraded_descriptor)
+        }
+        Err(upgrade_error) => {
+            #[cfg(test)]
+            inject_restore_fault(fault, &layout);
+            match guard.restore() {
+                Ok(()) => Err(upgrade_error),
+                Err(restore_error) => Err(ProjectError::Filesystem(restore_error)),
+            }
+        }
+    }
+}
+
+fn migrate_database(
+    layout: &teratai_filesystem::ProjectLayout,
+    project_id: &str,
+    correlation_id: &str,
+    migrated_at: &str,
+    before_hash: &str,
+    after_hash: &str,
+) -> Result<(), ProjectError> {
+    let mut connection = Connection::open(layout.metadata_path())?;
+    connection.pragma_update(None, "foreign_keys", true)?;
+    let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let schema_version: i64 =
+        transaction.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if schema_version != 1 {
+        return Err(ProjectError::DataIntegrity(
+            "metadata schema changed before the upgrade transaction".to_owned(),
+        ));
+    }
+    transaction.execute_batch(crate::job::JOB_MIGRATION)?;
+    transaction.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (2, 'job_runtime', ?1)",
+        [migrated_at],
+    )?;
+    transaction.execute(
+        "INSERT INTO audit_event (event_id, actor, action, target_type, target_id, before_hash, after_hash, occurred_at, correlation_id)
+         VALUES (?1, 'local-user', 'project.metadata_migrated', 'project', ?2, ?3, ?4, ?5, ?1)",
+        params![correlation_id, project_id, before_hash, after_hash, migrated_at],
+    )?;
+    transaction.commit()?;
+    connection.close().map_err(|(_, error)| error)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn inject_after_database_commit(fault: UpgradeFault) -> Result<(), ProjectError> {
+    if matches!(
+        fault,
+        UpgradeFault::AfterDatabaseCommit | UpgradeFault::DuringRestoreVerification
+    ) {
+        return Err(ProjectError::DataIntegrity(
+            "injected project upgrade failure".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn inject_restore_fault(fault: UpgradeFault, layout: &teratai_filesystem::ProjectLayout) {
+    if fault == UpgradeFault::DuringRestoreVerification {
+        let metadata_path = layout.metadata_path();
+        let _ = std::fs::remove_file(&metadata_path);
+        std::fs::create_dir(&metadata_path).expect("inject deterministic restore failure");
+    }
+}
+
+#[cfg(test)]
+fn upgrade_with_fault(
+    path: &Path,
+    correlation_id: &str,
+    fault: UpgradeFault,
+) -> Result<ProjectDescriptor, ProjectError> {
+    upgrade_project_inner(path, correlation_id, fault)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use rusqlite::{params, Connection, TransactionBehavior};
+    use sha2::{Digest, Sha256};
+    use teratai_contracts::generated::project_create_request::ProjectCreateRequest;
+    use teratai_contracts::generated::project_manifest::ProjectManifest;
+    use teratai_filesystem::{begin_project_creation, FilesystemError};
+
+    use super::{upgrade_with_fault, UpgradeFault};
+    use crate::{ProjectError, ProjectService, PROJECT_MIGRATION, PROJECT_SCHEMA_VERSION};
+
+    const PROJECT_ID: &str = "00000000-0000-7000-8000-000000000110";
+    const CREATE_CORRELATION_ID: &str = "00000000-0000-7000-8000-000000000111";
+    const UPGRADE_CORRELATION_ID: &str = "00000000-0000-7000-8000-000000000112";
+    const CREATED_AT: &str = "2026-07-21T01:00:00Z";
+
+    fn test_parent(label: &str) -> PathBuf {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "teratai-project-upgrade-{label}-{}-{nonce}",
+            std::process::id()
+        ))
+    }
+
+    fn create_schema_one_fixture(label: &str) -> PathBuf {
+        let parent = test_parent(label);
+        fs::create_dir(&parent).expect("test parent");
+        let target = parent.join("Upgrade Fixture.teratai");
+        let request = ProjectCreateRequest {
+            name: "Audit Upgrade 2026".to_owned(),
+            project_id: PROJECT_ID.to_owned(),
+            project_path: target.to_string_lossy().into_owned(),
+            request_id: CREATE_CORRELATION_ID.to_owned(),
+        };
+        let manifest = ProjectManifest {
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            created_at: CREATED_AT.to_owned(),
+            metadata_schema_version: 1,
+            name: request.name.clone(),
+            project_id: request.project_id.clone(),
+            schema_version: PROJECT_SCHEMA_VERSION.to_owned(),
+        };
+        let mut manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("encode manifest");
+        manifest_bytes.push(b'\n');
+        let manifest_hash = format!("sha256:{:x}", Sha256::digest(&manifest_bytes));
+        let creation =
+            begin_project_creation(&target, &request.project_id, &request.request_id, b"{}")
+                .expect("begin fixture");
+        let mut connection = Connection::open(creation.metadata_path()).expect("open metadata");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("begin fixture transaction");
+        transaction
+            .execute_batch(PROJECT_MIGRATION)
+            .expect("apply schema one");
+        transaction
+            .execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (1, 'project_core', ?1)",
+                [CREATED_AT],
+            )
+            .expect("record migration");
+        transaction
+            .execute(
+                "INSERT INTO project (singleton, project_id, name, created_at, app_version, manifest_schema_version) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+                params![
+                    manifest.project_id,
+                    manifest.name,
+                    manifest.created_at,
+                    manifest.app_version,
+                    manifest.schema_version
+                ],
+            )
+            .expect("insert project");
+        transaction
+            .execute(
+                "INSERT INTO audit_event (event_id, actor, action, target_type, target_id, before_hash, after_hash, occurred_at, correlation_id) VALUES (?1, 'local-user', 'project.created', 'project', ?2, NULL, ?3, ?4, ?1)",
+                params![
+                    request.request_id,
+                    request.project_id,
+                    manifest_hash,
+                    CREATED_AT
+                ],
+            )
+            .expect("insert creation audit");
+        transaction.commit().expect("commit fixture");
+        connection.close().expect("close metadata");
+        creation
+            .write_manifest(&manifest_bytes)
+            .expect("write manifest");
+        creation
+            .commit()
+            .expect("publish fixture")
+            .root()
+            .to_owned()
+    }
+
+    fn control_file_bytes(path: &Path) -> (Vec<u8>, Vec<u8>) {
+        (
+            fs::read(path.join("manifest.json")).expect("read manifest"),
+            fs::read(path.join("metadata.sqlite")).expect("read metadata"),
+        )
+    }
+
+    fn audit_rows(path: &Path) -> Vec<(i64, String, Option<String>, Option<String>)> {
+        let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        let mut statement = connection
+            .prepare(
+                "SELECT sequence, action, before_hash, after_hash FROM audit_event ORDER BY sequence",
+            )
+            .expect("prepare audit query");
+        statement
+            .query_map([], |row| {
+                Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+            })
+            .expect("query audits")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect audits")
+    }
+
+    fn cleanup(path: &Path) {
+        fs::remove_dir_all(path.parent().expect("fixture parent")).expect("test cleanup");
+    }
+
+    #[test]
+    fn upgrade_preserves_identity_and_prior_audit() {
+        let path = create_schema_one_fixture("preserves");
+        let before = ProjectService::open(&path).expect("open schema one");
+        let audit_before = audit_rows(&path);
+
+        let after = ProjectService::upgrade(&path, UPGRADE_CORRELATION_ID).expect("upgrade");
+
+        assert_eq!(after.project_id, before.project_id);
+        assert_eq!(after.metadata_schema_version, 2);
+        let audit_after = audit_rows(&path);
+        assert_eq!(audit_after.len(), audit_before.len() + 1);
+        assert_eq!(&audit_after[..audit_before.len()], audit_before.as_slice());
+        assert_eq!(
+            audit_after.last().expect("migration audit").1,
+            "project.metadata_migrated"
+        );
+        assert_eq!(ProjectService::open(&path).expect("reopen upgraded"), after);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn upgrade_failure_restores_v1_or_requires_recovery() {
+        let restored = create_schema_one_fixture("restored");
+        let restored_before = control_file_bytes(&restored);
+        assert!(upgrade_with_fault(
+            &restored,
+            UPGRADE_CORRELATION_ID,
+            UpgradeFault::AfterDatabaseCommit,
+        )
+        .is_err());
+        assert_eq!(control_file_bytes(&restored), restored_before);
+        assert_eq!(
+            ProjectService::open(&restored)
+                .expect("restored project")
+                .metadata_schema_version,
+            1
+        );
+        cleanup(&restored);
+
+        let unproven = create_schema_one_fixture("unproven");
+        assert!(upgrade_with_fault(
+            &unproven,
+            UPGRADE_CORRELATION_ID,
+            UpgradeFault::DuringRestoreVerification,
+        )
+        .is_err());
+        assert!(matches!(
+            ProjectService::open(&unproven),
+            Err(ProjectError::Filesystem(FilesystemError::RecoveryRequired(
+                _
+            )))
+        ));
+        cleanup(&unproven);
+    }
+
+    #[test]
+    fn schema_two_upgrade_is_idempotent() {
+        let path = create_schema_one_fixture("idempotent");
+        let first = ProjectService::upgrade(&path, UPGRADE_CORRELATION_ID).expect("first upgrade");
+        let files_after_first = control_file_bytes(&path);
+        let audit_after_first = audit_rows(&path);
+
+        let second =
+            ProjectService::upgrade(&path, UPGRADE_CORRELATION_ID).expect("second upgrade");
+
+        assert_eq!(second, first);
+        assert_eq!(control_file_bytes(&path), files_after_first);
+        assert_eq!(audit_rows(&path), audit_after_first);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn invalid_correlation_id_is_rejected_without_mutation() {
+        let path = create_schema_one_fixture("invalid-correlation");
+        let before = control_file_bytes(&path);
+
+        assert!(matches!(
+            ProjectService::upgrade(&path, "not-a-uuid"),
+            Err(ProjectError::InvalidRequest(_))
+        ));
+        assert_eq!(control_file_bytes(&path), before);
+        cleanup(&path);
+    }
+
+    #[test]
+    fn manifest_audit_chain_rejects_tampered_link() {
+        let path = create_schema_one_fixture("tampered-chain");
+        ProjectService::upgrade(&path, UPGRADE_CORRELATION_ID).expect("upgrade");
+        let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        connection
+            .execute_batch("DROP TRIGGER audit_event_prevent_update;")
+            .expect("simulate storage tampering");
+        connection
+            .execute(
+                "UPDATE audit_event SET before_hash = 'sha256:tampered' WHERE action = 'project.metadata_migrated'",
+                [],
+            )
+            .expect("tamper chain link");
+        drop(connection);
+
+        assert!(matches!(
+            ProjectService::open(&path),
+            Err(ProjectError::DataIntegrity(_))
+        ));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn manifest_audit_chain_rejects_unknown_manifest_action() {
+        let path = create_schema_one_fixture("unknown-chain-action");
+        ProjectService::upgrade(&path, UPGRADE_CORRELATION_ID).expect("upgrade");
+        let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        connection
+            .execute_batch("DROP TRIGGER audit_event_prevent_update;")
+            .expect("simulate storage tampering");
+        connection
+            .execute(
+                "UPDATE audit_event SET action = 'project.manifest_rewritten' WHERE action = 'project.metadata_migrated'",
+                [],
+            )
+            .expect("tamper action");
+        drop(connection);
+
+        assert!(matches!(
+            ProjectService::validate(&path),
+            Err(ProjectError::DataIntegrity(_))
+        ));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn manifest_audit_chain_rejects_sequence_gap() {
+        let path = create_schema_one_fixture("chain-gap");
+        ProjectService::upgrade(&path, UPGRADE_CORRELATION_ID).expect("upgrade");
+        let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        connection
+            .execute_batch("DROP TRIGGER audit_event_prevent_update;")
+            .expect("simulate storage tampering");
+        connection
+            .execute(
+                "UPDATE audit_event SET sequence = 3 WHERE action = 'project.metadata_migrated'",
+                [],
+            )
+            .expect("tamper sequence");
+        drop(connection);
+
+        assert!(matches!(
+            ProjectService::open(&path),
+            Err(ProjectError::DataIntegrity(_))
+        ));
+        cleanup(&path);
+    }
+}
