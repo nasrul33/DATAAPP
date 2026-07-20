@@ -94,6 +94,12 @@ mod tests {
     const EVENT_ID: &str = "00000000-0000-7000-8000-000000000211";
     const CORRELATION_ID: &str = "00000000-0000-7000-8000-000000000212";
     const NOW: &str = "2026-07-20T12:00:00Z";
+    const INVALID_CALENDAR_TIMESTAMPS: [&str; 4] = [
+        "2026-13-10T12:00:00Z",
+        "2026-01-32T12:00:00Z",
+        "2026-01-10T23:60:00Z",
+        "2026-01-10T23:59:60Z",
+    ];
 
     #[test]
     fn schema_two_enforces_job_shape_and_append_only_events() {
@@ -149,6 +155,39 @@ mod tests {
             );
 
             assert!(result.is_err(), "accepted {invalid_timestamp}");
+        }
+    }
+
+    #[test]
+    fn schema_two_rejects_invalid_job_calendar_timestamp() {
+        let connection = migrated_memory_database();
+
+        for invalid_timestamp in INVALID_CALENDAR_TIMESTAMPS {
+            let result = connection.execute(
+                "INSERT INTO job (job_id, project_id, kind, status, correlation_id, revision, created_at, updated_at, progress_current) VALUES (?1, ?2, 'system.mock_long', 'QUEUED', ?3, 1, ?4, ?5, 0)",
+                params![JOB_ID, PROJECT_ID, CORRELATION_ID, invalid_timestamp, NOW],
+            );
+
+            assert!(
+                result.is_err(),
+                "accepted job timestamp {invalid_timestamp}"
+            );
+        }
+    }
+
+    #[test]
+    fn schema_two_rejects_invalid_job_event_calendar_timestamp() {
+        let connection = migrated_memory_database();
+        insert_job_with_status(&connection, "QUEUED").expect("insert queued job");
+
+        for invalid_timestamp in INVALID_CALENDAR_TIMESTAMPS {
+            let result =
+                insert_job_event_at(&connection, "job.queued", "QUEUED", invalid_timestamp);
+
+            assert!(
+                result.is_err(),
+                "accepted job event timestamp {invalid_timestamp}"
+            );
         }
     }
 
@@ -264,9 +303,25 @@ mod tests {
         event_type: &str,
         to_status: &str,
     ) -> Result<usize> {
+        insert_job_event_at(connection, event_type, to_status, NOW)
+    }
+
+    fn insert_job_event_at(
+        connection: &Connection,
+        event_type: &str,
+        to_status: &str,
+        occurred_at: &str,
+    ) -> Result<usize> {
         connection.execute(
             "INSERT INTO job_event (event_id, job_id, event_type, from_status, to_status, revision, progress_current, progress_total, progress_unit, occurred_at, correlation_id) VALUES (?1, ?2, ?3, NULL, ?4, 1, 0, 100, 'step', ?5, ?6)",
-            params![EVENT_ID, JOB_ID, event_type, to_status, NOW, CORRELATION_ID],
+            params![
+                EVENT_ID,
+                JOB_ID,
+                event_type,
+                to_status,
+                occurred_at,
+                CORRELATION_ID
+            ],
         )
     }
 }

@@ -41,7 +41,10 @@ CREATE TABLE job (
                     AND substr(created_at, 21, length(created_at) - 21) NOT GLOB '*[^0-9]*'
                 )
             )
-            AND strftime('%Y-%m-%dT%H:%M:%SZ', created_at) = substr(created_at, 1, 19) || 'Z'
+            AND COALESCE(
+                strftime('%Y-%m-%dT%H:%M:%SZ', created_at) = substr(created_at, 1, 19) || 'Z',
+                0
+            )
         ),
     started_at TEXT
         CHECK (
@@ -59,7 +62,10 @@ CREATE TABLE job (
                         AND substr(started_at, 21, length(started_at) - 21) NOT GLOB '*[^0-9]*'
                     )
                 )
-                AND strftime('%Y-%m-%dT%H:%M:%SZ', started_at) = substr(started_at, 1, 19) || 'Z'
+                AND COALESCE(
+                    strftime('%Y-%m-%dT%H:%M:%SZ', started_at) = substr(started_at, 1, 19) || 'Z',
+                    0
+                )
             )
         ),
     finished_at TEXT
@@ -78,7 +84,10 @@ CREATE TABLE job (
                         AND substr(finished_at, 21, length(finished_at) - 21) NOT GLOB '*[^0-9]*'
                     )
                 )
-                AND strftime('%Y-%m-%dT%H:%M:%SZ', finished_at) = substr(finished_at, 1, 19) || 'Z'
+                AND COALESCE(
+                    strftime('%Y-%m-%dT%H:%M:%SZ', finished_at) = substr(finished_at, 1, 19) || 'Z',
+                    0
+                )
             )
         ),
     updated_at TEXT NOT NULL
@@ -95,7 +104,10 @@ CREATE TABLE job (
                     AND substr(updated_at, 21, length(updated_at) - 21) NOT GLOB '*[^0-9]*'
                 )
             )
-            AND strftime('%Y-%m-%dT%H:%M:%SZ', updated_at) = substr(updated_at, 1, 19) || 'Z'
+            AND COALESCE(
+                strftime('%Y-%m-%dT%H:%M:%SZ', updated_at) = substr(updated_at, 1, 19) || 'Z',
+                0
+            )
         ),
     progress_current INTEGER NOT NULL DEFAULT 0 CHECK (progress_current >= 0),
     progress_total INTEGER CHECK (progress_total IS NULL OR progress_total > 0),
@@ -258,7 +270,10 @@ CREATE TABLE job_event (
                     AND substr(occurred_at, 21, length(occurred_at) - 21) NOT GLOB '*[^0-9]*'
                 )
             )
-            AND strftime('%Y-%m-%dT%H:%M:%SZ', occurred_at) = substr(occurred_at, 1, 19) || 'Z'
+            AND COALESCE(
+                strftime('%Y-%m-%dT%H:%M:%SZ', occurred_at) = substr(occurred_at, 1, 19) || 'Z',
+                0
+            )
         ),
     correlation_id TEXT NOT NULL
         CHECK (
