@@ -28,19 +28,75 @@ CREATE TABLE job (
         ),
     revision INTEGER NOT NULL CHECK (revision > 0),
     created_at TEXT NOT NULL
-        CHECK (length(created_at) BETWEEN 20 AND 35 AND created_at GLOB '????-??-??T*Z'),
+        CHECK (
+            length(created_at) BETWEEN 20 AND 35
+            AND substr(created_at, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+            AND substr(created_at, 12, 2) BETWEEN '00' AND '23'
+            AND (
+                substr(created_at, 20) = 'Z'
+                OR (
+                    length(created_at) BETWEEN 22 AND 35
+                    AND substr(created_at, 20, 1) = '.'
+                    AND substr(created_at, -1) = 'Z'
+                    AND substr(created_at, 21, length(created_at) - 21) NOT GLOB '*[^0-9]*'
+                )
+            )
+            AND strftime('%Y-%m-%dT%H:%M:%SZ', created_at) = substr(created_at, 1, 19) || 'Z'
+        ),
     started_at TEXT
         CHECK (
             started_at IS NULL
-            OR (length(started_at) BETWEEN 20 AND 35 AND started_at GLOB '????-??-??T*Z')
+            OR (
+                length(started_at) BETWEEN 20 AND 35
+                AND substr(started_at, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+                AND substr(started_at, 12, 2) BETWEEN '00' AND '23'
+                AND (
+                    substr(started_at, 20) = 'Z'
+                    OR (
+                        length(started_at) BETWEEN 22 AND 35
+                        AND substr(started_at, 20, 1) = '.'
+                        AND substr(started_at, -1) = 'Z'
+                        AND substr(started_at, 21, length(started_at) - 21) NOT GLOB '*[^0-9]*'
+                    )
+                )
+                AND strftime('%Y-%m-%dT%H:%M:%SZ', started_at) = substr(started_at, 1, 19) || 'Z'
+            )
         ),
     finished_at TEXT
         CHECK (
             finished_at IS NULL
-            OR (length(finished_at) BETWEEN 20 AND 35 AND finished_at GLOB '????-??-??T*Z')
+            OR (
+                length(finished_at) BETWEEN 20 AND 35
+                AND substr(finished_at, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+                AND substr(finished_at, 12, 2) BETWEEN '00' AND '23'
+                AND (
+                    substr(finished_at, 20) = 'Z'
+                    OR (
+                        length(finished_at) BETWEEN 22 AND 35
+                        AND substr(finished_at, 20, 1) = '.'
+                        AND substr(finished_at, -1) = 'Z'
+                        AND substr(finished_at, 21, length(finished_at) - 21) NOT GLOB '*[^0-9]*'
+                    )
+                )
+                AND strftime('%Y-%m-%dT%H:%M:%SZ', finished_at) = substr(finished_at, 1, 19) || 'Z'
+            )
         ),
     updated_at TEXT NOT NULL
-        CHECK (length(updated_at) BETWEEN 20 AND 35 AND updated_at GLOB '????-??-??T*Z'),
+        CHECK (
+            length(updated_at) BETWEEN 20 AND 35
+            AND substr(updated_at, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+            AND substr(updated_at, 12, 2) BETWEEN '00' AND '23'
+            AND (
+                substr(updated_at, 20) = 'Z'
+                OR (
+                    length(updated_at) BETWEEN 22 AND 35
+                    AND substr(updated_at, 20, 1) = '.'
+                    AND substr(updated_at, -1) = 'Z'
+                    AND substr(updated_at, 21, length(updated_at) - 21) NOT GLOB '*[^0-9]*'
+                )
+            )
+            AND strftime('%Y-%m-%dT%H:%M:%SZ', updated_at) = substr(updated_at, 1, 19) || 'Z'
+        ),
     progress_current INTEGER NOT NULL DEFAULT 0 CHECK (progress_current >= 0),
     progress_total INTEGER CHECK (progress_total IS NULL OR progress_total > 0),
     progress_unit TEXT
@@ -87,6 +143,7 @@ CREATE TABLE job (
         ),
     error_retriable INTEGER CHECK (error_retriable IS NULL OR error_retriable IN (0, 1)),
     CHECK (progress_total IS NULL OR progress_current <= progress_total),
+    CHECK (status <> 'QUEUED' OR started_at IS NULL),
     CHECK (
         (
             status IN ('SUCCEEDED', 'FAILED', 'CANCELLED')
@@ -188,7 +245,21 @@ CREATE TABLE job_event (
         ),
     error_retriable INTEGER CHECK (error_retriable IS NULL OR error_retriable IN (0, 1)),
     occurred_at TEXT NOT NULL
-        CHECK (length(occurred_at) BETWEEN 20 AND 35 AND occurred_at GLOB '????-??-??T*Z'),
+        CHECK (
+            length(occurred_at) BETWEEN 20 AND 35
+            AND substr(occurred_at, 1, 19) GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]T[0-9][0-9]:[0-9][0-9]:[0-9][0-9]'
+            AND substr(occurred_at, 12, 2) BETWEEN '00' AND '23'
+            AND (
+                substr(occurred_at, 20) = 'Z'
+                OR (
+                    length(occurred_at) BETWEEN 22 AND 35
+                    AND substr(occurred_at, 20, 1) = '.'
+                    AND substr(occurred_at, -1) = 'Z'
+                    AND substr(occurred_at, 21, length(occurred_at) - 21) NOT GLOB '*[^0-9]*'
+                )
+            )
+            AND strftime('%Y-%m-%dT%H:%M:%SZ', occurred_at) = substr(occurred_at, 1, 19) || 'Z'
+        ),
     correlation_id TEXT NOT NULL
         CHECK (
             length(correlation_id) = 36

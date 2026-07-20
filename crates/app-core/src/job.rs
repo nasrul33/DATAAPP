@@ -52,22 +52,16 @@ impl JobError {
 impl Display for JobError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InvalidRequest(detail) => write!(formatter, "invalid job request: {detail}"),
-            Self::JobNotFound(job_id) => write!(formatter, "job was not found: {job_id}"),
-            Self::InvalidTransition { from, to } => {
-                write!(formatter, "invalid job transition from {from} to {to}")
+            Self::InvalidRequest(_) => formatter.write_str("invalid job request"),
+            Self::JobNotFound(_) => formatter.write_str("job was not found"),
+            Self::InvalidTransition { .. } => formatter.write_str("invalid job transition"),
+            Self::RevisionConflict { .. } => formatter.write_str("job revision conflict"),
+            Self::IncompatibleSchema { .. } => {
+                formatter.write_str("metadata schema is incompatible")
             }
-            Self::RevisionConflict { expected, actual } => write!(
-                formatter,
-                "job revision conflict: expected {expected}, actual {actual}"
-            ),
-            Self::IncompatibleSchema { expected, actual } => write!(
-                formatter,
-                "metadata schema is incompatible: expected {expected}, actual {actual}"
-            ),
-            Self::DataIntegrity(detail) => write!(formatter, "job integrity failed: {detail}"),
+            Self::DataIntegrity(_) => formatter.write_str("job integrity failed"),
             Self::Database(_) => formatter.write_str("job metadata operation failed"),
-            Self::Timestamp(detail) => write!(formatter, "job timestamp is invalid: {detail}"),
+            Self::Timestamp(_) => formatter.write_str("job timestamp is invalid"),
         }
     }
 }
@@ -145,6 +139,32 @@ mod tests {
     }
 
     #[test]
+    fn schema_two_rejects_invalid_rfc3339_timestamp() {
+        let connection = migrated_memory_database();
+
+        for invalid_timestamp in ["xxxx-99-99T99:99:99Z", "2026-07-20T24:00:00Z"] {
+            let result = connection.execute(
+                "INSERT INTO job (job_id, project_id, kind, status, correlation_id, revision, created_at, updated_at, progress_current) VALUES (?1, ?2, 'system.mock_long', 'QUEUED', ?3, 1, ?4, ?5, 0)",
+                params![JOB_ID, PROJECT_ID, CORRELATION_ID, invalid_timestamp, NOW],
+            );
+
+            assert!(result.is_err(), "accepted {invalid_timestamp}");
+        }
+    }
+
+    #[test]
+    fn schema_two_rejects_started_timestamp_for_queued_job() {
+        let connection = migrated_memory_database();
+
+        let result = connection.execute(
+            "INSERT INTO job (job_id, project_id, kind, status, correlation_id, revision, created_at, started_at, updated_at, progress_current) VALUES (?1, ?2, 'system.mock_long', 'QUEUED', ?3, 1, ?4, ?4, ?4, 0)",
+            params![JOB_ID, PROJECT_ID, CORRELATION_ID, NOW],
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn classifies_job_errors_without_rendering_raw_database_details() {
         let database = JobError::Database(rusqlite::Error::InvalidQuery);
         let conflict = JobError::RevisionConflict {
@@ -155,6 +175,39 @@ mod tests {
         assert_eq!(database.kind(), JobErrorKind::Database);
         assert_eq!(database.to_string(), "job metadata operation failed");
         assert_eq!(conflict.kind(), JobErrorKind::RevisionConflict);
+    }
+
+    #[test]
+    fn job_error_display_never_reflects_arbitrary_input() {
+        const SENSITIVE: &str = "D:\\private\\project.teratai raw sqlite failure";
+        let errors = [
+            JobError::InvalidRequest(SENSITIVE.to_owned()),
+            JobError::JobNotFound(SENSITIVE.to_owned()),
+            JobError::InvalidTransition {
+                from: SENSITIVE.to_owned(),
+                to: SENSITIVE.to_owned(),
+            },
+            JobError::RevisionConflict {
+                expected: 1,
+                actual: 2,
+            },
+            JobError::IncompatibleSchema {
+                expected: 2,
+                actual: 3,
+            },
+            JobError::DataIntegrity(SENSITIVE.to_owned()),
+            JobError::Database(rusqlite::Error::InvalidParameterName(SENSITIVE.to_owned())),
+            JobError::Timestamp(SENSITIVE.to_owned()),
+        ];
+
+        for error in errors {
+            let rendered = error.to_string();
+            assert!(
+                !rendered.contains(SENSITIVE),
+                "{} reflected arbitrary input",
+                error.kind() as u8
+            );
+        }
     }
 
     fn migrated_memory_database() -> Connection {
