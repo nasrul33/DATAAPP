@@ -105,7 +105,7 @@ pub struct JobPage {
 /// Persistent, project-scoped job snapshot and history store.
 #[derive(Debug)]
 pub struct JobStore {
-    metadata_path: PathBuf,
+    project_path: PathBuf,
     project_id: String,
 }
 
@@ -117,44 +117,17 @@ impl JobStore {
     /// Returns a typed error for unsafe layouts, incompatible schemas, invalid
     /// project identity, or database failures.
     pub fn open(project_path: &Path) -> Result<Self, JobError> {
-        let layout = validate_project_layout(project_path).map_err(|_| {
-            JobError::DataIntegrity("project layout is unavailable or unsafe".to_owned())
-        })?;
-        let metadata_path = layout.metadata_path();
-        let connection = open_connection(&metadata_path)?;
-        let actual = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
-        if actual != 2 {
-            return Err(JobError::IncompatibleSchema {
-                expected: 2,
-                actual,
-            });
-        }
-        let migration_name: Option<String> = connection
-            .query_row(
-                "SELECT name FROM schema_migrations WHERE version = 2",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if migration_name.as_deref() != Some("job_runtime") {
-            return Err(JobError::DataIntegrity(
-                "job metadata migration history is invalid".to_owned(),
-            ));
-        }
-        let project_id: String = connection.query_row(
-            "SELECT project_id FROM project WHERE singleton = 1",
-            [],
-            |row| row.get(0),
+        let descriptor = validate_schema_two_project(project_path)?;
+        let canonical_path = PathBuf::from(&descriptor.project_path);
+        let connection = open_connection(
+            &validated_metadata_path(&canonical_path)?,
+            ConnectionAccess::ReadOnly,
         )?;
-        if !crate::is_uuid_v7(&project_id) {
-            return Err(JobError::DataIntegrity(
-                "project identity is not a lowercase UUID v7".to_owned(),
-            ));
-        }
+        probe_job_schema(&connection)?;
         drop(connection);
         Ok(Self {
-            metadata_path,
-            project_id,
+            project_path: canonical_path,
+            project_id: descriptor.project_id,
         })
     }
 
@@ -178,7 +151,7 @@ impl JobStore {
     /// Returns `InvalidRequest`, `JobNotFound`, or a safe database failure.
     pub fn get(&self, job_id: &str) -> Result<JobDescriptor, JobError> {
         validate_uuid(job_id, "job_id")?;
-        let connection = self.connection()?;
+        let connection = self.read_connection()?;
         connection
             .query_row(
                 "SELECT job_id, project_id, kind, status, correlation_id, revision,
@@ -215,7 +188,7 @@ impl JobStore {
         let fetch_limit = i64::try_from(limit + 1).map_err(|_| {
             JobError::InvalidRequest("page size cannot be represented safely".to_owned())
         })?;
-        let connection = self.connection()?;
+        let connection = self.read_connection()?;
         let mut items = if let Some(value) = cursor {
             let mut statement = connection.prepare(
                 "SELECT job_id, project_id, kind, status, correlation_id, revision,
@@ -301,7 +274,7 @@ impl JobStore {
         };
         let after_hash = snapshot_hash(&descriptor)?;
 
-        let mut connection = self.connection()?;
+        let mut connection = self.write_connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
         transaction.execute(
             "INSERT INTO job (
@@ -349,18 +322,115 @@ impl JobStore {
         Ok(descriptor)
     }
 
-    fn connection(&self) -> Result<Connection, JobError> {
-        open_connection(&self.metadata_path)
+    fn read_connection(&self) -> Result<Connection, JobError> {
+        self.validated_connection(ConnectionAccess::ReadOnly)
+    }
+
+    fn write_connection(&self) -> Result<Connection, JobError> {
+        self.validated_connection(ConnectionAccess::ReadWrite)
+    }
+
+    fn validated_connection(&self, access: ConnectionAccess) -> Result<Connection, JobError> {
+        let descriptor = validate_schema_two_project(&self.project_path)?;
+        if descriptor.project_id != self.project_id
+            || Path::new(&descriptor.project_path) != self.project_path
+        {
+            return Err(JobError::DataIntegrity(
+                "project identity changed after the job store opened".to_owned(),
+            ));
+        }
+        let connection = open_connection(&validated_metadata_path(&self.project_path)?, access)?;
+        probe_job_schema(&connection)?;
+        let connected_project_id: String = connection.query_row(
+            "SELECT project_id FROM project WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if connected_project_id != self.project_id {
+            return Err(JobError::DataIntegrity(
+                "metadata identity changed during connection validation".to_owned(),
+            ));
+        }
+        Ok(connection)
     }
 }
 
-fn open_connection(path: &Path) -> Result<Connection, JobError> {
-    let connection = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )?;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConnectionAccess {
+    ReadOnly,
+    ReadWrite,
+}
+
+fn validate_schema_two_project(
+    project_path: &Path,
+) -> Result<teratai_contracts::generated::project_descriptor::ProjectDescriptor, JobError> {
+    let descriptor = crate::ProjectService::open(project_path)
+        .map_err(|_| JobError::DataIntegrity("full project validation failed".to_owned()))?;
+    if descriptor.metadata_schema_version != 2 {
+        return Err(JobError::IncompatibleSchema {
+            expected: 2,
+            actual: descriptor.metadata_schema_version,
+        });
+    }
+    Ok(descriptor)
+}
+
+fn validated_metadata_path(project_path: &Path) -> Result<PathBuf, JobError> {
+    validate_project_layout(project_path)
+        .map(|layout| layout.metadata_path())
+        .map_err(|_| JobError::DataIntegrity("project control layout is unsafe".to_owned()))
+}
+
+fn open_connection(path: &Path, access: ConnectionAccess) -> Result<Connection, JobError> {
+    let access_flag = match access {
+        ConnectionAccess::ReadOnly => OpenFlags::SQLITE_OPEN_READ_ONLY,
+        ConnectionAccess::ReadWrite => OpenFlags::SQLITE_OPEN_READ_WRITE,
+    };
+    let connection =
+        Connection::open_with_flags(path, access_flag | OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
     connection.pragma_update(None, "foreign_keys", true)?;
     Ok(connection)
+}
+
+fn probe_job_schema(connection: &Connection) -> Result<(), JobError> {
+    let object_count: i64 = connection.query_row(
+        "SELECT COUNT(*)
+         FROM sqlite_schema
+         WHERE (type = 'table' AND name IN ('job', 'job_event'))
+            OR (type = 'trigger' AND name IN (
+                'job_event_prevent_update', 'job_event_prevent_delete'
+            ))
+            OR (type = 'index' AND name IN (
+                'job_status_updated_idx', 'job_correlation_idx',
+                'job_event_job_sequence_idx', 'job_event_correlation_sequence_idx'
+            ))",
+        [],
+        |row| row.get(0),
+    )?;
+    if object_count != 8 {
+        return Err(JobError::DataIntegrity(
+            "required job schema objects are missing".to_owned(),
+        ));
+    }
+    connection
+        .prepare(
+            "SELECT job_id, project_id, kind, status, correlation_id, revision,
+                    created_at, started_at, finished_at, updated_at,
+                    progress_current, progress_total, progress_unit, progress_phase,
+                    progress_message, error_code, error_message, error_retriable
+             FROM job LIMIT 0",
+        )
+        .map_err(|_| JobError::DataIntegrity("job snapshot schema is invalid".to_owned()))?;
+    connection
+        .prepare(
+            "SELECT sequence, event_id, job_id, event_type, from_status, to_status,
+                    revision, progress_current, progress_total, progress_unit,
+                    progress_phase, progress_message, error_code, error_message,
+                    error_retriable, occurred_at, correlation_id
+             FROM job_event LIMIT 0",
+        )
+        .map_err(|_| JobError::DataIntegrity("job event schema is invalid".to_owned()))?;
+    Ok(())
 }
 
 fn validate_enqueue(request: &JobEnqueueRequest) -> Result<(), JobError> {
@@ -582,6 +652,7 @@ mod tests {
     fn store_rejects_schema_one_without_mutation() {
         let path = create_schema_one_project("job-v1");
         let before = control_file_bytes(&path);
+        let entries_before = project_entry_names(&path);
 
         assert!(matches!(
             JobStore::open(&path),
@@ -591,7 +662,141 @@ mod tests {
             })
         ));
         assert_eq!(control_file_bytes(&path), before);
+        assert_eq!(project_entry_names(&path), entries_before);
         cleanup_project(&path);
+    }
+
+    #[test]
+    fn store_rejects_manifest_database_mismatch_and_tampered_identity() {
+        let manifest_mismatch = create_schema_two_project("manifest-mismatch");
+        let manifest_path = manifest_mismatch.join("manifest.json");
+        let mut manifest: ProjectManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+                .expect("decode manifest");
+        manifest.metadata_schema_version = 1;
+        let mut manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("encode manifest");
+        manifest_bytes.push(b'\n');
+        fs::write(&manifest_path, manifest_bytes).expect("write mismatched manifest");
+
+        let tampered_identity = create_schema_two_project("tampered-identity");
+        let connection =
+            Connection::open(tampered_identity.join("metadata.sqlite")).expect("open metadata");
+        connection
+            .execute("UPDATE project SET name = 'Tampered Project'", [])
+            .expect("tamper project identity");
+        drop(connection);
+
+        let mismatch_result = JobStore::open(&manifest_mismatch);
+        let tampered_result = JobStore::open(&tampered_identity);
+        cleanup_project(&manifest_mismatch);
+        cleanup_project(&tampered_identity);
+        assert!(matches!(mismatch_result, Err(JobError::DataIntegrity(_))));
+        assert!(matches!(tampered_result, Err(JobError::DataIntegrity(_))));
+    }
+
+    #[test]
+    fn store_rejects_malformed_schema_two_job_objects() {
+        let path = create_schema_two_project("malformed-schema-two");
+        let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        connection
+            .execute("DROP TABLE job_event", [])
+            .expect("remove required job history table");
+        drop(connection);
+
+        let result = JobStore::open(&path);
+        cleanup_project(&path);
+        assert!(matches!(result, Err(JobError::DataIntegrity(_))));
+    }
+
+    #[test]
+    fn store_rejects_extra_migration_and_broken_audit_authorization() {
+        let extra_migration = create_schema_two_project("extra-migration");
+        let connection =
+            Connection::open(extra_migration.join("metadata.sqlite")).expect("open metadata");
+        connection
+            .execute(
+                "INSERT INTO schema_migrations (version, name, applied_at)
+                 VALUES (3, 'unexpected', ?1)",
+                [NOW],
+            )
+            .expect("insert unexpected migration");
+        drop(connection);
+
+        let broken_audit = create_schema_two_project("broken-audit");
+        let connection =
+            Connection::open(broken_audit.join("metadata.sqlite")).expect("open metadata");
+        connection
+            .execute_batch("DROP TRIGGER audit_event_prevent_update")
+            .expect("drop audit update guard for tamper fixture");
+        connection
+            .execute(
+                "UPDATE audit_event SET after_hash = 'sha256:tampered'
+                 WHERE action = 'project.created'",
+                [],
+            )
+            .expect("break audit authorization chain");
+        drop(connection);
+
+        let migration_result = JobStore::open(&extra_migration);
+        let audit_result = JobStore::open(&broken_audit);
+        cleanup_project(&extra_migration);
+        cleanup_project(&broken_audit);
+        assert!(matches!(migration_result, Err(JobError::DataIntegrity(_))));
+        assert!(matches!(audit_result, Err(JobError::DataIntegrity(_))));
+    }
+
+    #[test]
+    fn operations_revalidate_project_after_metadata_replacement() {
+        let path = create_schema_two_project("replacement-target");
+        let replacement = create_schema_two_project("replacement-source");
+        let replacement_store = JobStore::open(&replacement).expect("open replacement store");
+        replacement_store
+            .enqueue_at(&enqueue(0), NOW)
+            .expect("seed replacement job");
+        drop(replacement_store);
+        let store = JobStore::open(&path).expect("open original store");
+        fs::remove_file(path.join("metadata.sqlite")).expect("remove original metadata");
+        fs::copy(
+            replacement.join("metadata.sqlite"),
+            path.join("metadata.sqlite"),
+        )
+        .expect("replace metadata after store open");
+
+        let enqueue_result = store.enqueue_at(&enqueue(9), NOW);
+        let get_result = store.get(&job_id(0));
+        let list_result = store.list(10, None);
+        cleanup_project(&path);
+        cleanup_project(&replacement);
+        assert!(matches!(enqueue_result, Err(JobError::DataIntegrity(_))));
+        assert!(matches!(get_result, Err(JobError::DataIntegrity(_))));
+        assert!(matches!(list_result, Err(JobError::DataIntegrity(_))));
+    }
+
+    #[test]
+    fn operations_reject_metadata_symlink_created_after_store_open() {
+        let path = create_schema_two_project("metadata-symlink");
+        let store = JobStore::open(&path).expect("open store");
+        let metadata_path = path.join("metadata.sqlite");
+        let original_path = path.join("metadata.original.sqlite");
+        fs::rename(&metadata_path, &original_path).expect("move metadata aside");
+        if let Err(error) = symlink_file(&original_path, &metadata_path) {
+            fs::rename(&original_path, &metadata_path).expect("restore metadata after skip");
+            cleanup_project(&path);
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(1314)
+            {
+                return;
+            }
+            panic!("create metadata symlink: {error}");
+        }
+
+        let enqueue_result = store.enqueue_at(&enqueue(0), NOW);
+        let get_result = store.get(&job_id(0));
+        let list_result = store.list(10, None);
+        cleanup_project(&path);
+        assert!(matches!(enqueue_result, Err(JobError::DataIntegrity(_))));
+        assert!(matches!(get_result, Err(JobError::DataIntegrity(_))));
+        assert!(matches!(list_result, Err(JobError::DataIntegrity(_))));
     }
 
     #[test]
@@ -757,12 +962,13 @@ mod tests {
     fn every_store_connection_enables_foreign_keys() {
         let path = create_schema_two_project("foreign-keys");
         let store = JobStore::open(&path).expect("open store");
-        let connection = store.connection().expect("open store connection");
+        let connection = store.read_connection().expect("open store connection");
         let foreign_keys: i64 = connection
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .expect("read foreign key setting");
 
         assert_eq!(foreign_keys, 1);
+        assert!(connection.is_readonly("main").expect("read access mode"));
         drop(connection);
         cleanup_project(&path);
     }
@@ -1025,6 +1231,31 @@ mod tests {
             fs::read(path.join("manifest.json")).expect("read manifest"),
             fs::read(path.join("metadata.sqlite")).expect("read metadata"),
         )
+    }
+
+    fn project_entry_names(path: &Path) -> Vec<String> {
+        let mut names = fs::read_dir(path)
+            .expect("read project directory")
+            .map(|entry| {
+                entry
+                    .expect("read project entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect::<Vec<_>>();
+        names.sort_unstable();
+        names
+    }
+
+    #[cfg(unix)]
+    fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::unix::fs::symlink(original, link)
+    }
+
+    #[cfg(windows)]
+    fn symlink_file(original: &Path, link: &Path) -> std::io::Result<()> {
+        std::os::windows::fs::symlink_file(original, link)
     }
 
     fn job_event_audit_counts(path: &Path) -> (i64, i64, i64) {
