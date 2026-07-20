@@ -3,7 +3,11 @@ use std::path::Path;
 use rusqlite::{params, Connection, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use teratai_contracts::generated::project_descriptor::ProjectDescriptor;
-use teratai_filesystem::{begin_project_upgrade, validate_project_layout};
+use teratai_contracts::generated::project_manifest::ProjectManifest;
+use teratai_filesystem::{
+    begin_project_upgrade, read_bounded, validate_project_layout, ProjectLayout,
+    MANIFEST_LIMIT_BYTES,
+};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -23,6 +27,7 @@ enum UpgradeFault {
 enum UpgradeFault {
     None,
     AfterDatabaseCommit,
+    AfterManifestWriteCorruption,
     DuringRestoreVerification,
 }
 
@@ -86,8 +91,16 @@ fn upgrade_project_inner(
         #[cfg(test)]
         inject_after_database_commit(fault)?;
         guard.write_manifest(&upgraded_manifest_bytes)?;
-        validate_database(&layout, &upgraded_manifest, &after_hash)?;
-        descriptor(&layout, &upgraded_manifest)
+        #[cfg(test)]
+        inject_after_manifest_write(fault, &layout);
+        let (written_manifest, written_hash) = read_validated_upgraded_manifest(
+            &layout,
+            &upgraded_manifest_bytes,
+            &after_hash,
+            &manifest.project_id,
+        )?;
+        validate_database(&layout, &written_manifest, &written_hash)?;
+        descriptor(&layout, &written_manifest)
     })();
 
     match upgrade_result {
@@ -106,8 +119,35 @@ fn upgrade_project_inner(
     }
 }
 
+fn read_validated_upgraded_manifest(
+    layout: &ProjectLayout,
+    expected_bytes: &[u8],
+    expected_hash: &str,
+    expected_project_id: &str,
+) -> Result<(ProjectManifest, String), ProjectError> {
+    let written_bytes = read_bounded(&layout.manifest_path(), MANIFEST_LIMIT_BYTES)?;
+    let written_hash = format!("sha256:{:x}", Sha256::digest(&written_bytes));
+    let written_manifest: ProjectManifest =
+        serde_json::from_slice(&written_bytes).map_err(|_| {
+            ProjectError::DataIntegrity("upgraded manifest could not be decoded safely".to_owned())
+        })?;
+    validate_manifest(&written_manifest)?;
+
+    if written_bytes != expected_bytes
+        || written_hash != expected_hash
+        || written_manifest.metadata_schema_version != METADATA_SCHEMA_VERSION
+        || written_manifest.project_id != expected_project_id
+    {
+        return Err(ProjectError::DataIntegrity(
+            "upgraded manifest differs from the authorized replacement".to_owned(),
+        ));
+    }
+
+    Ok((written_manifest, written_hash))
+}
+
 fn migrate_database(
-    layout: &teratai_filesystem::ProjectLayout,
+    layout: &ProjectLayout,
     project_id: &str,
     correlation_id: &str,
     migrated_at: &str,
@@ -153,11 +193,19 @@ fn inject_after_database_commit(fault: UpgradeFault) -> Result<(), ProjectError>
 }
 
 #[cfg(test)]
-fn inject_restore_fault(fault: UpgradeFault, layout: &teratai_filesystem::ProjectLayout) {
+fn inject_restore_fault(fault: UpgradeFault, layout: &ProjectLayout) {
     if fault == UpgradeFault::DuringRestoreVerification {
         let metadata_path = layout.metadata_path();
         let _ = std::fs::remove_file(&metadata_path);
         std::fs::create_dir(&metadata_path).expect("inject deterministic restore failure");
+    }
+}
+
+#[cfg(test)]
+fn inject_after_manifest_write(fault: UpgradeFault, layout: &ProjectLayout) {
+    if fault == UpgradeFault::AfterManifestWriteCorruption {
+        std::fs::write(layout.manifest_path(), b"{corrupted-after-write")
+            .expect("inject deterministic manifest corruption");
     }
 }
 
@@ -354,6 +402,29 @@ mod tests {
             )))
         ));
         cleanup(&unproven);
+    }
+
+    #[test]
+    fn corrupted_manifest_after_write_never_commits_recovery_proof() {
+        let path = create_schema_one_fixture("corrupted-after-manifest-write");
+        let before = control_file_bytes(&path);
+
+        assert!(upgrade_with_fault(
+            &path,
+            UPGRADE_CORRELATION_ID,
+            UpgradeFault::AfterManifestWriteCorruption,
+        )
+        .is_err());
+
+        match ProjectService::open(&path) {
+            Ok(descriptor) => {
+                assert_eq!(descriptor.metadata_schema_version, 1);
+                assert_eq!(control_file_bytes(&path), before);
+            }
+            Err(ProjectError::Filesystem(FilesystemError::RecoveryRequired(_))) => {}
+            Err(error) => panic!("unexpected recovery result: {error}"),
+        }
+        cleanup(&path);
     }
 
     #[test]
