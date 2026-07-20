@@ -5,7 +5,7 @@ pub mod job;
 use std::fmt::{self, Display, Formatter};
 use std::path::Path;
 
-use rusqlite::{params, Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{params, Connection, OpenFlags, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use teratai_contracts::generated::project_create_request::ProjectCreateRequest;
 use teratai_contracts::generated::project_descriptor::ProjectDescriptor;
@@ -18,9 +18,14 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 const PROJECT_SCHEMA_VERSION: &str = "1.0.0";
-const METADATA_SCHEMA_VERSION: i64 = 1;
+const MIN_METADATA_SCHEMA_VERSION: i64 = 1;
+const METADATA_SCHEMA_VERSION: i64 = 2;
 const PROJECT_MIGRATION: &str =
     include_str!("../../../migrations/metadata-sqlite/0001_project_core.sql");
+const PROJECT_MIGRATIONS: [(i64, &str, &str); 2] = [
+    (1, "project_core", PROJECT_MIGRATION),
+    (2, "job_runtime", job::JOB_MIGRATION),
+];
 
 /// Typed failures for transactional project lifecycle operations.
 #[derive(Debug)]
@@ -241,7 +246,9 @@ fn validate_manifest(manifest: &ProjectManifest) -> Result<(), ProjectError> {
             manifest.schema_version
         )));
     }
-    if manifest.metadata_schema_version != METADATA_SCHEMA_VERSION {
+    if !(MIN_METADATA_SCHEMA_VERSION..=METADATA_SCHEMA_VERSION)
+        .contains(&manifest.metadata_schema_version)
+    {
         return Err(ProjectError::IncompatibleProject(format!(
             "metadata schema {} is unsupported",
             manifest.metadata_schema_version
@@ -272,11 +279,13 @@ fn initialize_database(
     let mut connection = Connection::open(path)?;
     connection.pragma_update(None, "foreign_keys", true)?;
     let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    transaction.execute_batch(PROJECT_MIGRATION)?;
-    transaction.execute(
-        "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
-        params![METADATA_SCHEMA_VERSION, "project_core", manifest.created_at],
-    )?;
+    for (version, name, migration) in PROJECT_MIGRATIONS {
+        transaction.execute_batch(migration)?;
+        transaction.execute(
+            "INSERT INTO schema_migrations (version, name, applied_at) VALUES (?1, ?2, ?3)",
+            params![version, name, manifest.created_at],
+        )?;
+    }
     transaction.execute(
         "INSERT INTO project (singleton, project_id, name, created_at, app_version, manifest_schema_version) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
         params![
@@ -312,12 +321,18 @@ fn validate_database(
     )?;
     let schema_version: i64 =
         connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if !(MIN_METADATA_SCHEMA_VERSION..=METADATA_SCHEMA_VERSION).contains(&schema_version) {
+        return Err(ProjectError::IncompatibleProject(format!(
+            "SQLite metadata schema {schema_version} is unsupported"
+        )));
+    }
     if schema_version != manifest.metadata_schema_version {
         return Err(ProjectError::DataIntegrity(format!(
             "manifest metadata schema {} differs from SQLite schema {schema_version}",
             manifest.metadata_schema_version
         )));
     }
+    validate_migration_history(&connection, schema_version)?;
     let integrity: String = connection.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
     if integrity != "ok" {
         return Err(ProjectError::DataIntegrity(format!(
@@ -365,6 +380,40 @@ fn validate_database(
         return Err(ProjectError::DataIntegrity(
             "manifest fingerprint differs from the initial audit event".to_owned(),
         ));
+    }
+    Ok(())
+}
+
+fn validate_migration_history(
+    connection: &Connection,
+    schema_version: i64,
+) -> Result<(), ProjectError> {
+    let (migration_count, maximum_migration): (i64, i64) = connection.query_row(
+        "SELECT COUNT(*), COALESCE(MAX(version), 0) FROM schema_migrations",
+        [],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if migration_count != schema_version || maximum_migration != schema_version {
+        return Err(ProjectError::DataIntegrity(
+            "metadata migration history does not match the declared schema".to_owned(),
+        ));
+    }
+    for (version, expected_name, _) in PROJECT_MIGRATIONS
+        .iter()
+        .take(usize::try_from(schema_version).unwrap_or(0))
+    {
+        let actual_name: Option<String> = connection
+            .query_row(
+                "SELECT name FROM schema_migrations WHERE version = ?1",
+                [version],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if actual_name.as_deref() != Some(expected_name) {
+            return Err(ProjectError::DataIntegrity(
+                "metadata migration history contains an unexpected migration".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
@@ -461,6 +510,198 @@ mod tests {
         }
     }
 
+    fn create_schema_one_fixture(label: &str) -> PathBuf {
+        let parent = test_parent(label);
+        fs::create_dir(&parent).expect("test parent");
+        let request = request(&parent);
+        let manifest = ProjectManifest {
+            app_version: env!("CARGO_PKG_VERSION").to_owned(),
+            created_at: CREATED_AT.to_owned(),
+            metadata_schema_version: 1,
+            name: request.name.clone(),
+            project_id: request.project_id.clone(),
+            schema_version: PROJECT_SCHEMA_VERSION.to_owned(),
+        };
+        let mut manifest_bytes = serde_json::to_vec_pretty(&manifest).expect("encode manifest");
+        manifest_bytes.push(b'\n');
+        let manifest_hash = format!("sha256:{:x}", Sha256::digest(&manifest_bytes));
+        let creation = begin_project_creation(
+            Path::new(&request.project_path),
+            &request.project_id,
+            &request.request_id,
+            b"{}",
+        )
+        .expect("begin schema-one fixture");
+        let mut connection = Connection::open(creation.metadata_path()).expect("open metadata");
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .expect("start schema-one transaction");
+        transaction
+            .execute_batch(PROJECT_MIGRATION)
+            .expect("apply project migration");
+        transaction
+            .execute(
+                "INSERT INTO schema_migrations (version, name, applied_at) VALUES (1, 'project_core', ?1)",
+                [CREATED_AT],
+            )
+            .expect("record project migration");
+        transaction
+            .execute(
+                "INSERT INTO project (singleton, project_id, name, created_at, app_version, manifest_schema_version) VALUES (1, ?1, ?2, ?3, ?4, ?5)",
+                params![
+                    manifest.project_id,
+                    manifest.name,
+                    manifest.created_at,
+                    manifest.app_version,
+                    manifest.schema_version
+                ],
+            )
+            .expect("insert project identity");
+        transaction
+            .execute(
+                "INSERT INTO audit_event (event_id, actor, action, target_type, target_id, before_hash, after_hash, occurred_at, correlation_id) VALUES (?1, 'local-user', 'project.created', 'project', ?2, NULL, ?3, ?4, ?1)",
+                params![
+                    request.request_id,
+                    request.project_id,
+                    manifest_hash,
+                    CREATED_AT
+                ],
+            )
+            .expect("insert initial audit event");
+        transaction.commit().expect("commit schema-one fixture");
+        connection.close().expect("close schema-one metadata");
+        creation
+            .write_manifest(&manifest_bytes)
+            .expect("write schema-one manifest");
+        creation
+            .commit()
+            .expect("publish schema-one fixture")
+            .root()
+            .to_path_buf()
+    }
+
+    fn create_project_fixture(label: &str) -> (ProjectDescriptor, PathBuf) {
+        let parent = test_parent(label);
+        fs::create_dir(&parent).expect("test parent");
+        let descriptor =
+            ProjectService::create_at(&request(&parent), CREATED_AT).expect("create project");
+        let path = PathBuf::from(&descriptor.project_path);
+        (descriptor, path)
+    }
+
+    fn create_newer_schema_fixture(version: i64) -> PathBuf {
+        let (_, path) = create_project_fixture("newer-schema");
+        let manifest_path = path.join("manifest.json");
+        let mut manifest: ProjectManifest =
+            serde_json::from_slice(&fs::read(&manifest_path).expect("read manifest"))
+                .expect("decode manifest");
+        manifest.metadata_schema_version = version;
+        let mut bytes = serde_json::to_vec_pretty(&manifest).expect("encode newer manifest");
+        bytes.push(b'\n');
+        fs::write(manifest_path, bytes).expect("write newer manifest");
+        path
+    }
+
+    fn control_file_bytes(path: &Path) -> (Vec<u8>, Vec<u8>) {
+        (
+            fs::read(path.join("manifest.json")).expect("read manifest bytes"),
+            fs::read(path.join("metadata.sqlite")).expect("read metadata bytes"),
+        )
+    }
+
+    fn sqlite_user_version(path: &Path) -> i64 {
+        let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .expect("read user_version")
+    }
+
+    fn sqlite_migrations(path: &Path) -> Vec<(i64, String)> {
+        let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        let mut statement = connection
+            .prepare("SELECT version, name FROM schema_migrations ORDER BY version")
+            .expect("prepare migration query");
+        statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query migrations")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect migrations")
+    }
+
+    #[test]
+    fn opens_schema_one_without_mutation() {
+        let path = create_schema_one_fixture("readonly-v1");
+        let before = control_file_bytes(&path);
+
+        assert_eq!(
+            ProjectService::open(&path)
+                .expect("open schema one")
+                .metadata_schema_version,
+            1
+        );
+        assert_eq!(control_file_bytes(&path), before);
+        assert_eq!(
+            ProjectService::validate(&path)
+                .expect("validate schema one")
+                .metadata_schema_version,
+            1
+        );
+        assert_eq!(control_file_bytes(&path), before);
+
+        fs::remove_dir_all(path.parent().expect("fixture parent")).expect("test cleanup");
+    }
+
+    #[test]
+    fn creates_schema_two_and_rejects_newer_schema() {
+        let (descriptor, path) = create_project_fixture("schema-v2");
+
+        assert_eq!(descriptor.metadata_schema_version, 2);
+        assert_eq!(sqlite_user_version(&path), 2);
+        assert_eq!(
+            sqlite_migrations(&path),
+            vec![
+                (1, "project_core".to_owned()),
+                (2, "job_runtime".to_owned())
+            ]
+        );
+        let before_schema_two_open = control_file_bytes(&path);
+        assert_eq!(
+            ProjectService::open(&path)
+                .expect("open schema two")
+                .metadata_schema_version,
+            2
+        );
+        assert_eq!(control_file_bytes(&path), before_schema_two_open);
+
+        let newer = create_newer_schema_fixture(3);
+        let before_newer_rejection = control_file_bytes(&newer);
+        assert!(matches!(
+            ProjectService::open(&newer),
+            Err(ProjectError::IncompatibleProject(_))
+        ));
+        assert_eq!(control_file_bytes(&newer), before_newer_rejection);
+
+        fs::remove_dir_all(path.parent().expect("fixture parent")).expect("test cleanup");
+        fs::remove_dir_all(newer.parent().expect("newer fixture parent")).expect("test cleanup");
+    }
+
+    #[test]
+    fn rejects_missing_schema_migration_record() {
+        let (_, path) = create_project_fixture("missing-migration-record");
+        let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        connection
+            .execute("DELETE FROM schema_migrations WHERE version = 2", [])
+            .expect("remove migration record");
+        drop(connection);
+
+        assert!(matches!(
+            ProjectService::open(&path),
+            Err(ProjectError::DataIntegrity(_))
+        ));
+
+        fs::remove_dir_all(path.parent().expect("fixture parent")).expect("test cleanup");
+    }
+
     #[test]
     fn creates_reopens_and_validates_transactional_project() {
         let parent = test_parent("lifecycle");
@@ -472,7 +713,7 @@ mod tests {
             ProjectService::open(Path::new(&created.project_path)).expect("open project");
 
         assert_eq!(created, reopened);
-        assert_eq!(created.metadata_schema_version, 1);
+        assert_eq!(created.metadata_schema_version, 2);
         let database = Connection::open(Path::new(&created.project_path).join("metadata.sqlite"))
             .expect("open metadata");
         let audit_count: i64 = database
