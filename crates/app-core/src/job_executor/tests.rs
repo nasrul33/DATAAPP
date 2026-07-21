@@ -1,7 +1,7 @@
 use std::fs;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{mpsc, Arc, Barrier, Mutex};
 use std::time::Duration;
 
 use teratai_contracts::generated::project_create_request::ProjectCreateRequest;
@@ -298,6 +298,99 @@ fn duplicate_and_full_queue_admission_leave_rejected_job_unchanged() {
     assert_eq!(core.queue.pop().as_deref(), Some(first.job_id.as_str()));
     core.claim_and_queue(&second.job_id)
         .expect("failed queue push released admission claim");
+}
+
+#[test]
+fn concurrent_full_queue_serializes_transient_claim_and_rolls_back() {
+    let mut fixture = ExecutorFixture::new("concurrent-bounded-admission");
+    let queued = fixture.enqueue("passive.kind");
+    let first_rejected = fixture.enqueue("passive.kind");
+    let second_rejected = fixture.enqueue("passive.kind");
+    let core = Arc::new(fixture.executor_core(vec![Arc::new(PassiveHandler)]));
+    assert_eq!(core.admission_bound, 3);
+    assert!(core.admitted.lock().expect("admission set").capacity() >= 3);
+    core.claim_and_queue(&queued.job_id).expect("fill queue");
+
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(2);
+    let (release_sender, release_receiver) = mpsc::sync_channel(1);
+    let release_receiver = Arc::new(Mutex::new(release_receiver));
+    core.set_before_queue_push_hook(Arc::new({
+        let calls = Arc::clone(&calls);
+        let release_receiver = Arc::clone(&release_receiver);
+        move || {
+            let call = calls.fetch_add(1, Ordering::SeqCst);
+            entered_sender.send(call).expect("signal transient claim");
+            if call == 0 {
+                release_receiver
+                    .lock()
+                    .expect("release receiver")
+                    .recv_timeout(Duration::from_secs(5))
+                    .expect("release first transient claim");
+            }
+        }
+    }))
+    .expect("install admission hook");
+
+    let first_core = Arc::clone(&core);
+    let first_job_id = first_rejected.job_id.clone();
+    let (result_sender, result_receiver) = mpsc::sync_channel(2);
+    let first_result_sender = result_sender.clone();
+    let first_thread = std::thread::spawn(move || {
+        first_result_sender
+            .send(first_core.claim_and_queue(&first_job_id))
+            .expect("send first result");
+    });
+    assert_eq!(
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first transient claim enters"),
+        0
+    );
+
+    let start = Arc::new(Barrier::new(2));
+    let second_core = Arc::clone(&core);
+    let second_job_id = second_rejected.job_id.clone();
+    let second_start = Arc::clone(&start);
+    let second_thread = std::thread::spawn(move || {
+        second_start.wait();
+        result_sender
+            .send(second_core.claim_and_queue(&second_job_id))
+            .expect("send second result");
+    });
+    start.wait();
+    let second_before_release = entered_receiver.recv_timeout(Duration::from_millis(500));
+
+    release_sender.send(()).expect("release first claim");
+    assert_eq!(
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second transient claim enters after release"),
+        1
+    );
+    let results = [
+        result_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("first queue result"),
+        result_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("second queue result"),
+    ];
+    first_thread.join().expect("first submission thread");
+    second_thread.join().expect("second submission thread");
+
+    assert!(matches!(
+        second_before_release,
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    assert!(results
+        .into_iter()
+        .all(|result| matches!(result, Err(JobExecutorError::QueueFull))));
+    let admitted = core.admitted.lock().expect("admission set");
+    assert_eq!(admitted.len(), 1);
+    assert!(admitted.contains(&queued.job_id));
+    assert!(!admitted.contains(&first_rejected.job_id));
+    assert!(!admitted.contains(&second_rejected.job_id));
 }
 
 #[test]

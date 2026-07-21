@@ -285,6 +285,10 @@ pub(crate) struct ExecutorCore {
     _resource_ledger: ResourceLedger,
     _config: JobExecutorConfig,
     _clock: Arc<dyn ExecutorClock>,
+    #[cfg(test)]
+    admission_bound: usize,
+    #[cfg(test)]
+    before_queue_push: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 #[cfg_attr(
@@ -302,6 +306,11 @@ impl ExecutorCore {
         clock: Arc<dyn ExecutorClock>,
     ) -> Result<Self, JobExecutorError> {
         validate_config(&config)?;
+        let admission_bound = config
+            .queue_capacity
+            .checked_add(config.worker_count)
+            .and_then(|bound| bound.checked_add(1))
+            .ok_or(JobExecutorError::InvalidConfiguration)?;
         let queue = Arc::new(
             BoundedQueue::new(config.queue_capacity)
                 .ok_or(JobExecutorError::InvalidConfiguration)?,
@@ -322,7 +331,7 @@ impl ExecutorCore {
 
         let mut admitted = HashSet::new();
         admitted
-            .try_reserve(config.queue_capacity)
+            .try_reserve(admission_bound)
             .map_err(|_| JobExecutorError::InvalidConfiguration)?;
         Ok(Self {
             store,
@@ -332,6 +341,10 @@ impl ExecutorCore {
             _resource_ledger: resource_ledger,
             _config: config,
             _clock: clock,
+            #[cfg(test)]
+            admission_bound,
+            #[cfg(test)]
+            before_queue_push: Mutex::new(None),
         })
     }
 
@@ -349,14 +362,18 @@ impl ExecutorCore {
             return Err(JobExecutorError::HandlerNotFound);
         }
 
-        {
-            let mut admitted = self
-                .admitted
-                .lock()
-                .map_err(|_| JobExecutorError::PersistenceFailed)?;
-            if !admitted.insert(descriptor.job_id.clone()) {
-                return Err(JobExecutorError::AlreadySubmitted);
-            }
+        let mut admitted = self
+            .admitted
+            .lock()
+            .map_err(|_| JobExecutorError::PersistenceFailed)?;
+        if !admitted.insert(descriptor.job_id.clone()) {
+            return Err(JobExecutorError::AlreadySubmitted);
+        }
+
+        #[cfg(test)]
+        if let Err(error) = self.run_before_queue_push_hook() {
+            admitted.remove(&descriptor.job_id);
+            return Err(error);
         }
 
         match self.queue.try_push(descriptor.job_id) {
@@ -367,23 +384,35 @@ impl ExecutorCore {
                     PushError::Closed(job_id) => (job_id, JobExecutorError::ShuttingDown),
                     PushError::Poisoned(job_id) => (job_id, JobExecutorError::PersistenceFailed),
                 };
-                let removal_poisoned = match self.admitted.lock() {
-                    Ok(mut admitted) => {
-                        admitted.remove(&job_id);
-                        false
-                    }
-                    Err(poisoned) => {
-                        poisoned.into_inner().remove(&job_id);
-                        true
-                    }
-                };
-                if removal_poisoned {
-                    Err(JobExecutorError::PersistenceFailed)
-                } else {
-                    Err(mapped)
-                }
+                admitted.remove(&job_id);
+                Err(mapped)
             }
         }
+    }
+
+    #[cfg(test)]
+    fn set_before_queue_push_hook(
+        &self,
+        hook: Arc<dyn Fn() + Send + Sync>,
+    ) -> Result<(), JobExecutorError> {
+        *self
+            .before_queue_push
+            .lock()
+            .map_err(|_| JobExecutorError::PersistenceFailed)? = Some(hook);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn run_before_queue_push_hook(&self) -> Result<(), JobExecutorError> {
+        let hook = self
+            .before_queue_push
+            .lock()
+            .map_err(|_| JobExecutorError::PersistenceFailed)?
+            .clone();
+        if let Some(hook) = hook {
+            hook();
+        }
+        Ok(())
     }
 }
 
