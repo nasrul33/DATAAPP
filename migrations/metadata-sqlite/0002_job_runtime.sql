@@ -115,8 +115,9 @@ CREATE TABLE job (
         CHECK (
             progress_unit IS NULL
             OR (
-                length(progress_unit) BETWEEN 1 AND 32
-                AND progress_unit = trim(progress_unit)
+                length(CAST(progress_unit AS BLOB)) BETWEEN 1 AND 32
+                AND progress_unit GLOB '[a-z]*'
+                AND progress_unit NOT GLOB '*[^a-z0-9._-]*'
             )
         ),
     progress_phase TEXT
@@ -132,8 +133,12 @@ CREATE TABLE job (
         CHECK (
             progress_message IS NULL
             OR (
-                length(progress_message) BETWEEN 1 AND 500
+                length(CAST(progress_message AS BLOB)) BETWEEN 1 AND 500
                 AND progress_message = trim(progress_message)
+                AND instr(progress_message, char(0)) = 0
+                AND instr(progress_message, char(9)) = 0
+                AND instr(progress_message, char(10)) = 0
+                AND instr(progress_message, char(13)) = 0
             )
         ),
     error_code TEXT
@@ -149,13 +154,18 @@ CREATE TABLE job (
         CHECK (
             error_message IS NULL
             OR (
-                length(error_message) BETWEEN 1 AND 500
+                length(CAST(error_message AS BLOB)) BETWEEN 1 AND 500
                 AND error_message = trim(error_message)
+                AND instr(error_message, char(0)) = 0
+                AND instr(error_message, char(9)) = 0
+                AND instr(error_message, char(10)) = 0
+                AND instr(error_message, char(13)) = 0
             )
         ),
     error_retriable INTEGER CHECK (error_retriable IS NULL OR error_retriable IN (0, 1)),
     CHECK (progress_total IS NULL OR progress_current <= progress_total),
     CHECK (status <> 'QUEUED' OR started_at IS NULL),
+    CHECK (status NOT IN ('RUNNING', 'SUCCEEDED') OR started_at IS NOT NULL),
     CHECK (
         (
             status IN ('SUCCEEDED', 'FAILED', 'CANCELLED')
@@ -217,8 +227,9 @@ CREATE TABLE job_event (
         CHECK (
             progress_unit IS NULL
             OR (
-                length(progress_unit) BETWEEN 1 AND 32
-                AND progress_unit = trim(progress_unit)
+                length(CAST(progress_unit AS BLOB)) BETWEEN 1 AND 32
+                AND progress_unit GLOB '[a-z]*'
+                AND progress_unit NOT GLOB '*[^a-z0-9._-]*'
             )
         ),
     progress_phase TEXT
@@ -234,8 +245,12 @@ CREATE TABLE job_event (
         CHECK (
             progress_message IS NULL
             OR (
-                length(progress_message) BETWEEN 1 AND 500
+                length(CAST(progress_message AS BLOB)) BETWEEN 1 AND 500
                 AND progress_message = trim(progress_message)
+                AND instr(progress_message, char(0)) = 0
+                AND instr(progress_message, char(9)) = 0
+                AND instr(progress_message, char(10)) = 0
+                AND instr(progress_message, char(13)) = 0
             )
         ),
     error_code TEXT
@@ -251,8 +266,12 @@ CREATE TABLE job_event (
         CHECK (
             error_message IS NULL
             OR (
-                length(error_message) BETWEEN 1 AND 500
+                length(CAST(error_message AS BLOB)) BETWEEN 1 AND 500
                 AND error_message = trim(error_message)
+                AND instr(error_message, char(0)) = 0
+                AND instr(error_message, char(9)) = 0
+                AND instr(error_message, char(10)) = 0
+                AND instr(error_message, char(13)) = 0
             )
         ),
     error_retriable INTEGER CHECK (error_retriable IS NULL OR error_retriable IN (0, 1)),

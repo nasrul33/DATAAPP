@@ -363,7 +363,7 @@ impl JobStore {
     pub fn get(&self, job_id: &str) -> Result<JobDescriptor, JobError> {
         validate_uuid(job_id, "job_id")?;
         let connection = self.read_connection()?;
-        connection
+        let decoded = connection
             .query_row(
                 "SELECT job_id, project_id, kind, status, correlation_id, revision,
                         created_at, started_at, finished_at, updated_at,
@@ -374,7 +374,10 @@ impl JobStore {
                 params![self.project_id, job_id],
                 row_to_descriptor,
             )
-            .optional()?
+            .optional()?;
+        decoded
+            .map(|row| validate_persisted_descriptor(row.descriptor, row.error_retriable))
+            .transpose()?
             .ok_or_else(|| JobError::JobNotFound("job identity does not exist".to_owned()))
     }
 
@@ -400,7 +403,7 @@ impl JobStore {
             JobError::InvalidRequest("page size cannot be represented safely".to_owned())
         })?;
         let connection = self.read_connection()?;
-        let mut items = if let Some(value) = cursor {
+        let decoded = if let Some(value) = cursor {
             let mut statement = connection.prepare(
                 "SELECT job_id, project_id, kind, status, correlation_id, revision,
                         created_at, started_at, finished_at, updated_at,
@@ -435,6 +438,10 @@ impl JobStore {
                 .collect::<Result<Vec<_>, _>>()?;
             collected
         };
+        let mut items = decoded
+            .into_iter()
+            .map(|row| validate_persisted_descriptor(row.descriptor, row.error_retriable))
+            .collect::<Result<Vec<_>, _>>()?;
         let has_more = items.len() > limit;
         if has_more {
             items.truncate(limit);
@@ -483,6 +490,7 @@ impl JobStore {
             progress_unit: request.progress_unit.clone(),
             started_at: None,
         };
+        let descriptor = validate_persisted_descriptor(descriptor, None)?;
         let after_hash = snapshot_hash(&descriptor)?;
 
         let mut connection = self.write_connection()?;
@@ -634,6 +642,8 @@ impl JobStore {
                 progress_unit: request.unit.clone(),
                 started_at: before.started_at.clone(),
             };
+            let raw_error_retriable = after.error_retriable.map(i64::from);
+            let after = validate_persisted_descriptor(after, raw_error_retriable)?;
             persist_mutation(
                 transaction,
                 &self.project_id,
@@ -691,7 +701,9 @@ impl JobStore {
                 let jobs = statement
                     .query_map([&self.project_id], row_to_descriptor)?
                     .collect::<Result<Vec<_>, _>>()?;
-                jobs
+                jobs.into_iter()
+                    .map(|row| validate_persisted_descriptor(row.descriptor, row.error_retriable))
+                    .collect::<Result<Vec<_>, _>>()?
             };
             let mut recovered = Vec::with_capacity(active.len());
             for before in active {
@@ -723,6 +735,8 @@ impl JobStore {
                     progress_unit: before.progress_unit.clone(),
                     started_at: before.started_at.clone(),
                 };
+                let raw_error_retriable = after.error_retriable.map(i64::from);
+                let after = validate_persisted_descriptor(after, raw_error_retriable)?;
                 persist_mutation(
                     transaction,
                     &self.project_id,
@@ -1016,7 +1030,7 @@ fn select_job(
     project_id: &str,
     job_id: &str,
 ) -> Result<JobDescriptor, JobError> {
-    transaction
+    let decoded = transaction
         .query_row(
             "SELECT job_id, project_id, kind, status, correlation_id, revision,
                     created_at, started_at, finished_at, updated_at,
@@ -1027,7 +1041,10 @@ fn select_job(
             params![project_id, job_id],
             row_to_descriptor,
         )
-        .optional()?
+        .optional()?;
+    decoded
+        .map(|row| validate_persisted_descriptor(row.descriptor, row.error_retriable))
+        .transpose()?
         .ok_or_else(|| JobError::JobNotFound("job identity does not exist".to_owned()))
 }
 
@@ -1043,7 +1060,7 @@ fn transitioned_descriptor(
         .checked_add(1)
         .ok_or_else(|| JobError::DataIntegrity("job revision overflowed".to_owned()))?;
     let failure = request.failure();
-    Ok(JobDescriptor {
+    let descriptor = JobDescriptor {
         correlation_id: request.correlation_id().to_owned(),
         created_at: before.created_at.clone(),
         job_id: before.job_id.clone(),
@@ -1066,7 +1083,9 @@ fn transitioned_descriptor(
         } else {
             before.started_at.clone()
         },
-    })
+    };
+    let raw_error_retriable = descriptor.error_retriable.map(i64::from);
+    validate_persisted_descriptor(descriptor, raw_error_retriable)
 }
 
 fn transition_action(from: JobStatus, to: JobStatus) -> Result<&'static str, JobError> {
@@ -1340,27 +1359,224 @@ fn format_uuid(bytes: [u8; 16]) -> String {
     result
 }
 
-fn row_to_descriptor(row: &Row<'_>) -> rusqlite::Result<JobDescriptor> {
-    Ok(JobDescriptor {
-        job_id: row.get(0)?,
-        project_id: row.get(1)?,
-        kind: row.get(2)?,
-        status: row.get(3)?,
-        correlation_id: row.get(4)?,
-        revision: row.get(5)?,
-        created_at: row.get(6)?,
-        started_at: row.get(7)?,
-        finished_at: row.get(8)?,
-        updated_at: row.get(9)?,
-        progress_current: row.get(10)?,
-        progress_total: row.get(11)?,
-        progress_unit: row.get(12)?,
-        progress_phase: row.get(13)?,
-        progress_message: row.get(14)?,
-        error_code: row.get(15)?,
-        error_message: row.get(16)?,
-        error_retriable: row.get::<_, Option<i64>>(17)?.map(|value| value != 0),
+struct DecodedJobDescriptor {
+    descriptor: JobDescriptor,
+    error_retriable: Option<i64>,
+}
+
+fn row_to_descriptor(row: &Row<'_>) -> rusqlite::Result<DecodedJobDescriptor> {
+    Ok(DecodedJobDescriptor {
+        descriptor: JobDescriptor {
+            job_id: row.get(0)?,
+            project_id: row.get(1)?,
+            kind: row.get(2)?,
+            status: row.get(3)?,
+            correlation_id: row.get(4)?,
+            revision: row.get(5)?,
+            created_at: row.get(6)?,
+            started_at: row.get(7)?,
+            finished_at: row.get(8)?,
+            updated_at: row.get(9)?,
+            progress_current: row.get(10)?,
+            progress_total: row.get(11)?,
+            progress_unit: row.get(12)?,
+            progress_phase: row.get(13)?,
+            progress_message: row.get(14)?,
+            error_code: row.get(15)?,
+            error_message: row.get(16)?,
+            error_retriable: None,
+        },
+        error_retriable: row.get(17)?,
     })
+}
+
+fn validate_persisted_descriptor(
+    mut descriptor: JobDescriptor,
+    raw_error_retriable: Option<i64>,
+) -> Result<JobDescriptor, JobError> {
+    descriptor.error_retriable = decode_persisted_boolean(raw_error_retriable)?;
+    let status = validate_persisted_identity(&descriptor)?;
+    validate_persisted_timeline(&descriptor)?;
+    validate_persisted_payload(&descriptor, status)?;
+    validate_persisted_status_fields(&descriptor, status)?;
+    Ok(descriptor)
+}
+
+fn decode_persisted_boolean(value: Option<i64>) -> Result<Option<bool>, JobError> {
+    Ok(match value {
+        None => None,
+        Some(0) => Some(false),
+        Some(1) => Some(true),
+        Some(_) => {
+            return Err(persisted_integrity(
+                "error_retriable is not a SQLite boolean",
+            ))
+        }
+    })
+}
+
+fn validate_persisted_identity(descriptor: &JobDescriptor) -> Result<JobStatus, JobError> {
+    for (field, value) in [
+        ("job_id", descriptor.job_id.as_str()),
+        ("project_id", descriptor.project_id.as_str()),
+        ("correlation_id", descriptor.correlation_id.as_str()),
+    ] {
+        if !crate::is_uuid_v7(value) {
+            return Err(persisted_integrity(&format!(
+                "{field} is not a lowercase UUID v7"
+            )));
+        }
+    }
+    if !is_safe_token(&descriptor.kind, 120) {
+        return Err(persisted_integrity("kind is not a bounded safe identifier"));
+    }
+    let status = JobStatus::parse(&descriptor.status)?;
+    if descriptor.revision <= 0 {
+        return Err(persisted_integrity("revision is not positive"));
+    }
+    Ok(status)
+}
+
+fn validate_persisted_timeline(descriptor: &JobDescriptor) -> Result<(), JobError> {
+    let created_at = persisted_timestamp(&descriptor.created_at, "created_at")?;
+    let updated_at = persisted_timestamp(&descriptor.updated_at, "updated_at")?;
+    if updated_at < created_at {
+        return Err(persisted_integrity("updated_at precedes created_at"));
+    }
+    let started_at = descriptor
+        .started_at
+        .as_deref()
+        .map(|value| persisted_timestamp(value, "started_at"))
+        .transpose()?;
+    let finished_at = descriptor
+        .finished_at
+        .as_deref()
+        .map(|value| persisted_timestamp(value, "finished_at"))
+        .transpose()?;
+    if started_at.is_some_and(|value| value < created_at || value > updated_at) {
+        return Err(persisted_integrity(
+            "started_at is outside the persisted job timeline",
+        ));
+    }
+    if finished_at.is_some_and(|value| value < created_at || value > updated_at) {
+        return Err(persisted_integrity(
+            "finished_at is outside the persisted job timeline",
+        ));
+    }
+    if started_at
+        .zip(finished_at)
+        .is_some_and(|(started, finished)| finished < started)
+    {
+        return Err(persisted_integrity("finished_at precedes started_at"));
+    }
+    Ok(())
+}
+
+fn validate_persisted_payload(
+    descriptor: &JobDescriptor,
+    status: JobStatus,
+) -> Result<(), JobError> {
+    if descriptor.progress_current < 0 {
+        return Err(persisted_integrity("progress_current is negative"));
+    }
+    if descriptor.progress_total.is_some_and(|total| total <= 0) {
+        return Err(persisted_integrity("progress_total is not positive"));
+    }
+    if descriptor
+        .progress_total
+        .is_some_and(|total| descriptor.progress_current > total)
+    {
+        return Err(persisted_integrity(
+            "progress_current exceeds progress_total",
+        ));
+    }
+    if descriptor
+        .progress_unit
+        .as_deref()
+        .is_some_and(|value| !is_safe_token(value, 32))
+    {
+        return Err(persisted_integrity("progress_unit is unsafe"));
+    }
+    if descriptor
+        .progress_phase
+        .as_deref()
+        .is_some_and(|value| !is_safe_token(value, 120))
+    {
+        return Err(persisted_integrity("progress_phase is unsafe"));
+    }
+    if descriptor
+        .progress_message
+        .as_deref()
+        .is_some_and(|value| !is_safe_message(value, 500))
+    {
+        return Err(persisted_integrity("progress_message is unsafe"));
+    }
+    if descriptor
+        .error_code
+        .as_deref()
+        .is_some_and(|value| !is_safe_error_code(value))
+    {
+        return Err(persisted_integrity("error_code is unsafe"));
+    }
+    if descriptor
+        .error_message
+        .as_deref()
+        .is_some_and(|value| !is_safe_message(value, 500))
+    {
+        return Err(persisted_integrity("error_message is unsafe"));
+    }
+
+    let has_complete_error = descriptor.error_code.is_some()
+        && descriptor.error_message.is_some()
+        && descriptor.error_retriable.is_some();
+    let has_any_error = descriptor.error_code.is_some()
+        || descriptor.error_message.is_some()
+        || descriptor.error_retriable.is_some();
+    if (status == JobStatus::Failed && !has_complete_error)
+        || (status != JobStatus::Failed && has_any_error)
+    {
+        return Err(persisted_integrity(
+            "status and persisted failure details disagree",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_persisted_status_fields(
+    descriptor: &JobDescriptor,
+    status: JobStatus,
+) -> Result<(), JobError> {
+    let started = descriptor.started_at.is_some();
+    let finished = descriptor.finished_at.is_some();
+    let valid_status_timestamps = match status {
+        JobStatus::Queued => !started && !finished,
+        JobStatus::Running => started && !finished,
+        JobStatus::Succeeded => started && finished,
+        JobStatus::Cancelling => !finished,
+        JobStatus::Failed | JobStatus::Cancelled => finished,
+    };
+    if !valid_status_timestamps {
+        return Err(persisted_integrity(
+            "status and persisted lifecycle timestamps disagree",
+        ));
+    }
+    if status == JobStatus::Queued
+        && (descriptor.progress_phase.is_some() || descriptor.progress_message.is_some())
+    {
+        return Err(persisted_integrity(
+            "queued job contains active progress details",
+        ));
+    }
+    Ok(())
+}
+
+fn persisted_timestamp(value: &str, field: &str) -> Result<OffsetDateTime, JobError> {
+    validate_timestamp(value)
+        .map_err(|_| persisted_integrity(&format!("{field} is not a valid UTC RFC 3339 timestamp")))
+}
+
+fn persisted_integrity(detail: &str) -> JobError {
+    JobError::DataIntegrity(detail.to_owned())
 }
 
 #[cfg(test)]
@@ -1380,8 +1596,9 @@ mod tests {
     use teratai_filesystem::REQUIRED_PROJECT_DIRECTORIES;
 
     use super::{
-        event_id_at, full_project_validation_count, snapshot_hash, transition_allowed, JobError,
-        JobErrorKind, JobListCursor, JobStatus, JobStore, TransitionRequest, JOB_MIGRATION,
+        event_id_at, full_project_validation_count, snapshot_hash, transition_allowed,
+        validate_persisted_descriptor, JobError, JobErrorKind, JobListCursor, JobStatus, JobStore,
+        TransitionRequest, JOB_MIGRATION,
     };
     use crate::ProjectService;
 
@@ -1441,6 +1658,195 @@ mod tests {
             })
         ));
         assert_eq!(job_event_audit_counts(&path), before);
+
+        drop(store);
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn independent_store_handles_observe_peer_writes_and_reach_revision_cas() {
+        let path = create_schema_two_project("independent-handles");
+        let first = JobStore::open(&path).expect("open first store");
+        let second = JobStore::open(&path).expect("open second store before peer write");
+
+        let queued = first.enqueue_at(&enqueue(0), NOW).expect("peer enqueue");
+        assert_eq!(
+            second.get(&queued.job_id).expect("read peer enqueue"),
+            queued
+        );
+        let running = first
+            .start_at(&transition(queued.revision), NOW_1)
+            .expect("peer transition");
+        assert_eq!(
+            second.get(&running.job_id).expect("read peer transition"),
+            running
+        );
+        assert!(matches!(
+            second.start_at(&transition(queued.revision), NOW_2),
+            Err(JobError::RevisionConflict {
+                expected: 1,
+                actual: 2
+            })
+        ));
+
+        drop(second);
+        drop(first);
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn persisted_descriptor_reads_reject_sql_valid_unsafe_text_and_cross_fields() {
+        assert_persisted_tamper_rejected("multibyte-overflow", |connection| {
+            let oversized = "é".repeat(251);
+            connection
+                .execute(
+                    "UPDATE job SET progress_message = ?1 WHERE job_id = ?2",
+                    params![oversized, job_id(0)],
+                )
+                .expect("inject byte-overflow message");
+        });
+        assert_persisted_tamper_rejected("control-character", |connection| {
+            connection
+                .execute(
+                    "UPDATE job SET progress_message = 'baris pertama' || char(10) || 'baris kedua'
+                     WHERE job_id = ?1",
+                    [job_id(0)],
+                )
+                .expect("inject newline message");
+        });
+        let path = create_schema_two_project("sql-valid-control-character");
+        let store = JobStore::open(&path).expect("open SQL-valid fixture");
+        store.enqueue_at(&enqueue(0), NOW).expect("enqueue job");
+        let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        connection
+            .execute(
+                "UPDATE job SET progress_message = 'unsafe' || char(1) || 'message'
+                 WHERE job_id = ?1",
+                [job_id(0)],
+            )
+            .expect("inject SQL-valid control character");
+        drop(connection);
+        store
+            .metadata
+            .refresh_after_authorized_write()
+            .expect("authorize SQL-valid fixture");
+        assert!(matches!(
+            store.get(&job_id(0)),
+            Err(JobError::DataIntegrity(_))
+        ));
+        drop(store);
+        cleanup_project(&path);
+        assert_persisted_tamper_rejected("cross-field", |connection| {
+            connection
+                .execute(
+                    "UPDATE job SET status = 'RUNNING', started_at = NULL WHERE job_id = ?1",
+                    [job_id(0)],
+                )
+                .expect("inject invalid running timestamps");
+        });
+    }
+
+    #[test]
+    fn persisted_descriptor_validation_guards_mutation_and_recovery_reads() {
+        let mutation_path = create_schema_two_project("invalid-before-mutation");
+        let mutation_store = JobStore::open(&mutation_path).expect("open mutation fixture");
+        mutation_store
+            .enqueue_at(&enqueue(0), NOW)
+            .expect("enqueue mutation fixture");
+        let connection = Connection::open(mutation_path.join("metadata.sqlite"))
+            .expect("open mutation metadata");
+        connection
+            .pragma_update(None, "ignore_check_constraints", true)
+            .expect("enable migration-bypass fixture");
+        connection
+            .execute(
+                "UPDATE job SET progress_message = 'unsafe' || char(9) || 'message'
+                 WHERE job_id = ?1",
+                [job_id(0)],
+            )
+            .expect("inject mutation control character");
+        drop(connection);
+        mutation_store
+            .metadata
+            .refresh_after_authorized_write()
+            .expect("authorize migration-bypass fixture");
+        assert!(matches!(
+            mutation_store.start_at(&transition(1), NOW_1),
+            Err(JobError::DataIntegrity(_))
+        ));
+        drop(mutation_store);
+        cleanup_project(&mutation_path);
+
+        let (recovery_path, recovery_store) = running_store("invalid-before-recovery");
+        let connection = Connection::open(recovery_path.join("metadata.sqlite"))
+            .expect("open recovery metadata");
+        connection
+            .pragma_update(None, "ignore_check_constraints", true)
+            .expect("enable migration-bypass fixture");
+        connection
+            .execute(
+                "UPDATE job SET progress_message = 'unsafe' || char(13) || 'message'
+                 WHERE job_id = ?1",
+                [job_id(0)],
+            )
+            .expect("inject recovery control character");
+        drop(connection);
+        recovery_store
+            .metadata
+            .refresh_after_authorized_write()
+            .expect("authorize migration-bypass fixture");
+        assert!(matches!(
+            recovery_store.recover_interrupted_at(RECOVERY_ID, NOW_4),
+            Err(JobError::DataIntegrity(_))
+        ));
+        drop(recovery_store);
+        cleanup_project(&recovery_path);
+    }
+
+    #[test]
+    fn persisted_descriptor_rejects_non_boolean_sqlite_integer() {
+        let path = create_schema_two_project("invalid-persisted-boolean");
+        let store = JobStore::open(&path).expect("open store");
+        let descriptor = store.enqueue_at(&enqueue(0), NOW).expect("enqueue job");
+
+        assert!(matches!(
+            validate_persisted_descriptor(descriptor, Some(2)),
+            Err(JobError::DataIntegrity(_))
+        ));
+
+        drop(store);
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn persisted_row_decode_rejects_boolean_two_from_migration_bypass() {
+        let path = create_schema_two_project("boolean-two-bypass");
+        let store = JobStore::open(&path).expect("open store");
+        store.enqueue_at(&enqueue(0), NOW).expect("enqueue job");
+        let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        connection
+            .pragma_update(None, "ignore_check_constraints", true)
+            .expect("enable migration-bypass fixture");
+        connection
+            .execute(
+                "UPDATE job
+                 SET status = 'FAILED', finished_at = ?1, updated_at = ?1,
+                     error_code = 'INTERRUPTED', error_message = 'Pekerjaan terhenti.',
+                     error_retriable = 2
+                 WHERE job_id = ?2",
+                params![NOW_1, job_id(0)],
+            )
+            .expect("inject non-boolean integer");
+        drop(connection);
+        store
+            .metadata
+            .refresh_after_authorized_write()
+            .expect("authorize migration-bypass fixture");
+
+        assert!(matches!(
+            store.get(&job_id(0)),
+            Err(JobError::DataIntegrity(_))
+        ));
 
         drop(store);
         cleanup_project(&path);
@@ -2196,6 +2602,59 @@ mod tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn schema_two_rejects_unsafe_text_by_bytes_and_common_controls() {
+        let connection = migrated_memory_database();
+        insert_job_with_status(&connection, "QUEUED").expect("insert queued job");
+
+        let oversized = "é".repeat(251);
+        assert!(connection
+            .execute(
+                "UPDATE job SET progress_message = ?1 WHERE job_id = ?2",
+                params![oversized, JOB_ID],
+            )
+            .is_err());
+        assert!(connection
+            .execute(
+                "UPDATE job SET progress_message = 'line one' || char(10) || 'line two'
+                 WHERE job_id = ?1",
+                [JOB_ID],
+            )
+            .is_err());
+        assert!(connection
+            .execute(
+                "UPDATE job SET progress_unit = 'bad unit' WHERE job_id = ?1",
+                [JOB_ID],
+            )
+            .is_err());
+    }
+
+    fn assert_persisted_tamper_rejected(label: &str, tamper: impl FnOnce(&Connection)) {
+        let path = create_schema_two_project(label);
+        let store = JobStore::open(&path).expect("open store");
+        store.enqueue_at(&enqueue(0), NOW).expect("enqueue job");
+        let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        connection
+            .pragma_update(None, "ignore_check_constraints", true)
+            .expect("enable migration-bypass fixture");
+        tamper(&connection);
+        drop(connection);
+        store
+            .metadata
+            .refresh_after_authorized_write()
+            .expect("authorize migration-bypass fixture");
+        assert!(matches!(
+            store.get(&job_id(0)),
+            Err(JobError::DataIntegrity(_))
+        ));
+        assert!(matches!(
+            store.list(10, None),
+            Err(JobError::DataIntegrity(_))
+        ));
+        drop(store);
+        cleanup_project(&path);
     }
 
     #[test]

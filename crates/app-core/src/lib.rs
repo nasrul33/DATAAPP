@@ -421,9 +421,9 @@ fn validate_manifest_authorization_chain(
     let mut chain_length = 0_usize;
     for row in rows {
         let (sequence, action, before_hash, after_hash) = row?;
-        if sequence != previous_sequence + 1 {
+        if previous_sequence != 0 && sequence <= previous_sequence {
             return Err(ProjectError::DataIntegrity(
-                "manifest authorization chain contains a sequence gap".to_owned(),
+                "manifest authorization chain is not strictly increasing".to_owned(),
             ));
         }
         let after_hash = after_hash.filter(|hash| !hash.is_empty()).ok_or_else(|| {

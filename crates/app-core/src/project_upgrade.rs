@@ -6,7 +6,7 @@ use teratai_contracts::generated::project_descriptor::ProjectDescriptor;
 use teratai_contracts::generated::project_manifest::ProjectManifest;
 use teratai_filesystem::{
     begin_project_upgrade, read_bounded, validate_project_layout, ProjectLayout,
-    MANIFEST_LIMIT_BYTES,
+    ProjectUpgradeBackupProof, MANIFEST_LIMIT_BYTES,
 };
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -22,11 +22,54 @@ enum UpgradeFault {
     None,
 }
 
+#[derive(Clone, Copy)]
+enum UpgradeStage {
+    BackupPrepared,
+    DatabaseMigrated,
+    ManifestPublished,
+    ValidatedReadyToCommit,
+}
+
+struct UpgradeMarkerContext<'a> {
+    manifest: &'a ProjectManifest,
+    correlation_id: &'a str,
+    original_manifest_hash: &'a str,
+    target_manifest_hash: &'a str,
+    backups: &'a ProjectUpgradeBackupProof,
+}
+
+impl UpgradeMarkerContext<'_> {
+    fn bytes(&self, stage: UpgradeStage) -> Result<Vec<u8>, ProjectError> {
+        upgrade_marker_bytes(
+            self.manifest,
+            self.correlation_id,
+            self.original_manifest_hash,
+            self.target_manifest_hash,
+            self.backups,
+            stage,
+        )
+    }
+}
+
+impl UpgradeStage {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::BackupPrepared => "BACKUP_PREPARED",
+            Self::DatabaseMigrated => "DATABASE_MIGRATED",
+            Self::ManifestPublished => "MANIFEST_PUBLISHED",
+            Self::ValidatedReadyToCommit => "VALIDATED_READY_TO_COMMIT",
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum UpgradeFault {
     None,
+    AfterBackupPrepared,
     AfterDatabaseCommit,
+    AfterManifestPublished,
+    AfterValidation,
     AfterManifestWriteCorruption,
     DuringRestoreVerification,
 }
@@ -68,16 +111,32 @@ fn upgrade_project_inner(
     let migrated_at = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .map_err(|error| ProjectError::Timestamp(error.to_string()))?;
-    let marker = serde_json::to_vec(&serde_json::json!({
-        "after_hash": after_hash,
-        "before_hash": before_hash,
-        "correlation_id": correlation_id,
-        "from_metadata_schema_version": manifest.metadata_schema_version,
-        "project_id": manifest.project_id,
-        "state": "UPGRADING",
-        "to_metadata_schema_version": METADATA_SCHEMA_VERSION
-    }))?;
-    let mut guard = begin_project_upgrade(&layout, correlation_id, &marker)?;
+    let mut backup_proof = None;
+    let mut marker = Vec::new();
+    let mut guard = begin_project_upgrade::<ProjectError, _>(&layout, correlation_id, |proof| {
+        backup_proof = Some(proof.clone());
+        marker = upgrade_marker_bytes(
+            &manifest,
+            correlation_id,
+            &before_hash,
+            &after_hash,
+            proof,
+            UpgradeStage::BackupPrepared,
+        )?;
+        Ok(marker.clone())
+    })?;
+    let backup_proof = backup_proof.ok_or_else(|| {
+        ProjectError::DataIntegrity("upgrade backup proof was not retained".to_owned())
+    })?;
+    let marker_context = UpgradeMarkerContext {
+        manifest: &manifest,
+        correlation_id,
+        original_manifest_hash: &before_hash,
+        target_manifest_hash: &after_hash,
+        backups: &backup_proof,
+    };
+    #[cfg(test)]
+    inject_after_backup_prepared(fault, &marker)?;
 
     let upgrade_result = (|| -> Result<ProjectDescriptor, ProjectError> {
         migrate_database(
@@ -88,9 +147,15 @@ fn upgrade_project_inner(
             &before_hash,
             &after_hash,
         )?;
+        marker = marker_context.bytes(UpgradeStage::DatabaseMigrated)?;
+        guard.write_marker(&marker)?;
         #[cfg(test)]
-        inject_after_database_commit(fault)?;
+        inject_after_database_commit(fault, &marker)?;
         guard.write_manifest(&upgraded_manifest_bytes)?;
+        marker = marker_context.bytes(UpgradeStage::ManifestPublished)?;
+        guard.write_marker(&marker)?;
+        #[cfg(test)]
+        inject_after_manifest_published(fault, &marker)?;
         #[cfg(test)]
         inject_after_manifest_write(fault, &layout);
         let (written_manifest, written_hash) = read_validated_upgraded_manifest(
@@ -100,7 +165,12 @@ fn upgrade_project_inner(
             &manifest.project_id,
         )?;
         validate_database(&layout, &written_manifest, &written_hash)?;
-        descriptor(&layout, &written_manifest)
+        let upgraded_descriptor = descriptor(&layout, &written_manifest)?;
+        marker = marker_context.bytes(UpgradeStage::ValidatedReadyToCommit)?;
+        guard.write_marker(&marker)?;
+        #[cfg(test)]
+        inject_after_validation(fault, &marker)?;
+        Ok(upgraded_descriptor)
     })();
 
     match upgrade_result {
@@ -117,6 +187,38 @@ fn upgrade_project_inner(
             }
         }
     }
+}
+
+fn upgrade_marker_bytes(
+    manifest: &ProjectManifest,
+    correlation_id: &str,
+    original_manifest_hash: &str,
+    target_manifest_hash: &str,
+    backups: &ProjectUpgradeBackupProof,
+    stage: UpgradeStage,
+) -> Result<Vec<u8>, ProjectError> {
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "backups": {
+            "manifest": {
+                "content_digest": backups.manifest.content_digest.as_str(),
+                "length": backups.manifest.length,
+                "name": "manifest-schema-1.json.backup"
+            },
+            "metadata": {
+                "content_digest": backups.metadata.content_digest.as_str(),
+                "length": backups.metadata.length,
+                "name": "metadata-schema-1.sqlite.backup"
+            }
+        },
+        "correlation_id": correlation_id,
+        "original_manifest_hash": original_manifest_hash,
+        "project_id": manifest.project_id.as_str(),
+        "source_metadata_schema_version": manifest.metadata_schema_version,
+        "stage": stage.as_str(),
+        "target_manifest_hash": target_manifest_hash,
+        "target_metadata_schema_version": METADATA_SCHEMA_VERSION,
+        "version": 1
+    }))?)
 }
 
 fn read_validated_upgraded_manifest(
@@ -180,11 +282,62 @@ fn migrate_database(
 }
 
 #[cfg(test)]
-fn inject_after_database_commit(fault: UpgradeFault) -> Result<(), ProjectError> {
+thread_local! {
+    static CAPTURED_MARKER: std::cell::RefCell<Option<Vec<u8>>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn capture_marker(contents: &[u8]) {
+    CAPTURED_MARKER.with(|captured| captured.replace(Some(contents.to_vec())));
+}
+
+#[cfg(test)]
+fn take_captured_marker() -> Vec<u8> {
+    CAPTURED_MARKER.with(|captured| captured.replace(None).expect("upgrade marker was captured"))
+}
+
+#[cfg(test)]
+fn inject_after_backup_prepared(fault: UpgradeFault, marker: &[u8]) -> Result<(), ProjectError> {
+    if fault == UpgradeFault::AfterBackupPrepared {
+        capture_marker(marker);
+        return Err(ProjectError::DataIntegrity(
+            "injected project upgrade failure".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn inject_after_database_commit(fault: UpgradeFault, marker: &[u8]) -> Result<(), ProjectError> {
     if matches!(
         fault,
         UpgradeFault::AfterDatabaseCommit | UpgradeFault::DuringRestoreVerification
     ) {
+        capture_marker(marker);
+        return Err(ProjectError::DataIntegrity(
+            "injected project upgrade failure".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn inject_after_manifest_published(fault: UpgradeFault, marker: &[u8]) -> Result<(), ProjectError> {
+    if fault == UpgradeFault::AfterManifestPublished {
+        capture_marker(marker);
+        return Err(ProjectError::DataIntegrity(
+            "injected project upgrade failure".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn inject_after_validation(fault: UpgradeFault, marker: &[u8]) -> Result<(), ProjectError> {
+    if fault == UpgradeFault::AfterValidation {
+        capture_marker(marker);
         return Err(ProjectError::DataIntegrity(
             "injected project upgrade failure".to_owned(),
         ));
@@ -230,7 +383,7 @@ mod tests {
     use teratai_contracts::generated::project_manifest::ProjectManifest;
     use teratai_filesystem::{begin_project_creation, FilesystemError};
 
-    use super::{upgrade_with_fault, UpgradeFault};
+    use super::{take_captured_marker, upgrade_with_fault, UpgradeFault};
     use crate::{ProjectError, ProjectService, PROJECT_MIGRATION, PROJECT_SCHEMA_VERSION};
 
     const PROJECT_ID: &str = "00000000-0000-7000-8000-000000000110";
@@ -405,6 +558,43 @@ mod tests {
     }
 
     #[test]
+    fn upgrade_marker_binds_backups_and_advances_every_irreversible_stage() {
+        let cases = [
+            (UpgradeFault::AfterBackupPrepared, "BACKUP_PREPARED"),
+            (UpgradeFault::AfterDatabaseCommit, "DATABASE_MIGRATED"),
+            (UpgradeFault::AfterManifestPublished, "MANIFEST_PUBLISHED"),
+            (UpgradeFault::AfterValidation, "VALIDATED_READY_TO_COMMIT"),
+        ];
+
+        for (index, (fault, expected_stage)) in cases.into_iter().enumerate() {
+            let path = create_schema_one_fixture(&format!("marker-stage-{index}"));
+            let original_manifest = fs::read(path.join("manifest.json")).expect("read manifest");
+            let original_manifest_hash = format!("sha256:{:x}", Sha256::digest(original_manifest));
+
+            assert!(upgrade_with_fault(&path, UPGRADE_CORRELATION_ID, fault).is_err());
+            let marker: serde_json::Value =
+                serde_json::from_slice(&take_captured_marker()).expect("decode marker");
+
+            assert_eq!(marker["project_id"], PROJECT_ID);
+            assert_eq!(marker["correlation_id"], UPGRADE_CORRELATION_ID);
+            assert_eq!(marker["source_metadata_schema_version"], 1);
+            assert_eq!(marker["target_metadata_schema_version"], 2);
+            assert_eq!(marker["original_manifest_hash"], original_manifest_hash);
+            assert_eq!(marker["stage"], expected_stage);
+            for backup in ["metadata", "manifest"] {
+                let proof = &marker["backups"][backup];
+                assert!(proof["length"].as_u64().is_some_and(|length| length > 0));
+                let digest = proof["content_digest"]
+                    .as_str()
+                    .expect("bounded backup digest");
+                assert!(digest.starts_with("proof-v1:"));
+                assert!(digest.len() <= 80);
+            }
+            cleanup(&path);
+        }
+    }
+
+    #[test]
     fn corrupted_manifest_after_write_never_commits_recovery_proof() {
         let path = create_schema_one_fixture("corrupted-after-manifest-write");
         let before = control_file_bytes(&path);
@@ -503,25 +693,46 @@ mod tests {
     }
 
     #[test]
-    fn manifest_audit_chain_rejects_sequence_gap() {
-        let path = create_schema_one_fixture("chain-gap");
+    fn manifest_audit_chain_allows_interleaved_non_project_audits() {
+        let path = create_schema_one_fixture("interleaved-chain");
         ProjectService::upgrade(&path, UPGRADE_CORRELATION_ID).expect("upgrade");
+        let manifest_hash = format!(
+            "sha256:{:x}",
+            Sha256::digest(fs::read(path.join("manifest.json")).expect("read manifest"))
+        );
         let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
         connection
-            .execute_batch("DROP TRIGGER audit_event_prevent_update;")
-            .expect("simulate storage tampering");
+            .execute(
+                "INSERT INTO audit_event (
+                    event_id, actor, action, target_type, target_id,
+                    before_hash, after_hash, occurred_at, correlation_id
+                 ) VALUES (?1, 'local-user', 'job.progressed', 'job', ?2,
+                           'sha256:before', 'sha256:after', ?3, ?1)",
+                params![
+                    "00000000-0000-7000-8000-000000000113",
+                    "00000000-0000-7000-8000-000000000210",
+                    CREATED_AT,
+                ],
+            )
+            .expect("insert interleaved job audit");
         connection
             .execute(
-                "UPDATE audit_event SET sequence = 3 WHERE action = 'project.metadata_migrated'",
-                [],
+                "INSERT INTO audit_event (
+                    event_id, actor, action, target_type, target_id,
+                    before_hash, after_hash, occurred_at, correlation_id
+                 ) VALUES (?1, 'local-user', 'project.metadata_migrated', 'project', ?2,
+                           ?3, ?3, ?4, ?1)",
+                params![
+                    "00000000-0000-7000-8000-000000000114",
+                    PROJECT_ID,
+                    manifest_hash,
+                    CREATED_AT,
+                ],
             )
-            .expect("tamper sequence");
+            .expect("insert later manifest audit");
         drop(connection);
 
-        assert!(matches!(
-            ProjectService::open(&path),
-            Err(ProjectError::DataIntegrity(_))
-        ));
+        ProjectService::open(&path).expect("open with interleaved global audit sequence");
         cleanup(&path);
     }
 }

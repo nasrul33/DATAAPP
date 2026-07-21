@@ -1,7 +1,9 @@
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use crate::{
     atomic_write, validate_safe_token, FilesystemError, ProjectLayout, MANIFEST_LIMIT_BYTES,
@@ -55,6 +57,29 @@ struct ContentProof {
     digest_b: u64,
 }
 
+/// Bounded content identity for one durable project-upgrade backup.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectUpgradeFileProof {
+    pub length: u64,
+    pub content_digest: String,
+}
+
+/// Durable identities for both control-file backups created before a marker.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProjectUpgradeBackupProof {
+    pub metadata: ProjectUpgradeFileProof,
+    pub manifest: ProjectUpgradeFileProof,
+}
+
+impl ContentProof {
+    fn bounded_file_proof(self) -> ProjectUpgradeFileProof {
+        ProjectUpgradeFileProof {
+            length: self.length,
+            content_digest: format!("proof-v1:{:016x}{:016x}", self.digest_a, self.digest_b),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct OwnedFile {
     file: File,
@@ -66,7 +91,17 @@ struct OwnedFile {
 pub struct PinnedProjectMetadata {
     path: PathBuf,
     file: File,
-    identity: RefCell<FileIdentity>,
+    identity: Arc<Mutex<FileIdentity>>,
+}
+
+type SharedIdentity = Arc<Mutex<FileIdentity>>;
+type WeakSharedIdentity = Weak<Mutex<FileIdentity>>;
+
+static PINNED_METADATA_IDENTITIES: OnceLock<Mutex<HashMap<PathBuf, WeakSharedIdentity>>> =
+    OnceLock::new();
+
+fn pinned_metadata_identities() -> &'static Mutex<HashMap<PathBuf, WeakSharedIdentity>> {
+    PINNED_METADATA_IDENTITIES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 impl PinnedProjectMetadata {
@@ -83,12 +118,10 @@ impl PinnedProjectMetadata {
     /// Returns an error when the path becomes linked, non-regular, replaced,
     /// or changes identity outside an authorized metadata write.
     pub fn verify(&self) -> Result<(), FilesystemError> {
-        validate_file_handle(
-            &self.path,
-            &self.file,
-            *self.identity.borrow(),
-            "pinned project metadata",
-        )
+        let expected = *self.identity.lock().map_err(|_| {
+            FilesystemError::InvalidLayout("pinned metadata capability is poisoned".to_owned())
+        })?;
+        validate_file_handle(&self.path, &self.file, expected, "pinned project metadata")
     }
 
     /// Accept the current identity after an authorized `SQLite` write completes.
@@ -113,8 +146,27 @@ impl PinnedProjectMetadata {
                 "pinned project metadata identity changed".to_owned(),
             ));
         }
-        self.identity.replace(handle_identity);
+        *self.identity.lock().map_err(|_| {
+            FilesystemError::InvalidLayout("pinned metadata capability is poisoned".to_owned())
+        })? = handle_identity;
         Ok(())
+    }
+}
+
+impl Drop for PinnedProjectMetadata {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.identity) != 1 {
+            return;
+        }
+        if let Ok(mut identities) = pinned_metadata_identities().lock() {
+            let remove = identities
+                .get(&self.path)
+                .and_then(Weak::upgrade)
+                .is_some_and(|registered| Arc::ptr_eq(&registered, &self.identity));
+            if remove {
+                identities.remove(&self.path);
+            }
+        }
     }
 }
 
@@ -130,11 +182,36 @@ pub fn pin_project_metadata(
     let path = layout.metadata_path();
     let (file, identity) =
         open_verified_regular_with_mode(&path, "project metadata", RegularOpenMode::Pinned)?;
+    let identity = shared_pinned_identity(&path, identity)?;
     Ok(PinnedProjectMetadata {
         path,
         file,
-        identity: RefCell::new(identity),
+        identity,
     })
+}
+
+fn shared_pinned_identity(
+    path: &Path,
+    observed: FileIdentity,
+) -> Result<SharedIdentity, FilesystemError> {
+    let mut identities = pinned_metadata_identities().lock().map_err(|_| {
+        FilesystemError::InvalidLayout("pinned metadata registry is poisoned".to_owned())
+    })?;
+    if let Some(shared) = identities.get(path).and_then(Weak::upgrade) {
+        let authorized = *shared.lock().map_err(|_| {
+            FilesystemError::InvalidLayout("pinned metadata capability is poisoned".to_owned())
+        })?;
+        if observed != authorized {
+            return Err(FilesystemError::InvalidLayout(
+                "pinned project metadata changed outside an authorized write".to_owned(),
+            ));
+        }
+        return Ok(shared);
+    }
+
+    let shared = Arc::new(Mutex::new(observed));
+    identities.insert(path.to_owned(), Arc::downgrade(&shared));
+    Ok(shared)
 }
 
 /// A durable guard for an in-place project metadata upgrade.
@@ -582,12 +659,16 @@ impl Drop for ProjectUpgrade {
 ///
 /// Returns an error for an invalid correlation ID, oversized marker, stale or
 /// unsafe layout, existing recovery artifacts, or operating-system failure.
-pub fn begin_project_upgrade(
+pub fn begin_project_upgrade<E, F>(
     layout: &ProjectLayout,
     correlation_id: &str,
-    marker_contents: &[u8],
-) -> Result<ProjectUpgrade, FilesystemError> {
-    begin_project_upgrade_inner(layout, correlation_id, marker_contents, |_, _| {})
+    marker_builder: F,
+) -> Result<ProjectUpgrade, E>
+where
+    E: From<FilesystemError>,
+    F: FnOnce(&ProjectUpgradeBackupProof) -> Result<Vec<u8>, E>,
+{
+    begin_project_upgrade_inner(layout, correlation_id, marker_builder, |_, _| {})
 }
 
 #[cfg(test)]
@@ -600,21 +681,27 @@ fn begin_project_upgrade_observed<F>(
 where
     F: FnMut(BeginStage, &ProjectLayout),
 {
-    begin_project_upgrade_inner(layout, correlation_id, marker_contents, observer)
+    begin_project_upgrade_inner(
+        layout,
+        correlation_id,
+        |_| Ok(marker_contents.to_vec()),
+        observer,
+    )
 }
 
-fn begin_project_upgrade_inner<F>(
+fn begin_project_upgrade_inner<E, F, O>(
     layout: &ProjectLayout,
     correlation_id: &str,
-    marker_contents: &[u8],
-    mut observer: F,
-) -> Result<ProjectUpgrade, FilesystemError>
+    marker_builder: F,
+    mut observer: O,
+) -> Result<ProjectUpgrade, E>
 where
-    F: FnMut(BeginStage, &ProjectLayout),
+    E: From<FilesystemError>,
+    F: FnOnce(&ProjectUpgradeBackupProof) -> Result<Vec<u8>, E>,
+    O: FnMut(BeginStage, &ProjectLayout),
 {
     validate_safe_token(correlation_id, "correlation_id")?;
     let marker_path = layout.root().join(UPGRADE_MARKER_FILE);
-    ensure_bounded(marker_contents, MANIFEST_LIMIT_BYTES, &marker_path)?;
 
     let recovery_directory = layout.root().join("recovery");
     let (root_directory, root_identity) = open_verified_directory(layout.root(), "project root")?;
@@ -628,7 +715,8 @@ where
         return Err(FilesystemError::FileTooLarge {
             path: layout.manifest_path(),
             limit: MANIFEST_LIMIT_BYTES,
-        });
+        }
+        .into());
     }
 
     let metadata_backup_path = recovery_directory.join(METADATA_BACKUP_FILE);
@@ -641,7 +729,7 @@ where
         &lock_path,
     ] {
         if entry_exists_no_follow(artifact)? {
-            return Err(FilesystemError::RecoveryRequired(artifact.clone()));
+            return Err(FilesystemError::RecoveryRequired(artifact.clone()).into());
         }
     }
 
@@ -677,14 +765,13 @@ where
         &manifest_backup_file,
         "project manifest",
     )?;
-    durable_bounded_write(
+    let (marker_file, marker_identity) = publish_initial_marker(
         &marker_path,
-        marker_contents,
-        MANIFEST_LIMIT_BYTES,
+        metadata_backup_proof,
+        manifest_backup_proof,
         correlation_id,
+        marker_builder,
     )?;
-    let (marker_file, marker_identity) =
-        open_verified_regular(&marker_path, "upgrade recovery marker", true)?;
 
     Ok(ProjectUpgrade {
         layout: layout.clone(),
@@ -715,6 +802,32 @@ where
         committed: false,
         finalize_failure: None,
     })
+}
+
+fn publish_initial_marker<E, F>(
+    marker_path: &Path,
+    metadata_backup_proof: ContentProof,
+    manifest_backup_proof: ContentProof,
+    correlation_id: &str,
+    marker_builder: F,
+) -> Result<(File, FileIdentity), E>
+where
+    E: From<FilesystemError>,
+    F: FnOnce(&ProjectUpgradeBackupProof) -> Result<Vec<u8>, E>,
+{
+    let backup_proof = ProjectUpgradeBackupProof {
+        metadata: metadata_backup_proof.bounded_file_proof(),
+        manifest: manifest_backup_proof.bounded_file_proof(),
+    };
+    let marker_contents = marker_builder(&backup_proof)?;
+    ensure_bounded(&marker_contents, MANIFEST_LIMIT_BYTES, marker_path)?;
+    durable_bounded_write(
+        marker_path,
+        &marker_contents,
+        MANIFEST_LIMIT_BYTES,
+        correlation_id,
+    )?;
+    open_verified_regular(marker_path, "upgrade recovery marker", true).map_err(E::from)
 }
 
 fn ensure_bounded(contents: &[u8], limit: u64, path: &Path) -> Result<(), FilesystemError> {
@@ -1203,6 +1316,14 @@ mod tests {
     const CORRELATION_ID: &str = "00000000-0000-7000-8000-000000000111";
     const MARKER: &[u8] = br#"{"stage":"backup_complete"}"#;
 
+    fn begin_project_upgrade(
+        layout: &ProjectLayout,
+        correlation_id: &str,
+        marker_contents: &[u8],
+    ) -> Result<ProjectUpgrade, FilesystemError> {
+        super::begin_project_upgrade(layout, correlation_id, |_| Ok(marker_contents.to_vec()))
+    }
+
     struct ProjectFixture {
         parent: PathBuf,
         layout: ProjectLayout,
@@ -1321,25 +1442,16 @@ mod tests {
     }
 
     #[test]
-    fn invalid_or_oversized_marker_does_not_create_recovery_artifacts() {
+    fn invalid_input_is_rejected_before_backup_and_oversized_built_marker_fails_closed() {
         let fixture = project_fixture("invalid-input");
         let layout = fixture.layout();
         let before = control_file_bytes(layout.root());
-        let oversized = vec![b'x'; usize::try_from(MANIFEST_LIMIT_BYTES).unwrap() + 1];
 
         assert!(matches!(
             begin_project_upgrade(layout, "not-a-correlation-id", MARKER),
             Err(FilesystemError::InvalidPath(_))
         ));
-        assert!(matches!(
-            begin_project_upgrade(layout, CORRELATION_ID, &oversized),
-            Err(FilesystemError::FileTooLarge { .. })
-        ));
         assert_eq!(control_file_bytes(layout.root()), before);
-        assert!(!layout
-            .root()
-            .join(".project-upgrade-recovery.json")
-            .exists());
         assert!(layout
             .root()
             .join("recovery")
@@ -1347,6 +1459,27 @@ mod tests {
             .unwrap()
             .next()
             .is_none());
+
+        let oversized_fixture = project_fixture("oversized-built-marker");
+        let oversized_layout = oversized_fixture.layout();
+        let oversized_before = control_file_bytes(oversized_layout.root());
+        let oversized = vec![b'x'; usize::try_from(MANIFEST_LIMIT_BYTES).unwrap() + 1];
+        assert!(matches!(
+            begin_project_upgrade(oversized_layout, CORRELATION_ID, &oversized),
+            Err(FilesystemError::FileTooLarge { .. })
+        ));
+        assert_eq!(
+            control_file_bytes(oversized_layout.root()),
+            oversized_before
+        );
+        assert!(!oversized_layout
+            .root()
+            .join(".project-upgrade-recovery.json")
+            .exists());
+        assert!(matches!(
+            validate_project_layout(oversized_layout.root()),
+            Err(FilesystemError::RecoveryRequired(_))
+        ));
     }
 
     #[test]
