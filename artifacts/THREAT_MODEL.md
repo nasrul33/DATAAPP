@@ -31,7 +31,7 @@
 | Duplicate or unbounded background execution | project-scoped executor accepts only validated `job_id`; bounded FIFO, bounded workers, and an in-process admission set prevent duplicate execution within one executor; cross-process exactly-once is not claimed |
 | Resource estimate overflow or aggregate exhaustion | checked arithmetic plus RAII reservations enforce explicit memory/disk/duration policy budgets before `RUNNING`; rejection is audit-backed and never invokes the handler |
 | Native handler panic leaks sensitive payload or kills a worker | executor-aware hook is installed before workers, marked handler panic text/location are discarded, `catch_unwind` contains the invocation, and persistence receives only fixed safe `OPERATION_FAILED` metadata |
-| Shutdown abandons queued work or silently drops worker handles | shutdown closes/drains the bounded queue, preserves unstarted snapshots as `QUEUED`, waits against one configured deadline, retains handles on timeout, and transfers them to a prestarted private reaper on Drop |
+| Shutdown abandons queued work or silently drops worker handles | shutdown closes/drains the bounded queue, preserves unstarted snapshots as `QUEUED`, and waits against one configured deadline; every handle stays in a preallocated shared worker slot registered with the reaper before spawn, so timed-out Drop disconnects a payload-free command sender and the prestarted reaper takes/joins remaining handles asynchronously |
 | Silent result manipulation | manifest SHA-256, manifest/SQLite identity comparison, SQLite integrity check, immutable runs, append-only events |
 | Sensitive data leakage | offline default, masking, explicit export summary |
 | Dependency compromise | lockfiles, SBOM, signature/checksum release |
@@ -59,7 +59,8 @@
 - Handler estimates are checked and reserved against caller-configured memory, disk, and duration budgets. These values are policy ceilings, not measurements of physical memory or free disk; platform probes remain follow-up scope.
 - Panic containment covers `JobHandler::run`. A process-wide executor-aware hook delegates unrelated panics to the prior hook, discards marked handler payload/location, and persists only a fixed safe failure. The invariant panic in resource-reservation Drop also uses a fixed non-sensitive message.
 - Cancellation remains persistent and cooperative. A native handler that does not checkpoint cannot be forcibly killed; the observable bounded outcome is `ShutdownTimeout`, with active state retained for T-0110 restart recovery.
-- The private reaper starts before workers and owns leftover `JoinHandle` cleanup after a timed-out Drop. It does not make the handler cooperative and does not claim successful shutdown while work remains.
+- Before any worker spawn, the private reaper receives clones of every preallocated `Arc<WorkerSlot>`. A worker `JoinHandle` is installed in its slot and never sent through the command channel. Graceful shutdown takes/joins handles from those slots only after exit proof.
+- After a timed-out Drop, dropping the payload-free command sender disconnects and wakes the prestarted reaper; the reaper takes/joins every remaining slot handle asynchronously. The channel carries only `Stop`, so `Full` or `Disconnected` cannot own or drop a worker handle. This fallback does not make the handler cooperative and does not claim successful shutdown while work remains.
 - Engine dispatch, platform resource discovery, Tauri job events/commands, automatic retry, and Job Center UI are not authorized by T-0111.
 
 ## Accepted Windows residuals (Option B)

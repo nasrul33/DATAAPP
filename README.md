@@ -190,7 +190,7 @@ pnpm contracts:check
 
 ## Background job executor core
 
-T-0111 menyediakan `JobExecutor` Rust project-scoped dengan worker dan submission queue bounded. Caller native mempersistenkan job melalui `JobStore`, lalu submit hanya `job_id`; handler terdaftar berjalan di background, menulis progress melalui CAS, mengamati cancellation persisten pada checkpoint, dan menghasilkan lifecycle plus audit history yang tetap dapat dibaca setelah reopen. Resource estimate ditolak sebelum handler berjalan jika melampaui budget memory/disk/duration yang dikonfigurasi. Handler error dan panic dipetakan ke failure metadata yang aman, sedangkan shutdown memakai deadline eksplisit dan private reaper untuk mempertahankan ownership worker handle.
+T-0111 menyediakan `JobExecutor` Rust project-scoped dengan worker dan submission queue bounded. Caller native mempersistenkan job melalui `JobStore`, lalu submit hanya `job_id`; handler terdaftar berjalan di background, menulis progress melalui CAS, mengamati cancellation persisten pada checkpoint, dan menghasilkan lifecycle plus audit history yang tetap dapat dibaca setelah reopen. Resource estimate ditolak sebelum handler berjalan jika melampaui budget memory/disk/duration yang dikonfigurasi. Handler error dan panic dipetakan ke failure metadata yang aman. Shutdown memakai deadline eksplisit; setiap handle tetap di preallocated shared worker slot, dan setelah timed-out Drop, sender disconnection membangunkan private reaper untuk mengambil serta join handle tersisa secara asynchronous.
 
 Verifikasi executor secara terisolasi dari root repository:
 

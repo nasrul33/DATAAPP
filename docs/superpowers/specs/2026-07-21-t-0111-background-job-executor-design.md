@@ -97,7 +97,7 @@ T-0111 does not claim that configured budgets equal current physical availabilit
 
 ### `WorkerReaper`
 
-Construction creates one executor-private maintenance reaper before any worker starts. The reaper normally receives a stop command and is joined after all workers complete. If `Drop` follows a timed-out explicit shutdown, ownership of every remaining worker `JoinHandle` is transferred to the reaper through a bounded channel; the reaper joins those workers asynchronously and then exits. The caller-facing destructor performs no unbounded wait, while worker handles are never silently discarded.
+Construction preallocates one `Arc<WorkerSlot>` per worker and registers clones of all slots with one executor-private maintenance reaper before any worker starts. Each spawned worker installs its `JoinHandle` in its shared slot; handles are never sent through the command channel. The reaper normally receives the payload-free `Stop` command and is joined after graceful shutdown has taken/joined every worker handle. If `Drop` follows a timed-out explicit shutdown, dropping the command sender disconnects and wakes the reaper; it takes and joins every remaining slot handle asynchronously and then exits. `Full` or `Disconnected` command-channel outcomes cannot own or drop a handle, and the caller-facing destructor performs no unbounded wait.
 
 ## Configuration
 
@@ -159,7 +159,7 @@ Shutdown has three phases:
 
 Queued jobs not started before shutdown remain `QUEUED`. Running or cancelling jobs that do not finish remain in their current persistent state. The executor does not falsely mark them successful or delete their history. On the next application start, the existing T-0110 `recover_interrupted` operation changes `RUNNING` and `CANCELLING` jobs to `FAILED/INTERRUPTED` exactly once.
 
-If all workers and the idle reaper join within the deadline, shutdown succeeds. Otherwise it returns `ShutdownTimeout` and retains outstanding worker handles for a later shutdown attempt. If the executor is then dropped, the outstanding handles are transferred to the already-running reaper without an unbounded caller wait. The executor never kills a worker or claims bounded shutdown success while work remains; application termination remains an outer-process decision.
+If all workers and the idle reaper join within the deadline, shutdown succeeds. Otherwise it returns `ShutdownTimeout` and retains outstanding worker handles in their shared slots for a later shutdown attempt. If the executor is then dropped, sender disconnection wakes the already-running reaper to take/join those slot handles without an unbounded caller wait. The executor never kills a worker or claims bounded shutdown success while work remains; application termination remains an outer-process decision.
 
 ## Typed errors
 

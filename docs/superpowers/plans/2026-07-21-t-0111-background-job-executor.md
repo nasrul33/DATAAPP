@@ -789,7 +789,7 @@ Add tests that prove:
 
 1. `shutdown` rejects later submissions, drains pending IDs, releases their admission claims, leaves their snapshots `QUEUED`, and joins a cooperative active worker.
 2. A gated non-cooperative handler causes `ShutdownTimeout`; after the test releases its gate, a second `shutdown` joins successfully.
-3. Dropping after `ShutdownTimeout` returns within a bounded test deadline, transfers the outstanding worker handle to the pre-started reaper, and the reaper observes worker completion after the handler gate is released.
+3. Dropping after `ShutdownTimeout` returns within a bounded test deadline, disconnects the payload-free reaper command sender, and the pre-started reaper takes/joins the outstanding handle from its shared slot after the handler gate is released.
 4. Dropping an interrupted process fixture and reopening its store lets `recover_interrupted` change active state to `FAILED/INTERRUPTED` once, while queued state remains unchanged.
 5. Sixteen simultaneous `submit` calls for one `job_id` yield exactly one success, fifteen `AlreadySubmitted` results, and one handler invocation. Hold the admitted handler at a channel-driven gate until all submitters report; use a start barrier and bounded channels, not timing, as the assertion.
 
@@ -812,7 +812,7 @@ Expected: FAIL because bounded join/retry and drain cleanup are incomplete.
 - stop and join the idle reaper only after every worker handle is joined;
 - return success only when every worker and the reaper are joined.
 
-`JobExecutor::new` starts a panic-free executor-private `WorkerReaper` before worker creation and keeps its bounded command sender plus join handle. `Drop` closes/drains, performs only the configured bounded shutdown attempt, then sends every unjoined worker handle to that existing reaper and returns without joining it. The reaper owns and joins the workers asynchronously, signals completion for deterministic tests, and exits. Production owners must still call `shutdown`; reaper adoption is the safety fallback, not a successful graceful shutdown.
+`JobExecutor::new` preallocates one `Arc<WorkerSlot>` per worker, registers clones with a panic-free executor-private `WorkerReaper`, and starts the reaper before worker creation. Every worker installs its `JoinHandle` in its shared slot. The bounded command channel is payload-free and carries only `Stop`; it never owns a worker handle. `Drop` closes/drains, performs only the configured bounded shutdown attempt, then drops the sender and returns without joining the reaper. On disconnection, the existing reaper takes and joins every remaining slot handle asynchronously, signals completion for deterministic tests, and exits. `Full` or `Disconnected` command errors cannot drop handles. Production owners must still call `shutdown`; disconnect-triggered reaper cleanup is the safety fallback, not a successful graceful shutdown.
 
 - [ ] **Step 4: Run executor tests repeatedly to expose flakes**
 
