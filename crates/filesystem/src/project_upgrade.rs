@@ -115,6 +115,15 @@ fn pinned_metadata_identities() -> &'static Mutex<HashMap<PathBuf, WeakSharedIde
 }
 
 impl PinnedProjectMetadata {
+    #[cfg(any(test, feature = "test-utils"))]
+    #[must_use]
+    pub fn operation_is_locked_for_test(&self) -> bool {
+        matches!(
+            self.identity.try_lock(),
+            Err(std::sync::TryLockError::WouldBlock)
+        )
+    }
+
     /// Begin one complete read or write operation over this pinned capability.
     ///
     /// # Errors

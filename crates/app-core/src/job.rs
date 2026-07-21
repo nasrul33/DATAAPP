@@ -18,33 +18,40 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 #[cfg(test)]
-type AfterCommitBarrier = Option<(std::thread::ThreadId, std::sync::Arc<std::sync::Barrier>)>;
+struct AfterCommitHook {
+    thread_id: std::thread::ThreadId,
+    committed: std::sync::mpsc::SyncSender<()>,
+    release: std::sync::mpsc::Receiver<()>,
+}
 
 #[cfg(test)]
-static AFTER_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<AfterCommitBarrier>> =
+static AFTER_COMMIT_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<AfterCommitHook>>> =
     std::sync::OnceLock::new();
 
 #[cfg(test)]
-fn install_after_commit_barrier(barrier: Option<std::sync::Arc<std::sync::Barrier>>) {
-    *AFTER_COMMIT_BARRIER
+fn install_after_commit_hook(hook: Option<AfterCommitHook>) {
+    *AFTER_COMMIT_HOOK
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
-        .expect("after-commit barrier is available") =
-        barrier.map(|value| (std::thread::current().id(), value));
+        .expect("after-commit hook is available") = hook;
 }
 
 #[cfg(test)]
 fn wait_after_commit_before_identity_refresh() {
-    let barrier = AFTER_COMMIT_BARRIER
+    let mut hook = AFTER_COMMIT_HOOK
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
-        .expect("after-commit barrier is available")
+        .expect("after-commit hook is available");
+    let hook = hook
         .as_ref()
-        .filter(|(thread_id, _)| *thread_id == std::thread::current().id())
-        .map(|(_, barrier)| std::sync::Arc::clone(barrier));
-    if let Some(barrier) = barrier {
-        barrier.wait();
-        barrier.wait();
+        .is_some_and(|value| value.thread_id == std::thread::current().id())
+        .then(|| hook.take())
+        .flatten();
+    if let Some(hook) = hook {
+        hook.committed.send(()).expect("signal committed write");
+        hook.release
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("release committed writer before timeout");
     }
 }
 
@@ -1647,8 +1654,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::mpsc::{self, RecvTimeoutError};
-    use std::sync::{Arc, Barrier};
+    use std::sync::mpsc;
     use std::time::Duration;
 
     use rusqlite::{params, Connection, Result, TransactionBehavior};
@@ -1662,9 +1668,9 @@ mod tests {
     use teratai_filesystem::REQUIRED_PROJECT_DIRECTORIES;
 
     use super::{
-        event_id_at, full_project_validation_count, install_after_commit_barrier, snapshot_hash,
-        transition_allowed, validate_persisted_descriptor, JobError, JobErrorKind, JobListCursor,
-        JobStatus, JobStore, TransitionRequest, JOB_MIGRATION,
+        event_id_at, full_project_validation_count, install_after_commit_hook, snapshot_hash,
+        transition_allowed, validate_persisted_descriptor, AfterCommitHook, JobError, JobErrorKind,
+        JobListCursor, JobStatus, JobStore, TransitionRequest, JOB_MIGRATION,
     };
     use crate::ProjectService;
 
@@ -1765,39 +1771,38 @@ mod tests {
         let path = create_schema_two_project("simultaneous-peer-handles");
         let writer = JobStore::open(&path).expect("open writer store");
         let reader = JobStore::open(&path).expect("open reader store");
-        let barrier = Arc::new(Barrier::new(2));
-        let writer_barrier = Arc::clone(&barrier);
+        let (committed_sender, committed_receiver) = mpsc::sync_channel(1);
+        let (release_sender, release_receiver) = mpsc::sync_channel(1);
         let writer_thread = std::thread::spawn(move || {
-            install_after_commit_barrier(Some(writer_barrier));
+            install_after_commit_hook(Some(AfterCommitHook {
+                thread_id: std::thread::current().id(),
+                committed: committed_sender,
+                release: release_receiver,
+            }));
             let result = writer.enqueue_at(&enqueue(0), NOW);
-            install_after_commit_barrier(None);
+            install_after_commit_hook(None);
             result
         });
-        barrier.wait();
-        let (result_sender, result_receiver) = mpsc::channel();
-        let reader_thread = std::thread::spawn(move || {
-            result_sender
-                .send(reader.get(&job_id(0)))
-                .expect("send reader result");
-        });
-        let before_refresh = result_receiver.recv_timeout(Duration::from_millis(100));
-        barrier.wait();
+        if committed_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .is_err()
+        {
+            install_after_commit_hook(None);
+            let _ = release_sender.send(());
+            let _ = writer_thread.join();
+            panic!("writer did not reach the post-commit hook");
+        }
+        assert!(reader.metadata.operation_is_locked_for_test());
+        release_sender.send(()).expect("release committed writer");
 
         let queued = writer_thread
             .join()
             .expect("writer thread")
             .expect("peer enqueue");
-        let observed = match before_refresh {
-            Err(RecvTimeoutError::Timeout) => result_receiver
-                .recv_timeout(Duration::from_secs(2))
-                .expect("reader completed after identity refresh"),
-            Ok(result) => panic!("reader completed before identity refresh: {result:?}"),
-            Err(RecvTimeoutError::Disconnected) => panic!("reader result channel disconnected"),
-        }
-        .expect("read after peer commit");
-        reader_thread.join().expect("reader thread");
+        let observed = reader.get(&job_id(0)).expect("read after peer commit");
         assert_eq!(observed, queued);
 
+        drop(reader);
         cleanup_project(&path);
     }
 
