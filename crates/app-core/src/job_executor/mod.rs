@@ -1,14 +1,11 @@
-#[expect(
-    dead_code,
-    reason = "worker-only queue paths remain intentionally unused until Task 4 starts executor threads"
-)]
 mod queue;
 
 pub mod resource;
 
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread::{self, JoinHandle};
 
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -17,6 +14,7 @@ use self::queue::{BoundedQueue, PushError};
 use self::resource::{ResourceBudget, ResourceEstimate, ResourceLedger};
 use crate::job::{
     JobDescriptor, JobError, JobErrorKind, JobProgressUpdateRequest, JobStatus, JobStore,
+    JobTransitionRequest,
 };
 
 #[derive(Debug, Clone)]
@@ -100,8 +98,16 @@ impl ExecutionContext<'_> {
         &mut self,
         progress: JobProgress,
     ) -> Result<CheckpointDecision, JobExecutorError> {
-        if self.cancellation_requested()? {
-            return Ok(CheckpointDecision::Cancelled);
+        self.descriptor = self
+            .store
+            .get(&self.descriptor.job_id)
+            .map_err(|error| map_persistence_error(&error))?;
+        match JobStatus::parse(&self.descriptor.status)
+            .map_err(|error| map_persistence_error(&error))?
+        {
+            JobStatus::Cancelling => return Ok(CheckpointDecision::Cancelled),
+            JobStatus::Running => {}
+            _ => return Err(JobExecutorError::InvalidState),
         }
         let timestamp = self
             .clock
@@ -270,34 +276,299 @@ impl Display for JobExecutorError {
 
 impl std::error::Error for JobExecutorError {}
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Task 3 validates the crate-private core; Task 4 supplies its first production owner"
-    )
-)]
+struct WorkerHandle {
+    join: Option<JoinHandle<()>>,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "Task 7 consumes the required completion signal for deadline-based shutdown"
+        )
+    )]
+    completed: mpsc::Receiver<()>,
+}
+
+enum ReaperCommand {
+    Adopt(JoinHandle<()>),
+    Stop,
+}
+
+struct WorkerReaper {
+    commands: mpsc::SyncSender<ReaperCommand>,
+    join: Option<JoinHandle<()>>,
+}
+
+impl WorkerReaper {
+    fn start(capacity: usize) -> Result<Self, JobExecutorError> {
+        let (commands, receiver) = mpsc::sync_channel(capacity);
+        let join = thread::Builder::new()
+            .name("teratai-job-worker-reaper".to_owned())
+            .spawn(move || {
+                while let Ok(command) = receiver.recv() {
+                    match command {
+                        ReaperCommand::Adopt(worker) => {
+                            let _worker_result = worker.join();
+                        }
+                        ReaperCommand::Stop => break,
+                    }
+                }
+            })
+            .map_err(|_| JobExecutorError::InvalidConfiguration)?;
+        Ok(Self {
+            commands,
+            join: Some(join),
+        })
+    }
+
+    fn adopt(&self, worker: JoinHandle<()>) {
+        if let Err(error) = self.commands.send(ReaperCommand::Adopt(worker)) {
+            if let ReaperCommand::Adopt(worker) = error.0 {
+                let _worker_result = worker.join();
+            }
+        }
+    }
+
+    fn request_stop(&self) {
+        let _stop_result = self.commands.send(ReaperCommand::Stop);
+    }
+
+    fn stop_and_join(&mut self) {
+        self.request_stop();
+        if let Some(join) = self.join.take() {
+            let _reaper_result = join.join();
+        }
+    }
+}
+
+/// Project-scoped bounded executor for persisted native jobs.
+pub struct JobExecutor {
+    core: Arc<ExecutorCore>,
+    workers: Vec<WorkerHandle>,
+    reaper: Option<WorkerReaper>,
+}
+
+impl JobExecutor {
+    /// Construct the validated core, start its private reaper, and then start workers.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe configuration error when validation, reaper startup, or
+    /// worker startup fails. A partial worker set is closed and joined before
+    /// construction returns an error.
+    pub fn new(
+        store: Arc<JobStore>,
+        handlers: Vec<Arc<dyn JobHandler>>,
+        config: JobExecutorConfig,
+        clock: Arc<dyn ExecutorClock>,
+    ) -> Result<Self, JobExecutorError> {
+        let core = Arc::new(ExecutorCore::new(store, handlers, config, clock)?);
+        let reaper_capacity = core
+            .config
+            .worker_count
+            .checked_add(1)
+            .ok_or(JobExecutorError::InvalidConfiguration)?;
+        let mut reaper = WorkerReaper::start(reaper_capacity)?;
+        let mut workers = Vec::new();
+        workers
+            .try_reserve_exact(core.config.worker_count)
+            .map_err(|_| {
+                reaper.stop_and_join();
+                JobExecutorError::InvalidConfiguration
+            })?;
+
+        for worker_index in 0..core.config.worker_count {
+            let worker_core = Arc::clone(&core);
+            let (completed_sender, completed) = mpsc::sync_channel(1);
+            let spawn_result = thread::Builder::new()
+                .name(format!("teratai-job-worker-{worker_index}"))
+                .spawn(move || {
+                    worker_loop(&worker_core);
+                    let _completion_result = completed_sender.send(());
+                });
+            if let Ok(join) = spawn_result {
+                workers.push(WorkerHandle {
+                    join: Some(join),
+                    completed,
+                });
+            } else {
+                rollback_worker_start(&core, &mut workers, &mut reaper);
+                return Err(JobExecutorError::InvalidConfiguration);
+            }
+        }
+
+        Ok(Self {
+            core,
+            workers,
+            reaper: Some(reaper),
+        })
+    }
+
+    /// Submit one already-persisted queued job without waiting for capacity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a safe admission error without mutating persistent state.
+    pub fn submit(&self, job_id: &str) -> Result<(), JobExecutorError> {
+        self.core.claim_and_queue(job_id)
+    }
+}
+
+impl Drop for JobExecutor {
+    fn drop(&mut self) {
+        let drained = self.core.queue.close_and_drain();
+        release_drained_admissions(&self.core.admitted, drained);
+        if let Some(reaper) = self.reaper.take() {
+            for worker in &mut self.workers {
+                if let Some(join) = worker.join.take() {
+                    reaper.adopt(join);
+                }
+            }
+            reaper.request_stop();
+        }
+    }
+}
+
+fn rollback_worker_start(
+    core: &ExecutorCore,
+    workers: &mut [WorkerHandle],
+    reaper: &mut WorkerReaper,
+) {
+    let drained = core.queue.close_and_drain();
+    release_drained_admissions(&core.admitted, drained);
+    for worker in workers {
+        if let Some(join) = worker.join.take() {
+            let _worker_result = join.join();
+        }
+    }
+    reaper.stop_and_join();
+}
+
+fn release_drained_admissions(admitted: &Mutex<HashSet<String>>, drained: Vec<String>) {
+    let mut admitted = match admitted.lock() {
+        Ok(admitted) => admitted,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    for job_id in drained {
+        admitted.remove(&job_id);
+    }
+}
+
+struct AdmissionGuard {
+    admitted: Arc<Mutex<HashSet<String>>>,
+    job_id: String,
+}
+
+impl AdmissionGuard {
+    fn new(admitted: Arc<Mutex<HashSet<String>>>, job_id: String) -> Self {
+        Self { admitted, job_id }
+    }
+}
+
+impl Drop for AdmissionGuard {
+    fn drop(&mut self) {
+        let mut admitted = match self.admitted.lock() {
+            Ok(admitted) => admitted,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        admitted.remove(&self.job_id);
+    }
+}
+
+fn worker_loop(core: &ExecutorCore) {
+    while let Some(job_id) = core.queue.pop() {
+        let _admission = AdmissionGuard::new(Arc::clone(&core.admitted), job_id.clone());
+        let _execution_result = execute_job(core, &job_id);
+    }
+}
+
+fn execute_job(core: &ExecutorCore, job_id: &str) -> Result<(), JobExecutorError> {
+    let queued = core
+        .store
+        .get(job_id)
+        .map_err(|error| map_persistence_error(&error))?;
+    if JobStatus::parse(&queued.status).map_err(|error| map_persistence_error(&error))?
+        != JobStatus::Queued
+    {
+        return Ok(());
+    }
+    let handler = core
+        .handlers
+        .get(queued.kind.as_str())
+        .cloned()
+        .ok_or(JobExecutorError::HandlerNotFound)?;
+    let _reservation = core
+        .resource_ledger
+        .reserve(handler.estimate())
+        .map_err(|_| JobExecutorError::PreflightRejected)?;
+    let started_at = core
+        .clock
+        .now()
+        .map_err(|_| JobExecutorError::PersistenceFailed)?;
+    let running = core
+        .store
+        .start_at(&transition_request(&queued), &started_at)
+        .map_err(|error| map_persistence_error(&error))?;
+    let mut context = ExecutionContext {
+        store: core.store.as_ref(),
+        descriptor: running,
+        clock: core.clock.as_ref(),
+    };
+
+    if matches!(handler.run(&mut context), Ok(HandlerOutcome::Completed)) {
+        finish_completed_job(core, job_id)?;
+    }
+    Ok(())
+}
+
+fn finish_completed_job(core: &ExecutorCore, job_id: &str) -> Result<(), JobExecutorError> {
+    let descriptor = core
+        .store
+        .get(job_id)
+        .map_err(|error| map_persistence_error(&error))?;
+    let status =
+        JobStatus::parse(&descriptor.status).map_err(|error| map_persistence_error(&error))?;
+    let finished_at = core
+        .clock
+        .now()
+        .map_err(|_| JobExecutorError::PersistenceFailed)?;
+    let request = transition_request(&descriptor);
+    match status {
+        JobStatus::Running => core
+            .store
+            .succeed_at(&request, &finished_at)
+            .map(|_| ())
+            .map_err(|error| map_persistence_error(&error)),
+        JobStatus::Cancelling => core
+            .store
+            .complete_cancellation_at(&request, &finished_at)
+            .map(|_| ())
+            .map_err(|error| map_persistence_error(&error)),
+        _ => Ok(()),
+    }
+}
+
+fn transition_request(descriptor: &JobDescriptor) -> JobTransitionRequest {
+    JobTransitionRequest {
+        correlation_id: descriptor.correlation_id.clone(),
+        expected_revision: descriptor.revision,
+        job_id: descriptor.job_id.clone(),
+    }
+}
+
 pub(crate) struct ExecutorCore {
     store: Arc<JobStore>,
     queue: Arc<BoundedQueue<String>>,
     handlers: HashMap<&'static str, Arc<dyn JobHandler>>,
     admitted: Arc<Mutex<HashSet<String>>>,
-    _resource_ledger: ResourceLedger,
-    _config: JobExecutorConfig,
-    _clock: Arc<dyn ExecutorClock>,
+    resource_ledger: ResourceLedger,
+    config: JobExecutorConfig,
+    clock: Arc<dyn ExecutorClock>,
     #[cfg(test)]
     admission_bound: usize,
     #[cfg(test)]
     before_queue_push: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Task 3 validates admission in unit tests; Task 4 calls these methods from the public executor"
-    )
-)]
 impl ExecutorCore {
     pub(crate) fn new(
         store: Arc<JobStore>,
@@ -338,9 +609,9 @@ impl ExecutorCore {
             queue,
             handlers: registry,
             admitted: Arc::new(Mutex::new(admitted)),
-            _resource_ledger: resource_ledger,
-            _config: config,
-            _clock: clock,
+            resource_ledger,
+            config,
+            clock,
             #[cfg(test)]
             admission_bound,
             #[cfg(test)]
@@ -416,13 +687,6 @@ impl ExecutorCore {
     }
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Task 3 validates construction in unit tests; Task 4 calls it through ExecutorCore"
-    )
-)]
 fn validate_config(config: &JobExecutorConfig) -> Result<(), JobExecutorError> {
     let available = std::thread::available_parallelism()
         .map_err(|_| JobExecutorError::InvalidConfiguration)?
@@ -437,13 +701,6 @@ fn validate_config(config: &JobExecutorConfig) -> Result<(), JobExecutorError> {
     Ok(())
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Task 3 validates admission in unit tests; Task 4 makes the core production-live"
-    )
-)]
 fn map_admission_read_error(error: &JobError) -> JobExecutorError {
     match error.kind() {
         JobErrorKind::InvalidRequest => JobExecutorError::InvalidJobId,
@@ -475,13 +732,6 @@ fn is_safe_message(value: &str, maximum: usize) -> bool {
         && !value.chars().any(char::is_control)
 }
 
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "Task 3 validates handler registration in unit tests; Task 4 makes the registry production-live"
-    )
-)]
 fn is_safe_token(value: &str, maximum: usize) -> bool {
     let bytes = value.as_bytes();
     (1..=maximum).contains(&bytes.len())

@@ -5,6 +5,10 @@ use std::sync::{Condvar, LockResult, Mutex, MutexGuard};
 pub(crate) enum PushError<T> {
     Full(T),
     Closed(T),
+    #[expect(
+        dead_code,
+        reason = "the required typed queue contract reserves poison reporting while this queue recovers poisoned guards"
+    )]
     Poisoned(T),
 }
 

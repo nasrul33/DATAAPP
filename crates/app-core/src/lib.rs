@@ -9,7 +9,7 @@ pub use job::{
 };
 pub use job_executor::resource::{DurationClass, ResourceBudget, ResourceEstimate};
 pub use job_executor::{
-    CheckpointDecision, ClockError, ExecutionContext, ExecutorClock, HandlerOutcome,
+    CheckpointDecision, ClockError, ExecutionContext, ExecutorClock, HandlerOutcome, JobExecutor,
     JobExecutorConfig, JobExecutorError, JobExecutorErrorKind, JobHandler, JobHandlerError,
     JobProgress, SystemExecutorClock,
 };

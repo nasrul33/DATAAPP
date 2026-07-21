@@ -8,8 +8,8 @@ use teratai_contracts::generated::project_create_request::ProjectCreateRequest;
 
 use super::resource::{DurationClass, ResourceBudget, ResourceEstimate};
 use super::{
-    ClockError, ExecutionContext, ExecutorClock, ExecutorCore, HandlerOutcome, JobExecutorConfig,
-    JobExecutorError, JobHandler, JobHandlerError,
+    CheckpointDecision, ClockError, ExecutionContext, ExecutorClock, ExecutorCore, HandlerOutcome,
+    JobExecutor, JobExecutorConfig, JobExecutorError, JobHandler, JobHandlerError, JobProgress,
 };
 use crate::job::JobTransitionRequest;
 use crate::{JobEnqueueRequest, JobStore, ProjectService};
@@ -23,6 +23,7 @@ static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 struct ExecutorFixture {
     store: Option<Arc<JobStore>>,
     parent: PathBuf,
+    project_path: PathBuf,
     next_job: u64,
 }
 
@@ -48,6 +49,7 @@ impl ExecutorFixture {
         Self {
             store: Some(store),
             parent,
+            project_path,
             next_job: 0x310,
         }
     }
@@ -112,7 +114,7 @@ struct FixedClock;
 
 impl ExecutorClock for FixedClock {
     fn now(&self) -> Result<String, ClockError> {
-        Ok("2026-07-21T00:00:00Z".to_owned())
+        Ok("2099-07-21T00:00:00Z".to_owned())
     }
 }
 
@@ -150,6 +152,117 @@ impl JobHandler for InvalidKindHandler {
     fn run(&self, _context: &mut ExecutionContext<'_>) -> Result<HandlerOutcome, JobHandlerError> {
         Ok(HandlerOutcome::Completed)
     }
+}
+
+struct GateHandler {
+    entered: mpsc::SyncSender<i64>,
+    release: Mutex<mpsc::Receiver<()>>,
+    invocations: Arc<AtomicUsize>,
+}
+
+impl JobHandler for GateHandler {
+    fn kind(&self) -> &'static str {
+        "mock.success"
+    }
+
+    fn estimate(&self) -> ResourceEstimate {
+        ResourceEstimate {
+            memory_bytes: 16,
+            disk_bytes: 32,
+            duration: DurationClass::Short,
+        }
+    }
+
+    fn run(&self, context: &mut ExecutionContext<'_>) -> Result<HandlerOutcome, JobHandlerError> {
+        self.invocations.fetch_add(1, Ordering::SeqCst);
+        for current in [1, 2] {
+            self.entered.send(current).expect("signal checkpoint");
+            self.release
+                .lock()
+                .expect("release receiver")
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release checkpoint");
+            if context
+                .checkpoint(JobProgress {
+                    current,
+                    total: Some(2),
+                    unit: Some("step".to_owned()),
+                    phase: "mock.work".to_owned(),
+                    message: format!("Langkah {current} dari 2"),
+                })
+                .expect("persist checkpoint")
+                == CheckpointDecision::Cancelled
+            {
+                return Ok(HandlerOutcome::Cancelled);
+            }
+        }
+        Ok(HandlerOutcome::Completed)
+    }
+}
+
+#[test]
+fn mock_job_persists_progress_and_succeeds() {
+    let mut fixture = ExecutorFixture::new("mock-success");
+    let queued = fixture.enqueue("mock.success");
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(2);
+    let (release_sender, release_receiver) = mpsc::sync_channel(2);
+    let handler = Arc::new(GateHandler {
+        entered: entered_sender,
+        release: Mutex::new(release_receiver),
+        invocations: Arc::clone(&invocations),
+    });
+    let executor = JobExecutor::new(
+        Arc::clone(fixture.store()),
+        vec![handler],
+        ExecutorFixture::config(1),
+        Arc::new(FixedClock),
+    )
+    .expect("start executor");
+
+    executor.submit(&queued.job_id).expect("submit mock job");
+    assert_eq!(
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handler enters first checkpoint"),
+        1
+    );
+    let running = fixture.store().get(&queued.job_id).expect("running job");
+    assert_eq!(running.status, "RUNNING");
+    assert_eq!(running.revision, queued.revision + 1);
+
+    release_sender.send(()).expect("release first checkpoint");
+    assert_eq!(
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handler enters second checkpoint"),
+        2
+    );
+    let first_progress = fixture.store().get(&queued.job_id).expect("first progress");
+    assert_eq!(first_progress.progress_current, 1);
+    assert_eq!(first_progress.revision, running.revision + 1);
+
+    release_sender.send(()).expect("release second checkpoint");
+    assert!(executor.core.queue.close_and_drain().is_empty());
+    executor.workers[0]
+        .completed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("worker completes after closed queue");
+
+    let succeeded = fixture.store().get(&queued.job_id).expect("succeeded job");
+    assert_eq!(succeeded.status, "SUCCEEDED");
+    assert_eq!(succeeded.progress_current, 2);
+    assert_eq!(succeeded.progress_total, Some(2));
+    assert_eq!(succeeded.progress_unit.as_deref(), Some("step"));
+    assert_eq!(succeeded.progress_phase.as_deref(), Some("mock.work"));
+    assert_eq!(succeeded.revision, first_progress.revision + 2);
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+    let reopened = JobStore::open(&fixture.project_path).expect("reopen job store");
+    assert_eq!(
+        reopened.get(&queued.job_id).expect("reopened job"),
+        succeeded
+    );
 }
 
 #[test]
