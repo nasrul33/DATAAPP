@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/runtime/correlation-request.schema.json",
+  "title": "CorrelationRequest",
+  "description": "Minimal request used by native commands that only require correlation.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["request_id"],
+  "properties": {
+    "request_id": {
+      "description": "Lowercase UUID v7 correlation identifier.",
+      "type": "string"
+    }
+  }
+}

@@ -50,4 +50,4 @@ Crate `teratai-contracts` di `packages/contracts/rust` menjadi dependency bersam
 
 ## Project contracts
 
-`ProjectCreateRequest`, `ProjectManifest`, dan `ProjectDescriptor` membentuk lifecycle project native T-0100. Contract hanya mendeskripsikan wire/storage shape; validasi UUID v7, absolute `.teratai` path, bounded manifest, schema compatibility, SQLite integrity, dan fingerprint tetap diwajibkan pada Rust project core sebelum descriptor dipercaya.
+`ProjectCreateRequest`, `ProjectOpenRequest`, `CorrelationRequest`, `ProjectManifest`, dan `ProjectDescriptor` membentuk lifecycle project native. `DesktopError` menjadi error envelope aman pada batas Tauri. Contract hanya mendeskripsikan wire/storage shape; validasi UUID v7, absolute `.teratai` path, bounded manifest, schema compatibility, SQLite integrity, fingerprint, serta sanitasi error tetap diwajibkan pada Rust sebelum data dipercaya UI.

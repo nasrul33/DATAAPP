@@ -7,7 +7,7 @@ Target utama: Windows, Tauri 2.x, Python 3.12
 
 ## Prasyarat
 
-Toolchain yang telah diverifikasi untuk T-0001 sampai T-0100:
+Toolchain yang telah diverifikasi untuk T-0001 sampai T-0101:
 
 - Node.js 24.17.0 atau kompatibel dengan `>=24.0.0`.
 - pnpm 11.9.0.
@@ -51,7 +51,7 @@ pnpm --filter @teratai/desktop build
 pnpm --dir apps/desktop desktop:build
 ```
 
-Dashboard shell saat ini sengaja menampilkan empty state. Pembuatan proyek, dataset, workflow, temuan, dan ekspor tetap nonaktif sampai task pemilik fiturnya diimplementasikan.
+Lifecycle proyek tersedia ketika aplikasi dijalankan melalui Tauri. Preview browser sengaja menampilkan state izin karena file picker native tidak tersedia. Dataset, workflow, temuan, dan ekspor tetap nonaktif sampai task pemilik fiturnya diimplementasikan.
 
 ## Quality gates
 
@@ -173,7 +173,18 @@ Verifikasi lifecycle storage secara terisolasi:
 cargo test -p teratai-filesystem -p teratai-app-core --locked
 ```
 
-T-0100 belum membuka akses path dari UI atau Tauri. Typed command, file picker grant, serta loading/error/recovery UI dimiliki T-0101.
+## Desktop project lifecycle
+
+T-0101 menghubungkan project core ke UI melalui command Tauri typed `project_create`, `project_open`, `project_validate`, `project_current`, dan `project_close`. Buat/buka proyek selalu memakai dialog sistem; capability main window dibatasi ke `dialog:allow-open` dan `dialog:allow-save`.
+
+Jalankan lifecycle native dari root repository:
+
+```powershell
+pnpm install --frozen-lockfile
+pnpm --dir apps/desktop desktop:dev
+```
+
+Create/open menampilkan loading dan mencegah aksi ganda. Permission, error, empty, active, dan recovery/corruption memiliki state terpisah. Recovery bersifat non-destruktif: aplikasi tidak menghapus, menimpa, atau memperbaiki project secara otomatis. Session aktif hanya disimpan di memori proses; close tidak mengubah file project.
 
 ## Prinsip produk
 
@@ -228,6 +239,6 @@ tests/golden              Analytics golden test boundary
 
 ## Batas implementasi saat ini
 
-T-0001 sampai T-0007 menyelesaikan foundation runtime. T-0100 memulai Phase 1 dengan storage project transaksional dan metadata SQLite baseline. T-0101 berikutnya menghubungkan lifecycle tersebut ke typed Tauri commands dan UI. Operasi analitik serta job runtime belum diimplementasikan; sidecar Python tetap dependency-free.
+T-0001 sampai T-0007 menyelesaikan foundation runtime. T-0100 dan T-0101 memulai Phase 1 dengan storage project transaksional, metadata SQLite baseline, typed desktop commands, system file picker, dan UI lifecycle lengkap. Operasi analitik serta job runtime belum diimplementasikan; sidecar Python tetap dependency-free.
 
 MVP berakhir ketika pengguna dapat mengimpor Excel/CSV, melakukan profiling, cleaning, transformasi, join, deteksi duplikasi/outlier/rule, melihat visualisasi, menyimpan workflow, menjalankannya ulang, dan mengekspor hasil beserta audit trail.

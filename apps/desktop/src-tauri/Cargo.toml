@@ -14,3 +14,6 @@ tauri-build.workspace = true
 
 [dependencies]
 tauri.workspace = true
+tauri-plugin-dialog.workspace = true
+teratai-app-core = { path = "../../../crates/app-core" }
+teratai-contracts.workspace = true

@@ -24,3 +24,11 @@
 | Silent result manipulation | manifest SHA-256, manifest/SQLite identity comparison, SQLite integrity check, immutable runs, append-only events |
 | Sensitive data leakage | offline default, masking, explicit export summary |
 | Dependency compromise | lockfiles, SBOM, signature/checksum release |
+
+## T-0101 desktop project boundary
+
+- The UI cannot submit an arbitrary unapproved path through a text field. Create and open targets originate from the operating-system save/open dialogs.
+- The main window receives only `dialog:allow-open` and `dialog:allow-save`; no broad filesystem plugin permission is granted.
+- Rust revalidates UUID v7 correlation, absolute `.teratai` paths, traversal, project integrity, linked control entries, and recovery state before activating a session.
+- Native failures are mapped to typed, localized `DesktopError` values. Raw database failures and sensitive absolute paths stay behind the Tauri boundary.
+- Recovery-required and corruption failures are non-destructive. The UI provides remediation guidance but never deletes or repairs project data automatically.
