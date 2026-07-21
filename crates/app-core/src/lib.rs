@@ -7,6 +7,12 @@ mod project_upgrade;
 pub use job::{
     JobDescriptor, JobEnqueueRequest, JobError, JobErrorKind, JobListCursor, JobPage, JobStore,
 };
+pub use job_executor::resource::{DurationClass, ResourceBudget, ResourceEstimate};
+pub use job_executor::{
+    CheckpointDecision, ClockError, ExecutionContext, ExecutorClock, HandlerOutcome,
+    JobExecutorConfig, JobExecutorError, JobExecutorErrorKind, JobHandler, JobHandlerError,
+    JobProgress, SystemExecutorClock,
+};
 
 use std::fmt::{self, Display, Formatter};
 use std::path::Path;

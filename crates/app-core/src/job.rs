@@ -157,7 +157,7 @@ pub struct JobStore {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JobStatus {
+pub(crate) enum JobStatus {
     Queued,
     Running,
     Succeeded,
@@ -188,7 +188,7 @@ impl JobStatus {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, JobError> {
+    pub(crate) fn parse(value: &str) -> Result<Self, JobError> {
         match value {
             "QUEUED" => Ok(Self::Queued),
             "RUNNING" => Ok(Self::Running),
@@ -202,7 +202,7 @@ impl JobStatus {
         }
     }
 
-    const fn is_terminal(self) -> bool {
+    pub(crate) const fn is_terminal(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
     }
 }
@@ -599,7 +599,7 @@ impl JobStore {
         Ok(descriptor)
     }
 
-    fn start_at(
+    pub(crate) fn start_at(
         &self,
         request: &JobTransitionRequest,
         timestamp: &str,
@@ -611,7 +611,7 @@ impl JobStore {
         )
     }
 
-    fn succeed_at(
+    pub(crate) fn succeed_at(
         &self,
         request: &JobTransitionRequest,
         timestamp: &str,
@@ -623,7 +623,7 @@ impl JobStore {
         )
     }
 
-    fn fail_at(
+    pub(crate) fn fail_at(
         &self,
         request: &JobFailureRequest,
         timestamp: &str,
@@ -635,7 +635,7 @@ impl JobStore {
         )
     }
 
-    fn update_progress_at(
+    pub(crate) fn update_progress_at(
         &self,
         request: &JobProgressUpdateRequest,
         timestamp: &str,
@@ -715,7 +715,7 @@ impl JobStore {
         )
     }
 
-    fn complete_cancellation_at(
+    pub(crate) fn complete_cancellation_at(
         &self,
         request: &JobTransitionRequest,
         timestamp: &str,
