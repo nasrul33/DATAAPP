@@ -19,6 +19,7 @@ const PROJECT_ID: &str = "00000000-0000-7000-8000-000000000301";
 const CREATE_CORRELATION_ID: &str = "00000000-0000-7000-8000-000000000302";
 const UPGRADE_CORRELATION_ID: &str = "00000000-0000-7000-8000-000000000303";
 const JOB_CORRELATION_ID: &str = "00000000-0000-7000-8000-000000000304";
+const RECOVERY_CORRELATION_ID: &str = "00000000-0000-7000-8000-000000000305";
 static FIXTURE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 struct ExecutorFixture {
@@ -231,6 +232,34 @@ struct CompletionGateHandler {
     entered: mpsc::SyncSender<()>,
     release: Mutex<mpsc::Receiver<()>>,
     invocations: Arc<AtomicUsize>,
+}
+
+struct ShutdownGateHandler {
+    kind: &'static str,
+    entered: mpsc::SyncSender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+    invocations: Arc<AtomicUsize>,
+}
+
+impl JobHandler for ShutdownGateHandler {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    fn estimate(&self) -> ResourceEstimate {
+        PassiveHandler.estimate()
+    }
+
+    fn run(&self, _context: &mut ExecutionContext<'_>) -> Result<HandlerOutcome, JobHandlerError> {
+        self.invocations.fetch_add(1, Ordering::SeqCst);
+        self.entered.send(()).expect("signal shutdown gate");
+        self.release
+            .lock()
+            .expect("shutdown release receiver")
+            .recv_timeout(Duration::from_secs(10))
+            .expect("release shutdown gate");
+        Ok(HandlerOutcome::Completed)
+    }
 }
 
 impl JobHandler for CompletionGateHandler {
@@ -1201,6 +1230,325 @@ fn running_progress_cas_conflict_retries_only_the_same_progress_once() {
     assert_eq!(terminal.progress_current, 2);
     assert_eq!(terminal.revision, reconciled.revision + 2);
     assert_eq!(terminal.revision, external.revision + 3);
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn shutdown_drains_pending_jobs_rejects_submissions_and_joins_active_worker() {
+    let mut fixture = ExecutorFixture::new("shutdown-drain");
+    let active = fixture.enqueue("shutdown.cooperative");
+    let pending = fixture.enqueue("shutdown.cooperative");
+    let late = fixture.enqueue("shutdown.cooperative");
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+    let (release_sender, release_receiver) = mpsc::sync_channel(1);
+    let mut executor = JobExecutor::new(
+        Arc::clone(fixture.store()),
+        vec![Arc::new(ShutdownGateHandler {
+            kind: "shutdown.cooperative",
+            entered: entered_sender,
+            release: Mutex::new(release_receiver),
+            invocations: Arc::clone(&invocations),
+        })],
+        ExecutorFixture::config(2),
+        Arc::new(SystemExecutorClock),
+    )
+    .expect("start executor");
+
+    executor.submit(&active.job_id).expect("submit active job");
+    entered_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("active handler entered");
+    executor
+        .submit(&pending.job_id)
+        .expect("submit pending job");
+
+    let (closed_sender, closed_receiver) = mpsc::sync_channel(1);
+    executor
+        .set_shutdown_observer_for_test(closed_sender)
+        .expect("install shutdown observer");
+    let releaser = std::thread::spawn(move || {
+        closed_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("shutdown closed queue");
+        release_sender.send(()).expect("release active handler");
+    });
+
+    executor.shutdown().expect("cooperative shutdown");
+    releaser.join().expect("shutdown releaser");
+
+    assert!(matches!(
+        executor.submit(&late.job_id),
+        Err(JobExecutorError::ShuttingDown)
+    ));
+    assert_eq!(
+        fixture
+            .store()
+            .get(&active.job_id)
+            .expect("active job")
+            .status,
+        "SUCCEEDED"
+    );
+    assert_eq!(
+        fixture.store().get(&pending.job_id).expect("pending job"),
+        pending
+    );
+    assert!(!executor
+        .core
+        .admitted
+        .lock()
+        .expect("admission set")
+        .contains(&pending.job_id));
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn shutdown_timeout_retains_worker_for_successful_retry() {
+    let mut fixture = ExecutorFixture::new("shutdown-retry");
+    let job = fixture.enqueue("shutdown.retry");
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+    let (release_sender, release_receiver) = mpsc::sync_channel(1);
+    let mut config = ExecutorFixture::config(1);
+    config.shutdown_timeout = Duration::from_millis(250);
+    let mut executor = JobExecutor::new(
+        Arc::clone(fixture.store()),
+        vec![Arc::new(ShutdownGateHandler {
+            kind: "shutdown.retry",
+            entered: entered_sender,
+            release: Mutex::new(release_receiver),
+            invocations: Arc::new(AtomicUsize::new(0)),
+        })],
+        config,
+        Arc::new(SystemExecutorClock),
+    )
+    .expect("start executor");
+
+    executor.submit(&job.job_id).expect("submit gated job");
+    entered_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("gated handler entered");
+    assert!(matches!(
+        executor.shutdown(),
+        Err(JobExecutorError::ShutdownTimeout)
+    ));
+
+    release_sender.send(()).expect("release gated handler");
+    executor.shutdown().expect("retry joins completed worker");
+    assert_eq!(
+        fixture
+            .store()
+            .get(&job.job_id)
+            .expect("terminal job")
+            .status,
+        "SUCCEEDED"
+    );
+}
+
+#[test]
+fn drop_after_timeout_is_bounded_and_reaper_observes_worker_completion() {
+    let mut fixture = ExecutorFixture::new("shutdown-drop-reaper");
+    let job = fixture.enqueue("shutdown.drop");
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+    let (release_sender, release_receiver) = mpsc::sync_channel(1);
+    let mut config = ExecutorFixture::config(1);
+    config.shutdown_timeout = Duration::from_millis(250);
+    let mut executor = JobExecutor::new(
+        Arc::clone(fixture.store()),
+        vec![Arc::new(ShutdownGateHandler {
+            kind: "shutdown.drop",
+            entered: entered_sender,
+            release: Mutex::new(release_receiver),
+            invocations: Arc::new(AtomicUsize::new(0)),
+        })],
+        config,
+        Arc::new(SystemExecutorClock),
+    )
+    .expect("start executor");
+
+    executor.submit(&job.job_id).expect("submit gated job");
+    entered_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("gated handler entered");
+    assert!(matches!(
+        executor.shutdown(),
+        Err(JobExecutorError::ShutdownTimeout)
+    ));
+    let reaper_completed = executor
+        .take_reaper_completion_for_test()
+        .expect("reaper completion receiver");
+    let (drop_sender, drop_receiver) = mpsc::sync_channel(1);
+    let dropper = std::thread::spawn(move || {
+        drop(executor);
+        drop_sender.send(()).expect("signal bounded drop");
+    });
+
+    drop_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("drop returns within configured bounded attempt");
+    release_sender.send(()).expect("release adopted worker");
+    reaper_completed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("reaper joined adopted worker");
+    dropper.join().expect("dropper thread");
+    assert_eq!(
+        fixture
+            .store()
+            .get(&job.job_id)
+            .expect("terminal job")
+            .status,
+        "SUCCEEDED"
+    );
+}
+
+#[test]
+fn restart_recovery_fails_active_jobs_once_and_preserves_queued_job() {
+    let mut fixture = ExecutorFixture::new("restart-recovery");
+    let running_job = fixture.enqueue("passive.kind");
+    let cancelling_job = fixture.enqueue("passive.kind");
+    let queued_job = fixture.enqueue("passive.kind");
+    let running = fixture
+        .store()
+        .start(&JobTransitionRequest {
+            correlation_id: running_job.correlation_id.clone(),
+            expected_revision: running_job.revision,
+            job_id: running_job.job_id.clone(),
+        })
+        .expect("start running fixture");
+    let started_for_cancellation = fixture
+        .store()
+        .start(&JobTransitionRequest {
+            correlation_id: cancelling_job.correlation_id.clone(),
+            expected_revision: cancelling_job.revision,
+            job_id: cancelling_job.job_id.clone(),
+        })
+        .expect("start cancelling fixture");
+    let cancelling = fixture
+        .store()
+        .request_cancellation(&JobTransitionRequest {
+            correlation_id: cancelling_job.correlation_id.clone(),
+            expected_revision: started_for_cancellation.revision,
+            job_id: cancelling_job.job_id.clone(),
+        })
+        .expect("request fixture cancellation");
+
+    drop(fixture.store.take());
+    fixture.store = Some(Arc::new(
+        JobStore::open(&fixture.project_path).expect("reopen job store after interruption"),
+    ));
+    let recovered = fixture
+        .store()
+        .recover_interrupted(RECOVERY_CORRELATION_ID)
+        .expect("recover interrupted jobs");
+    assert_eq!(recovered.len(), 2);
+
+    let recovered_running = fixture
+        .store()
+        .get(&running.job_id)
+        .expect("recovered running job");
+    let recovered_cancelling = fixture
+        .store()
+        .get(&cancelling.job_id)
+        .expect("recovered cancelling job");
+    for descriptor in [&recovered_running, &recovered_cancelling] {
+        assert_eq!(descriptor.status, "FAILED");
+        assert_eq!(descriptor.error_code.as_deref(), Some("INTERRUPTED"));
+        assert_eq!(descriptor.error_retriable, Some(true));
+    }
+    assert_eq!(
+        fixture
+            .store()
+            .get(&queued_job.job_id)
+            .expect("queued job unchanged"),
+        queued_job
+    );
+    let history_before_retry = (
+        job_history_counts(&fixture.project_path, &running.job_id),
+        job_history_counts(&fixture.project_path, &cancelling.job_id),
+        job_history_counts(&fixture.project_path, &queued_job.job_id),
+    );
+    assert!(fixture
+        .store()
+        .recover_interrupted(RECOVERY_CORRELATION_ID)
+        .expect("repeat recovery")
+        .is_empty());
+    assert_eq!(
+        history_before_retry,
+        (
+            job_history_counts(&fixture.project_path, &running.job_id),
+            job_history_counts(&fixture.project_path, &cancelling.job_id),
+            job_history_counts(&fixture.project_path, &queued_job.job_id),
+        )
+    );
+}
+
+#[test]
+fn sixteen_simultaneous_duplicate_submissions_admit_and_invoke_exactly_once() {
+    const SUBMITTERS: usize = 16;
+
+    let mut fixture = ExecutorFixture::new("duplicate-stress");
+    let job = fixture.enqueue("duplicate.gate");
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+    let (release_sender, release_receiver) = mpsc::sync_channel(1);
+    let executor = Arc::new(
+        JobExecutor::new(
+            Arc::clone(fixture.store()),
+            vec![Arc::new(ShutdownGateHandler {
+                kind: "duplicate.gate",
+                entered: entered_sender,
+                release: Mutex::new(release_receiver),
+                invocations: Arc::clone(&invocations),
+            })],
+            ExecutorFixture::config(1),
+            Arc::new(SystemExecutorClock),
+        )
+        .expect("start executor"),
+    );
+    let start = Arc::new(Barrier::new(SUBMITTERS + 1));
+    let (result_sender, result_receiver) = mpsc::sync_channel(SUBMITTERS);
+    let mut submitters = Vec::with_capacity(SUBMITTERS);
+    for _ in 0..SUBMITTERS {
+        let executor = Arc::clone(&executor);
+        let start = Arc::clone(&start);
+        let result_sender = result_sender.clone();
+        let job_id = job.job_id.clone();
+        submitters.push(std::thread::spawn(move || {
+            start.wait();
+            result_sender
+                .send(executor.submit(&job_id))
+                .expect("send duplicate submit result");
+        }));
+    }
+    drop(result_sender);
+    start.wait();
+
+    let mut accepted = 0;
+    let mut duplicates = 0;
+    for _ in 0..SUBMITTERS {
+        match result_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("duplicate submit result")
+        {
+            Ok(()) => accepted += 1,
+            Err(JobExecutorError::AlreadySubmitted) => duplicates += 1,
+            Err(error) => panic!("unexpected duplicate submit result: {error}"),
+        }
+    }
+    for submitter in submitters {
+        submitter.join().expect("duplicate submitter");
+    }
+    assert_eq!(accepted, 1);
+    assert_eq!(duplicates, SUBMITTERS - 1);
+    entered_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("admitted handler invoked");
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+
+    release_sender.send(()).expect("release admitted handler");
+    let Ok(mut executor) = Arc::try_unwrap(executor) else {
+        panic!("all submitter executor references released");
+    };
+    executor.shutdown().expect("join stress worker");
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
 }
 

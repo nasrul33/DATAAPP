@@ -8,6 +8,7 @@ use std::fmt::{self, Display, Formatter};
 use std::io::Write;
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -430,67 +431,139 @@ impl Display for JobExecutorError {
 
 impl std::error::Error for JobExecutorError {}
 
+struct CompletionReceiver(Mutex<mpsc::Receiver<()>>);
+
+impl CompletionReceiver {
+    fn new(receiver: mpsc::Receiver<()>) -> Self {
+        Self(Mutex::new(receiver))
+    }
+
+    fn recv(&self) -> Result<(), mpsc::RecvError> {
+        match self.0.lock() {
+            Ok(receiver) => receiver.recv(),
+            Err(poisoned) => poisoned.into_inner().recv(),
+        }
+    }
+
+    fn recv_timeout(&self, timeout: std::time::Duration) -> Result<(), mpsc::RecvTimeoutError> {
+        match self.0.lock() {
+            Ok(receiver) => receiver.recv_timeout(timeout),
+            Err(poisoned) => poisoned.into_inner().recv_timeout(timeout),
+        }
+    }
+
+    fn try_recv(&self) -> Result<(), mpsc::TryRecvError> {
+        match self.0.lock() {
+            Ok(receiver) => receiver.try_recv(),
+            Err(poisoned) => poisoned.into_inner().try_recv(),
+        }
+    }
+}
+
 struct WorkerHandle {
     join: Option<JoinHandle<()>>,
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "Task 7 consumes the required completion signal for deadline-based shutdown"
-        )
-    )]
-    completed: mpsc::Receiver<()>,
+    completed: CompletionReceiver,
 }
 
 enum ReaperCommand {
-    Adopt(JoinHandle<()>),
+    AdoptAndStop(Vec<JoinHandle<()>>),
     Stop,
 }
 
 struct WorkerReaper {
     commands: mpsc::SyncSender<ReaperCommand>,
     join: Option<JoinHandle<()>>,
+    completed: CompletionReceiver,
+    stop_requested: bool,
+    #[cfg(test)]
+    completion_observer: Option<CompletionReceiver>,
 }
 
 impl WorkerReaper {
-    fn start(capacity: usize) -> Result<Self, JobExecutorError> {
-        let (commands, receiver) = mpsc::sync_channel(capacity);
+    fn start() -> Result<Self, JobExecutorError> {
+        let (commands, receiver) = mpsc::sync_channel(1);
+        let (completed_sender, completed) = mpsc::sync_channel(1);
+        #[cfg(test)]
+        let (observer_sender, completion_observer) = mpsc::sync_channel(1);
         let join = thread::Builder::new()
             .name("teratai-job-worker-reaper".to_owned())
             .spawn(move || {
-                while let Ok(command) = receiver.recv() {
+                if let Ok(command) = receiver.recv() {
                     match command {
-                        ReaperCommand::Adopt(worker) => {
-                            let _worker_result = worker.join();
+                        ReaperCommand::AdoptAndStop(workers) => {
+                            for worker in workers {
+                                let _worker_result = worker.join();
+                            }
                         }
-                        ReaperCommand::Stop => break,
+                        ReaperCommand::Stop => {}
                     }
                 }
+                let _completion_result = completed_sender.send(());
+                #[cfg(test)]
+                let _observer_result = observer_sender.send(());
             })
             .map_err(|_| JobExecutorError::InvalidConfiguration)?;
         Ok(Self {
             commands,
             join: Some(join),
+            completed: CompletionReceiver::new(completed),
+            stop_requested: false,
+            #[cfg(test)]
+            completion_observer: Some(CompletionReceiver::new(completion_observer)),
         })
     }
 
-    fn adopt(&self, worker: JoinHandle<()>) {
-        if let Err(error) = self.commands.send(ReaperCommand::Adopt(worker)) {
-            if let ReaperCommand::Adopt(worker) = error.0 {
-                let _worker_result = worker.join();
-            }
+    fn adopt_and_stop(mut self, workers: Vec<JoinHandle<()>>) {
+        if self
+            .commands
+            .send(ReaperCommand::AdoptAndStop(workers))
+            .is_ok()
+        {
+            self.stop_requested = true;
         }
+        let _detached_reaper = self.join.take();
     }
 
-    fn request_stop(&self) {
-        let _stop_result = self.commands.send(ReaperCommand::Stop);
+    fn stop_and_join_by(&mut self, deadline: Instant) -> bool {
+        if self.join.is_none() {
+            return true;
+        }
+        if !self.stop_requested {
+            match self.commands.try_send(ReaperCommand::Stop) {
+                Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => {
+                    self.stop_requested = true;
+                }
+                Err(mpsc::TrySendError::Full(_)) => return false,
+            }
+        }
+
+        let completed = wait_for_completion(&self.completed, deadline);
+        if completed {
+            if let Some(join) = self.join.take() {
+                let _reaper_result = join.join();
+            }
+        }
+        completed
     }
 
     fn stop_and_join(&mut self) {
-        self.request_stop();
+        if !self.stop_requested {
+            let _stop_result = self.commands.send(ReaperCommand::Stop);
+            self.stop_requested = true;
+        }
+        let _completion_result = self.completed.recv();
         if let Some(join) = self.join.take() {
             let _reaper_result = join.join();
         }
+    }
+
+    fn detach(mut self) {
+        let _detached_reaper = self.join.take();
+    }
+
+    #[cfg(test)]
+    fn take_completion_for_test(&mut self) -> Option<CompletionReceiver> {
+        self.completion_observer.take()
     }
 }
 
@@ -499,6 +572,9 @@ pub struct JobExecutor {
     core: Arc<ExecutorCore>,
     workers: Vec<WorkerHandle>,
     reaper: Option<WorkerReaper>,
+    queue_closed: bool,
+    #[cfg(test)]
+    shutdown_observer: Option<mpsc::SyncSender<()>>,
 }
 
 impl JobExecutor {
@@ -517,12 +593,7 @@ impl JobExecutor {
     ) -> Result<Self, JobExecutorError> {
         let core = Arc::new(ExecutorCore::new(store, handlers, config, clock)?);
         ensure_handler_panic_hook()?;
-        let reaper_capacity = core
-            .config
-            .worker_count
-            .checked_add(1)
-            .ok_or(JobExecutorError::InvalidConfiguration)?;
-        let mut reaper = WorkerReaper::start(reaper_capacity)?;
+        let mut reaper = WorkerReaper::start()?;
         let mut workers = Vec::new();
         workers
             .try_reserve_exact(core.config.worker_count)
@@ -543,7 +614,7 @@ impl JobExecutor {
             if let Ok(join) = spawn_result {
                 workers.push(WorkerHandle {
                     join: Some(join),
-                    completed,
+                    completed: CompletionReceiver::new(completed),
                 });
             } else {
                 rollback_worker_start(&core, &mut workers, &mut reaper);
@@ -555,6 +626,9 @@ impl JobExecutor {
             core,
             workers,
             reaper: Some(reaper),
+            queue_closed: false,
+            #[cfg(test)]
+            shutdown_observer: None,
         })
     }
 
@@ -566,21 +640,109 @@ impl JobExecutor {
     pub fn submit(&self, job_id: &str) -> Result<(), JobExecutorError> {
         self.core.claim_and_queue(job_id)
     }
+
+    /// Stop accepting work, drain pending IDs, and join all executor threads
+    /// within the configured deadline.
+    ///
+    /// A timed-out worker remains owned by the executor so callers can release
+    /// cooperative work and retry shutdown without losing its join handle.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`JobExecutorError::ShutdownTimeout`] when any worker or the
+    /// private reaper cannot be joined before the single shutdown deadline.
+    pub fn shutdown(&mut self) -> Result<(), JobExecutorError> {
+        self.close_queue_once();
+        let deadline = Instant::now()
+            .checked_add(self.core.config.shutdown_timeout)
+            .ok_or(JobExecutorError::InvalidConfiguration)?;
+
+        for worker in &mut self.workers {
+            if worker.join.is_none() {
+                continue;
+            }
+            if wait_for_completion(&worker.completed, deadline) {
+                if let Some(join) = worker.join.take() {
+                    let _worker_result = join.join();
+                }
+            }
+        }
+        if self.workers.iter().any(|worker| worker.join.is_some()) {
+            return Err(JobExecutorError::ShutdownTimeout);
+        }
+
+        if let Some(reaper) = &mut self.reaper {
+            if !reaper.stop_and_join_by(deadline) {
+                return Err(JobExecutorError::ShutdownTimeout);
+            }
+        }
+        self.reaper = None;
+        Ok(())
+    }
+
+    fn close_queue_once(&mut self) {
+        if self.queue_closed {
+            return;
+        }
+        let drained = self.core.queue.close_and_drain();
+        release_drained_admissions(&self.core.admitted, drained);
+        self.queue_closed = true;
+        #[cfg(test)]
+        if let Some(observer) = &self.shutdown_observer {
+            let _observer_result = observer.try_send(());
+        }
+    }
+
+    #[cfg(test)]
+    fn set_shutdown_observer_for_test(
+        &mut self,
+        observer: mpsc::SyncSender<()>,
+    ) -> Result<(), JobExecutorError> {
+        if self.shutdown_observer.is_some() || self.queue_closed {
+            return Err(JobExecutorError::InvalidConfiguration);
+        }
+        self.shutdown_observer = Some(observer);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn take_reaper_completion_for_test(&mut self) -> Option<CompletionReceiver> {
+        self.reaper
+            .as_mut()
+            .and_then(WorkerReaper::take_completion_for_test)
+    }
 }
 
 impl Drop for JobExecutor {
     fn drop(&mut self) {
-        let drained = self.core.queue.close_and_drain();
-        release_drained_admissions(&self.core.admitted, drained);
+        let _shutdown_result = self.shutdown();
+        let outstanding: Vec<_> = self
+            .workers
+            .iter_mut()
+            .filter_map(|worker| worker.join.take())
+            .collect();
         if let Some(reaper) = self.reaper.take() {
-            for worker in &mut self.workers {
-                if let Some(join) = worker.join.take() {
-                    reaper.adopt(join);
-                }
+            if outstanding.is_empty() {
+                reaper.detach();
+            } else {
+                reaper.adopt_and_stop(outstanding);
             }
-            reaper.request_stop();
         }
     }
+}
+
+fn wait_for_completion(completed: &CompletionReceiver, deadline: Instant) -> bool {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return matches!(
+            completed.try_recv(),
+            Ok(()) | Err(mpsc::TryRecvError::Disconnected)
+        );
+    }
+    matches!(
+        completed.recv_timeout(remaining),
+        Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected)
+    )
 }
 
 fn rollback_worker_start(
@@ -1017,6 +1179,15 @@ impl ExecutorCore {
     }
 
     pub(crate) fn claim_and_queue(&self, job_id: &str) -> Result<(), JobExecutorError> {
+        {
+            let admitted = self
+                .admitted
+                .lock()
+                .map_err(|_| JobExecutorError::PersistenceFailed)?;
+            if admitted.contains(job_id) {
+                return Err(JobExecutorError::AlreadySubmitted);
+            }
+        }
         let descriptor = self
             .store
             .get(job_id)
@@ -1112,6 +1283,9 @@ fn validate_config(config: &JobExecutorConfig) -> Result<(), JobExecutorError> {
         || config.worker_count > available
         || config.queue_capacity == 0
         || config.shutdown_timeout.is_zero()
+        || Instant::now()
+            .checked_add(config.shutdown_timeout)
+            .is_none()
     {
         return Err(JobExecutorError::InvalidConfiguration);
     }
