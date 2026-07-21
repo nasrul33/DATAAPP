@@ -17,6 +17,13 @@
 - T-0004 adds `ContractMetadata` as a generation/serialization proof.
 - T-0006 adds canonical engine handshake request/response and typed engine error schemas. Runtime messages use bounded newline-delimited JSON over controlled process stdio.
 - T-0007 adds `RuntimeLogEvent` as the canonical structured runtime trace shared by TypeScript, Rust, and Python.
+- T-0100 adds project create request, manifest, and validated descriptor contracts. Native Tauri command exposure remains owned by T-0101.
+
+## Project lifecycle contract
+
+`ProjectCreateRequest` carries distinct UUID v7 request/project identifiers, an absolute user-approved `.teratai` target, and a validated display name. Project creation never writes directly into the final target: the native core initializes a recovery-marked sibling staging directory, applies metadata migrations transactionally, writes a bounded manifest atomically, validates integrity, then publishes with a same-volume rename.
+
+`ProjectManifest` is the immutable compatibility and identity record. `ProjectDescriptor` is returned only after directory layout, manifest version, SQLite `integrity_check`, metadata schema version, project identity, initial audit event, and manifest fingerprint agree. Open/validate are read-only and reject recovery markers or linked control files.
 
 ## Engine startup handshake
 

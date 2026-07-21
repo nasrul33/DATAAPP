@@ -27,6 +27,11 @@ Exit gate: clean clone builds, tests, launches, and verifies engine handshake.
 - Append-only audit events.
 - Recovery marker for interrupted write.
 
+| Task | Scope | Main paths | Acceptance |
+|---|---|---|---|
+| T-0100 | Transactional project storage foundation | `crates/app-core`, `crates/filesystem`, `migrations/metadata-sqlite`, `packages/contracts` | create/open/validate survives interruption, rejects unsafe/inconsistent state, and records initial append-only audit event |
+| T-0101 | Desktop project lifecycle integration | `apps/desktop`, `apps/desktop/src-tauri` | typed Tauri commands and complete create/open loading, error, permission, recovery, and empty states |
+
 ### EPIC-110 Job Runtime
 - Job entity and state machine.
 - Background execution, progress events, cancellation.

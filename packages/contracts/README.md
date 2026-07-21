@@ -47,3 +47,7 @@ Crate `teratai-contracts` di `packages/contracts/rust` menjadi dependency bersam
 ## Runtime log safety
 
 `RuntimeLogEvent` adalah kontrak trace lintas desktop, native, dan engine. Event hanya membawa metadata operasional yang terdefinisi, UUID v7 correlation ID, dan sequence positif. Source row, nilai dataset, secret, credential, absolute path, serta arbitrary context map dilarang agar observability tidak menjadi jalur kebocoran data.
+
+## Project contracts
+
+`ProjectCreateRequest`, `ProjectManifest`, dan `ProjectDescriptor` membentuk lifecycle project native T-0100. Contract hanya mendeskripsikan wire/storage shape; validasi UUID v7, absolute `.teratai` path, bounded manifest, schema compatibility, SQLite integrity, dan fingerprint tetap diwajibkan pada Rust project core sebelum descriptor dipercaya.

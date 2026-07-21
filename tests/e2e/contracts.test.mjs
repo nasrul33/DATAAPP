@@ -9,6 +9,9 @@ const generatedContracts = [
   ["engine-error", "engine_error", "EngineError"],
   ["engine-handshake-request", "engine_handshake_request", "EngineHandshakeRequest"],
   ["engine-handshake-response", "engine_handshake_response", "EngineHandshakeResponse"],
+  ["project-create-request", "project_create_request", "ProjectCreateRequest"],
+  ["project-descriptor", "project_descriptor", "ProjectDescriptor"],
+  ["project-manifest", "project_manifest", "ProjectManifest"],
   ["runtime-log-event", "runtime_log_event", "RuntimeLogEvent"],
 ];
 
