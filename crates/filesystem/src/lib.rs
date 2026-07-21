@@ -2,7 +2,9 @@
 
 mod project_upgrade;
 
-pub use project_upgrade::{begin_project_upgrade, ProjectUpgrade};
+pub use project_upgrade::{
+    begin_project_upgrade, pin_project_metadata, PinnedProjectMetadata, ProjectUpgrade,
+};
 
 use std::ffi::OsStr;
 use std::fmt::{self, Display, Formatter};

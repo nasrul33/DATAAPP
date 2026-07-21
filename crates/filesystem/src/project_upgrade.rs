@@ -61,6 +61,82 @@ struct OwnedFile {
     identity: FileIdentity,
 }
 
+/// Owned no-follow metadata handle that pins and verifies one project database.
+#[derive(Debug)]
+pub struct PinnedProjectMetadata {
+    path: PathBuf,
+    file: File,
+    identity: RefCell<FileIdentity>,
+}
+
+impl PinnedProjectMetadata {
+    /// Return the canonical metadata path represented by this capability.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Verify that the owned handle and current path still identify the pinned file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the path becomes linked, non-regular, replaced,
+    /// or changes identity outside an authorized metadata write.
+    pub fn verify(&self) -> Result<(), FilesystemError> {
+        validate_file_handle(
+            &self.path,
+            &self.file,
+            *self.identity.borrow(),
+            "pinned project metadata",
+        )
+    }
+
+    /// Accept the current identity after an authorized `SQLite` write completes.
+    ///
+    /// This is required on Windows because stable `std` exposes mutable file
+    /// metadata rather than the full by-handle file ID. The owned handle denies
+    /// delete sharing while allowing `SQLite` readers and writers.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the handle and path no longer identify the same
+    /// non-linked regular file.
+    pub fn refresh_after_authorized_write(&self) -> Result<(), FilesystemError> {
+        let handle_identity =
+            identity_from_metadata(&self.file.metadata()?, "pinned project metadata", true)?;
+        let path_metadata = fs::symlink_metadata(&self.path)?;
+        validate_regular_metadata(&path_metadata, "pinned project metadata")?;
+        let path_identity =
+            identity_from_metadata(&path_metadata, "pinned project metadata", true)?;
+        if handle_identity != path_identity {
+            return Err(FilesystemError::InvalidLayout(
+                "pinned project metadata identity changed".to_owned(),
+            ));
+        }
+        self.identity.replace(handle_identity);
+        Ok(())
+    }
+}
+
+/// Pin the validated project metadata path with an owned no-follow handle.
+///
+/// # Errors
+///
+/// Returns an error when metadata is missing, linked, non-regular, hardlinked
+/// where the platform exposes link count, or changes identity while opening.
+pub fn pin_project_metadata(
+    layout: &ProjectLayout,
+) -> Result<PinnedProjectMetadata, FilesystemError> {
+    let path = layout.metadata_path();
+    let (file, identity) =
+        open_verified_regular_with_mode(&path, "project metadata", RegularOpenMode::Pinned)?;
+    Ok(PinnedProjectMetadata {
+        path,
+        file,
+        identity: RefCell::new(identity),
+    })
+}
+
 /// A durable guard for an in-place project metadata upgrade.
 #[derive(Debug)]
 pub struct ProjectUpgrade {
@@ -679,12 +755,34 @@ fn open_verified_regular(
     label: &str,
     exclusive: bool,
 ) -> Result<(File, FileIdentity), FilesystemError> {
+    let mode = if exclusive {
+        RegularOpenMode::Exclusive
+    } else {
+        RegularOpenMode::Shared
+    };
+    open_verified_regular_with_mode(path, label, mode)
+}
+
+#[derive(Clone, Copy)]
+enum RegularOpenMode {
+    Shared,
+    Exclusive,
+    Pinned,
+}
+
+fn open_verified_regular_with_mode(
+    path: &Path,
+    label: &str,
+    mode: RegularOpenMode,
+) -> Result<(File, FileIdentity), FilesystemError> {
     let before = fs::symlink_metadata(path)?;
     validate_regular_metadata(&before, label)?;
     let mut options = OpenOptions::new();
     options.read(true);
-    if exclusive {
-        configure_exclusive_file_open(&mut options);
+    match mode {
+        RegularOpenMode::Shared => {}
+        RegularOpenMode::Exclusive => configure_exclusive_file_open(&mut options),
+        RegularOpenMode::Pinned => configure_pinned_file_open(&mut options),
     }
     let file = options.open(path)?;
     let handle_identity = identity_from_metadata(&file.metadata()?, label, true)?;
@@ -1045,6 +1143,18 @@ fn configure_exclusive_file_open(options: &mut OpenOptions) {
 
 #[cfg(not(windows))]
 fn configure_exclusive_file_open(_options: &mut OpenOptions) {}
+
+#[cfg(windows)]
+fn configure_pinned_file_open(options: &mut OpenOptions) {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    const FILE_SHARE_READ: u32 = 0x0000_0001;
+    const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+    options.share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+}
+
+#[cfg(not(windows))]
+fn configure_pinned_file_open(_options: &mut OpenOptions) {}
 
 #[cfg(windows)]
 fn configure_owned_directory_open(options: &mut OpenOptions) {

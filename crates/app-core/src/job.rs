@@ -5,7 +5,9 @@ use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, Transactio
 use sha2::{Digest, Sha256};
 pub use teratai_contracts::generated::job_descriptor::JobDescriptor;
 pub use teratai_contracts::generated::job_enqueue_request::JobEnqueueRequest;
-use teratai_filesystem::validate_project_layout;
+use teratai_filesystem::{
+    pin_project_metadata, validate_project_layout, PinnedProjectMetadata, ProjectLayout,
+};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
@@ -107,6 +109,7 @@ pub struct JobPage {
 pub struct JobStore {
     project_path: PathBuf,
     project_id: String,
+    metadata: PinnedProjectMetadata,
 }
 
 impl JobStore {
@@ -117,17 +120,27 @@ impl JobStore {
     /// Returns a typed error for unsafe layouts, incompatible schemas, invalid
     /// project identity, or database failures.
     pub fn open(project_path: &Path) -> Result<Self, JobError> {
-        let descriptor = validate_schema_two_project(project_path)?;
+        let layout = validated_project_layout(project_path)?;
+        let metadata = pin_project_metadata(&layout).map_err(|_| {
+            JobError::DataIntegrity("project metadata could not be pinned safely".to_owned())
+        })?;
+        let descriptor = validate_schema_two_project(layout.root())?;
         let canonical_path = PathBuf::from(&descriptor.project_path);
-        let connection = open_connection(
-            &validated_metadata_path(&canonical_path)?,
-            ConnectionAccess::ReadOnly,
-        )?;
-        probe_job_schema(&connection)?;
+        if canonical_path != layout.root() {
+            return Err(JobError::DataIntegrity(
+                "validated project path changed while opening".to_owned(),
+            ));
+        }
+        verify_pinned_metadata(&metadata)?;
+        let connection = open_connection(metadata.path(), ConnectionAccess::ReadOnly)?;
+        verify_pinned_metadata(&metadata)?;
+        probe_job_connection(&connection, &descriptor.project_id)?;
+        verify_pinned_metadata(&metadata)?;
         drop(connection);
         Ok(Self {
             project_path: canonical_path,
             project_id: descriptor.project_id,
+            metadata,
         })
     }
 
@@ -275,50 +288,61 @@ impl JobStore {
         let after_hash = snapshot_hash(&descriptor)?;
 
         let mut connection = self.write_connection()?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        transaction.execute(
-            "INSERT INTO job (
-                job_id, project_id, kind, status, correlation_id, revision,
-                created_at, updated_at, progress_current, progress_total, progress_unit
-             ) VALUES (?1, ?2, ?3, 'QUEUED', ?4, 1, ?5, ?5, 0, ?6, ?7)",
-            params![
-                descriptor.job_id,
-                descriptor.project_id,
-                descriptor.kind,
-                descriptor.correlation_id,
-                descriptor.created_at,
-                descriptor.progress_total,
-                descriptor.progress_unit,
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO job_event (
-                event_id, job_id, event_type, from_status, to_status, revision,
-                progress_current, progress_total, progress_unit, occurred_at, correlation_id
-             ) VALUES (?1, ?2, 'job.queued', NULL, 'QUEUED', 1, 0, ?3, ?4, ?5, ?6)",
-            params![
-                job_event_id,
-                descriptor.job_id,
-                descriptor.progress_total,
-                descriptor.progress_unit,
-                descriptor.created_at,
-                descriptor.correlation_id,
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO audit_event (
-                event_id, actor, action, target_type, target_id,
-                before_hash, after_hash, occurred_at, correlation_id
-             ) VALUES (?1, 'local-user', 'job.queued', 'job', ?2, NULL, ?3, ?4, ?5)",
-            params![
-                audit_event_id,
-                descriptor.job_id,
-                after_hash,
-                descriptor.created_at,
-                descriptor.correlation_id,
-            ],
-        )?;
-        transaction.commit()?;
+        verify_pinned_metadata(&self.metadata)?;
+        let write_result = (|| -> Result<(), JobError> {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            transaction.execute(
+                "INSERT INTO job (
+                    job_id, project_id, kind, status, correlation_id, revision,
+                    created_at, updated_at, progress_current, progress_total, progress_unit
+                 ) VALUES (?1, ?2, ?3, 'QUEUED', ?4, 1, ?5, ?5, 0, ?6, ?7)",
+                params![
+                    descriptor.job_id,
+                    descriptor.project_id,
+                    descriptor.kind,
+                    descriptor.correlation_id,
+                    descriptor.created_at,
+                    descriptor.progress_total,
+                    descriptor.progress_unit,
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO job_event (
+                    event_id, job_id, event_type, from_status, to_status, revision,
+                    progress_current, progress_total, progress_unit, occurred_at, correlation_id
+                 ) VALUES (?1, ?2, 'job.queued', NULL, 'QUEUED', 1, 0, ?3, ?4, ?5, ?6)",
+                params![
+                    job_event_id,
+                    descriptor.job_id,
+                    descriptor.progress_total,
+                    descriptor.progress_unit,
+                    descriptor.created_at,
+                    descriptor.correlation_id,
+                ],
+            )?;
+            transaction.execute(
+                "INSERT INTO audit_event (
+                    event_id, actor, action, target_type, target_id,
+                    before_hash, after_hash, occurred_at, correlation_id
+                 ) VALUES (?1, 'local-user', 'job.queued', 'job', ?2, NULL, ?3, ?4, ?5)",
+                params![
+                    audit_event_id,
+                    descriptor.job_id,
+                    after_hash,
+                    descriptor.created_at,
+                    descriptor.correlation_id,
+                ],
+            )?;
+            transaction.commit()?;
+            Ok(())
+        })();
+        let refresh_result = self
+            .metadata
+            .refresh_after_authorized_write()
+            .map_err(|_| JobError::DataIntegrity("pinned metadata identity changed".to_owned()));
+        refresh_result?;
+        write_result?;
         Ok(descriptor)
     }
 
@@ -331,26 +355,17 @@ impl JobStore {
     }
 
     fn validated_connection(&self, access: ConnectionAccess) -> Result<Connection, JobError> {
-        let descriptor = validate_schema_two_project(&self.project_path)?;
-        if descriptor.project_id != self.project_id
-            || Path::new(&descriptor.project_path) != self.project_path
-        {
+        let layout = validated_project_layout(&self.project_path)?;
+        if layout.root() != self.project_path || layout.metadata_path() != self.metadata.path() {
             return Err(JobError::DataIntegrity(
-                "project identity changed after the job store opened".to_owned(),
+                "project control paths changed after the job store opened".to_owned(),
             ));
         }
-        let connection = open_connection(&validated_metadata_path(&self.project_path)?, access)?;
-        probe_job_schema(&connection)?;
-        let connected_project_id: String = connection.query_row(
-            "SELECT project_id FROM project WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        if connected_project_id != self.project_id {
-            return Err(JobError::DataIntegrity(
-                "metadata identity changed during connection validation".to_owned(),
-            ));
-        }
+        verify_pinned_metadata(&self.metadata)?;
+        let connection = open_connection(self.metadata.path(), access)?;
+        verify_pinned_metadata(&self.metadata)?;
+        probe_job_connection(&connection, &self.project_id)?;
+        verify_pinned_metadata(&self.metadata)?;
         Ok(connection)
     }
 }
@@ -364,6 +379,8 @@ enum ConnectionAccess {
 fn validate_schema_two_project(
     project_path: &Path,
 ) -> Result<teratai_contracts::generated::project_descriptor::ProjectDescriptor, JobError> {
+    #[cfg(test)]
+    FULL_PROJECT_VALIDATIONS.with(|count| count.set(count.get() + 1));
     let descriptor = crate::ProjectService::open(project_path)
         .map_err(|_| JobError::DataIntegrity("full project validation failed".to_owned()))?;
     if descriptor.metadata_schema_version != 2 {
@@ -375,10 +392,25 @@ fn validate_schema_two_project(
     Ok(descriptor)
 }
 
-fn validated_metadata_path(project_path: &Path) -> Result<PathBuf, JobError> {
+#[cfg(test)]
+thread_local! {
+    static FULL_PROJECT_VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn full_project_validation_count() -> usize {
+    FULL_PROJECT_VALIDATIONS.with(std::cell::Cell::get)
+}
+
+fn validated_project_layout(project_path: &Path) -> Result<ProjectLayout, JobError> {
     validate_project_layout(project_path)
-        .map(|layout| layout.metadata_path())
         .map_err(|_| JobError::DataIntegrity("project control layout is unsafe".to_owned()))
+}
+
+fn verify_pinned_metadata(metadata: &PinnedProjectMetadata) -> Result<(), JobError> {
+    metadata
+        .verify()
+        .map_err(|_| JobError::DataIntegrity("pinned metadata identity changed".to_owned()))
 }
 
 fn open_connection(path: &Path, access: ConnectionAccess) -> Result<Connection, JobError> {
@@ -430,6 +462,29 @@ fn probe_job_schema(connection: &Connection) -> Result<(), JobError> {
              FROM job_event LIMIT 0",
         )
         .map_err(|_| JobError::DataIntegrity("job event schema is invalid".to_owned()))?;
+    Ok(())
+}
+
+fn probe_job_connection(connection: &Connection, project_id: &str) -> Result<(), JobError> {
+    let schema_version: i64 =
+        connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+    if schema_version != 2 {
+        return Err(JobError::IncompatibleSchema {
+            expected: 2,
+            actual: schema_version,
+        });
+    }
+    probe_job_schema(connection)?;
+    let connected_project_id: String = connection.query_row(
+        "SELECT project_id FROM project WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if connected_project_id != project_id {
+        return Err(JobError::DataIntegrity(
+            "metadata identity changed during connection validation".to_owned(),
+        ));
+    }
     Ok(())
 }
 
@@ -576,7 +631,8 @@ mod tests {
     use teratai_filesystem::REQUIRED_PROJECT_DIRECTORIES;
 
     use super::{
-        event_id_at, snapshot_hash, JobError, JobErrorKind, JobListCursor, JobStore, JOB_MIGRATION,
+        event_id_at, full_project_validation_count, snapshot_hash, JobError, JobErrorKind,
+        JobListCursor, JobStore, JOB_MIGRATION,
     };
     use crate::ProjectService;
 
@@ -627,6 +683,7 @@ mod tests {
         assert_eq!(second.items.len(), 1);
         assert_eq!(second.items[0].job_id, job_id(0));
         assert!(second.next_cursor.is_none());
+        drop(reopened);
         cleanup_project(&path);
     }
 
@@ -645,6 +702,7 @@ mod tests {
         assert_eq!(second.items[0].job_id, job_id(1));
         assert_eq!(third.items[0].job_id, job_id(0));
         assert!(third.next_cursor.is_none());
+        drop(store);
         cleanup_project(&path);
     }
 
@@ -755,7 +813,6 @@ mod tests {
             .expect("seed replacement job");
         drop(replacement_store);
         let store = JobStore::open(&path).expect("open original store");
-        fs::remove_file(path.join("metadata.sqlite")).expect("remove original metadata");
         fs::copy(
             replacement.join("metadata.sqlite"),
             path.join("metadata.sqlite"),
@@ -765,6 +822,7 @@ mod tests {
         let enqueue_result = store.enqueue_at(&enqueue(9), NOW);
         let get_result = store.get(&job_id(0));
         let list_result = store.list(10, None);
+        drop(store);
         cleanup_project(&path);
         cleanup_project(&replacement);
         assert!(matches!(enqueue_result, Err(JobError::DataIntegrity(_))));
@@ -773,14 +831,88 @@ mod tests {
     }
 
     #[test]
+    fn operations_reject_byte_identical_metadata_replacement() {
+        let path = create_schema_two_project("byte-identical-replacement");
+        let store = JobStore::open(&path).expect("open store");
+        let metadata_path = path.join("metadata.sqlite");
+        let original = fs::read(&metadata_path).expect("read original metadata");
+        fs::write(&metadata_path, original).expect("replace metadata with identical bytes");
+
+        let enqueue_result = store.enqueue_at(&enqueue(0), NOW);
+        let get_result = store.get(&job_id(0));
+        let list_result = store.list(10, None);
+        drop(store);
+        cleanup_project(&path);
+        assert!(matches!(enqueue_result, Err(JobError::DataIntegrity(_))));
+        assert!(matches!(get_result, Err(JobError::DataIntegrity(_))));
+        assert!(matches!(list_result, Err(JobError::DataIntegrity(_))));
+    }
+
+    #[test]
+    fn operations_reject_valid_same_project_replacement() {
+        let path = create_schema_two_project("same-project-target");
+        let replacement = create_schema_two_project("same-project-source");
+        let replacement_store = JobStore::open(&replacement).expect("open replacement store");
+        replacement_store
+            .enqueue_at(&enqueue(0), NOW)
+            .expect("seed replacement job");
+        drop(replacement_store);
+        let store = JobStore::open(&path).expect("open original store");
+        fs::copy(
+            replacement.join("manifest.json"),
+            path.join("manifest.json"),
+        )
+        .expect("replace manifest");
+        fs::copy(
+            replacement.join("metadata.sqlite"),
+            path.join("metadata.sqlite"),
+        )
+        .expect("replace metadata with valid same-project database");
+
+        let enqueue_result = store.enqueue_at(&enqueue(9), NOW);
+        let get_result = store.get(&job_id(0));
+        let list_result = store.list(10, None);
+        drop(store);
+        cleanup_project(&path);
+        cleanup_project(&replacement);
+        assert!(matches!(enqueue_result, Err(JobError::DataIntegrity(_))));
+        assert!(matches!(get_result, Err(JobError::DataIntegrity(_))));
+        assert!(matches!(list_result, Err(JobError::DataIntegrity(_))));
+    }
+
+    #[test]
+    fn repeated_list_does_not_repeat_full_project_integrity_validation() {
+        let path = create_schema_two_project("lightweight-list");
+        let store = JobStore::open(&path).expect("open store");
+        let validations_after_open = full_project_validation_count();
+
+        for _ in 0..3 {
+            assert!(store.list(10, None).expect("list jobs").items.is_empty());
+        }
+        assert_eq!(full_project_validation_count(), validations_after_open);
+        drop(store);
+        cleanup_project(&path);
+    }
+
+    #[test]
     fn operations_reject_metadata_symlink_created_after_store_open() {
         let path = create_schema_two_project("metadata-symlink");
         let store = JobStore::open(&path).expect("open store");
         let metadata_path = path.join("metadata.sqlite");
         let original_path = path.join("metadata.original.sqlite");
-        fs::rename(&metadata_path, &original_path).expect("move metadata aside");
+        if let Err(error) = fs::rename(&metadata_path, &original_path) {
+            drop(store);
+            cleanup_project(&path);
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.raw_os_error() == Some(32)
+            {
+                return;
+            }
+            panic!("move metadata aside: {error}");
+        }
         if let Err(error) = symlink_file(&original_path, &metadata_path) {
             fs::rename(&original_path, &metadata_path).expect("restore metadata after skip");
+            drop(store);
             cleanup_project(&path);
             if error.kind() == std::io::ErrorKind::PermissionDenied
                 || error.raw_os_error() == Some(1314)
@@ -793,6 +925,7 @@ mod tests {
         let enqueue_result = store.enqueue_at(&enqueue(0), NOW);
         let get_result = store.get(&job_id(0));
         let list_result = store.list(10, None);
+        drop(store);
         cleanup_project(&path);
         assert!(matches!(enqueue_result, Err(JobError::DataIntegrity(_))));
         assert!(matches!(get_result, Err(JobError::DataIntegrity(_))));
@@ -859,13 +992,13 @@ mod tests {
             ),
             Err(JobError::InvalidRequest(_))
         ));
+        drop(store);
         cleanup_project(&path);
     }
 
     #[test]
     fn enqueue_persists_snapshot_event_and_audit_atomically() {
         let path = create_schema_two_project("atomic-enqueue");
-        let store = JobStore::open(&path).expect("open store");
         let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
         connection
             .execute_batch(
@@ -876,12 +1009,14 @@ mod tests {
             )
             .expect("install abort trigger");
         drop(connection);
+        let store = JobStore::open(&path).expect("open store");
 
         assert!(matches!(
             store.enqueue_at(&enqueue(0), NOW),
             Err(JobError::Database(_))
         ));
         assert_eq!(job_event_audit_counts(&path), (0, 0, 1));
+        drop(store);
         cleanup_project(&path);
     }
 
@@ -913,6 +1048,7 @@ mod tests {
             event_id_at("job-event", &job_id(0), 2, "job.queued", NOW).expect("revision two ID")
         );
         drop(connection);
+        drop(store);
         cleanup_project(&path);
     }
 
@@ -939,6 +1075,7 @@ mod tests {
             Some(snapshot_hash(&persisted).expect("hash snapshot").as_str())
         );
         drop(connection);
+        drop(store);
         cleanup_project(&path);
     }
 
@@ -955,6 +1092,7 @@ mod tests {
             store.get(&job_id(9)),
             Err(JobError::JobNotFound(_))
         ));
+        drop(store);
         cleanup_project(&path);
     }
 
@@ -970,6 +1108,7 @@ mod tests {
         assert_eq!(foreign_keys, 1);
         assert!(connection.is_readonly("main").expect("read access mode"));
         drop(connection);
+        drop(store);
         cleanup_project(&path);
     }
 
