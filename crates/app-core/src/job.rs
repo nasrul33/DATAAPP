@@ -1,10 +1,15 @@
 use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row, TransactionBehavior};
+use rusqlite::{
+    params, Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior,
+};
 use sha2::{Digest, Sha256};
 pub use teratai_contracts::generated::job_descriptor::JobDescriptor;
 pub use teratai_contracts::generated::job_enqueue_request::JobEnqueueRequest;
+pub use teratai_contracts::generated::job_failure_request::JobFailureRequest;
+pub use teratai_contracts::generated::job_progress_update_request::JobProgressUpdateRequest;
+pub use teratai_contracts::generated::job_transition_request::JobTransitionRequest;
 use teratai_filesystem::{
     pin_project_metadata, validate_project_layout, PinnedProjectMetadata, ProjectLayout,
 };
@@ -112,6 +117,109 @@ pub struct JobStore {
     metadata: PinnedProjectMetadata,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JobStatus {
+    Queued,
+    Running,
+    Succeeded,
+    Failed,
+    Cancelling,
+    Cancelled,
+}
+
+impl JobStatus {
+    #[cfg(test)]
+    const ALL: [Self; 6] = [
+        Self::Queued,
+        Self::Running,
+        Self::Succeeded,
+        Self::Failed,
+        Self::Cancelling,
+        Self::Cancelled,
+    ];
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Queued => "QUEUED",
+            Self::Running => "RUNNING",
+            Self::Succeeded => "SUCCEEDED",
+            Self::Failed => "FAILED",
+            Self::Cancelling => "CANCELLING",
+            Self::Cancelled => "CANCELLED",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, JobError> {
+        match value {
+            "QUEUED" => Ok(Self::Queued),
+            "RUNNING" => Ok(Self::Running),
+            "SUCCEEDED" => Ok(Self::Succeeded),
+            "FAILED" => Ok(Self::Failed),
+            "CANCELLING" => Ok(Self::Cancelling),
+            "CANCELLED" => Ok(Self::Cancelled),
+            _ => Err(JobError::DataIntegrity(
+                "persisted job status is not recognized".to_owned(),
+            )),
+        }
+    }
+
+    const fn is_terminal(self) -> bool {
+        matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
+    }
+}
+
+fn transition_allowed(from: JobStatus, to: JobStatus) -> bool {
+    matches!(
+        (from, to),
+        (
+            JobStatus::Queued,
+            JobStatus::Running | JobStatus::Cancelling | JobStatus::Failed
+        ) | (
+            JobStatus::Running,
+            JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelling
+        ) | (
+            JobStatus::Cancelling,
+            JobStatus::Cancelled | JobStatus::Failed
+        )
+    )
+}
+
+#[derive(Clone, Copy)]
+enum TransitionRequest<'a> {
+    Plain(&'a JobTransitionRequest),
+    Failure(&'a JobFailureRequest),
+}
+
+impl<'a> TransitionRequest<'a> {
+    fn job_id(self) -> &'a str {
+        match self {
+            Self::Plain(request) => &request.job_id,
+            Self::Failure(request) => &request.job_id,
+        }
+    }
+
+    fn correlation_id(self) -> &'a str {
+        match self {
+            Self::Plain(request) => &request.correlation_id,
+            Self::Failure(request) => &request.correlation_id,
+        }
+    }
+
+    const fn expected_revision(self) -> i64 {
+        match self {
+            Self::Plain(request) => request.expected_revision,
+            Self::Failure(request) => request.expected_revision,
+        }
+    }
+
+    const fn failure(self) -> Option<&'a JobFailureRequest> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Failure(request) => Some(request),
+        }
+    }
+}
+
 impl JobStore {
     /// Open a validated schema-two project without mutating its control files.
     ///
@@ -155,6 +263,96 @@ impl JobStore {
             .format(&Rfc3339)
             .map_err(|error| JobError::Timestamp(error.to_string()))?;
         self.enqueue_at(request, &timestamp)
+    }
+
+    /// Move one queued job into active execution.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation, transition, concurrency, integrity, timestamp,
+    /// or database failure without partially persisted history.
+    pub fn start(&self, request: &JobTransitionRequest) -> Result<JobDescriptor, JobError> {
+        self.start_at(request, &current_timestamp()?)
+    }
+
+    /// Mark one running job as successfully completed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation, transition, concurrency, integrity, timestamp,
+    /// or database failure without partially persisted history.
+    pub fn succeed(&self, request: &JobTransitionRequest) -> Result<JobDescriptor, JobError> {
+        self.succeed_at(request, &current_timestamp()?)
+    }
+
+    /// Mark one queued, running, or cancelling job as safely failed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation, transition, concurrency, integrity, timestamp,
+    /// or database failure without exposing raw failure details.
+    pub fn fail(&self, request: &JobFailureRequest) -> Result<JobDescriptor, JobError> {
+        self.fail_at(request, &current_timestamp()?)
+    }
+
+    /// Persist one bounded, monotonic progress snapshot for an active job.
+    ///
+    /// A phase change may reset the current amount; updates within one phase
+    /// cannot regress.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation, transition, concurrency, integrity, timestamp,
+    /// or database failure without partially persisted history.
+    pub fn update_progress(
+        &self,
+        request: &JobProgressUpdateRequest,
+    ) -> Result<JobDescriptor, JobError> {
+        self.update_progress_at(request, &current_timestamp()?)
+    }
+
+    /// Cooperatively request cancellation without claiming completion.
+    ///
+    /// Repeating a current cancellation request returns the unchanged snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation, transition, concurrency, integrity, timestamp,
+    /// or database failure without partially persisted history.
+    pub fn request_cancellation(
+        &self,
+        request: &JobTransitionRequest,
+    ) -> Result<JobDescriptor, JobError> {
+        self.request_cancellation_at(request, &current_timestamp()?)
+    }
+
+    /// Complete a previously acknowledged cooperative cancellation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation, transition, concurrency, integrity, timestamp,
+    /// or database failure without partially persisted history.
+    pub fn complete_cancellation(
+        &self,
+        request: &JobTransitionRequest,
+    ) -> Result<JobDescriptor, JobError> {
+        self.complete_cancellation_at(request, &current_timestamp()?)
+    }
+
+    /// Mark active jobs left by an interrupted process as retriable failures.
+    ///
+    /// Queued and terminal jobs remain unchanged. Repeating recovery after a
+    /// successful pass writes no duplicate history.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed validation, integrity, timestamp, or database failure;
+    /// the complete recovery batch rolls back when any write fails.
+    pub fn recover_interrupted(
+        &self,
+        correlation_id: &str,
+    ) -> Result<Vec<JobDescriptor>, JobError> {
+        self.recover_interrupted_at(correlation_id, &current_timestamp()?)
     }
 
     /// Return one safe job snapshot by lowercase UUID v7 identity.
@@ -346,6 +544,262 @@ impl JobStore {
         Ok(descriptor)
     }
 
+    fn start_at(
+        &self,
+        request: &JobTransitionRequest,
+        timestamp: &str,
+    ) -> Result<JobDescriptor, JobError> {
+        self.transition_to_at(
+            TransitionRequest::Plain(request),
+            JobStatus::Running,
+            timestamp,
+        )
+    }
+
+    fn succeed_at(
+        &self,
+        request: &JobTransitionRequest,
+        timestamp: &str,
+    ) -> Result<JobDescriptor, JobError> {
+        self.transition_to_at(
+            TransitionRequest::Plain(request),
+            JobStatus::Succeeded,
+            timestamp,
+        )
+    }
+
+    fn fail_at(
+        &self,
+        request: &JobFailureRequest,
+        timestamp: &str,
+    ) -> Result<JobDescriptor, JobError> {
+        self.transition_to_at(
+            TransitionRequest::Failure(request),
+            JobStatus::Failed,
+            timestamp,
+        )
+    }
+
+    fn update_progress_at(
+        &self,
+        request: &JobProgressUpdateRequest,
+        timestamp: &str,
+    ) -> Result<JobDescriptor, JobError> {
+        validate_progress_request(request)?;
+        validate_timestamp(timestamp)?;
+        self.with_immediate_transaction(|transaction| {
+            let before = select_job(transaction, &self.project_id, &request.job_id)?;
+            if before.revision != request.expected_revision {
+                return Err(JobError::RevisionConflict {
+                    expected: request.expected_revision,
+                    actual: before.revision,
+                });
+            }
+            let status = JobStatus::parse(&before.status)?;
+            if !matches!(status, JobStatus::Running | JobStatus::Cancelling) {
+                return Err(JobError::InvalidTransition {
+                    from: status.as_str().to_owned(),
+                    to: "PROGRESS".to_owned(),
+                });
+            }
+            if before.progress_phase.as_deref() == Some(request.phase.as_str())
+                && request.current < before.progress_current
+            {
+                return Err(JobError::InvalidRequest(
+                    "progress cannot regress within the same phase".to_owned(),
+                ));
+            }
+            ensure_timestamp_not_earlier(timestamp, &before.updated_at)?;
+            let revision = before
+                .revision
+                .checked_add(1)
+                .ok_or_else(|| JobError::DataIntegrity("job revision overflowed".to_owned()))?;
+            let after = JobDescriptor {
+                correlation_id: request.correlation_id.clone(),
+                created_at: before.created_at.clone(),
+                job_id: before.job_id.clone(),
+                kind: before.kind.clone(),
+                progress_current: request.current,
+                project_id: before.project_id.clone(),
+                revision,
+                status: before.status.clone(),
+                updated_at: timestamp.to_owned(),
+                error_code: None,
+                error_message: None,
+                error_retriable: None,
+                finished_at: None,
+                progress_message: Some(request.message.clone()),
+                progress_phase: Some(request.phase.clone()),
+                progress_total: request.total,
+                progress_unit: request.unit.clone(),
+                started_at: before.started_at.clone(),
+            };
+            persist_mutation(
+                transaction,
+                &self.project_id,
+                &before,
+                &after,
+                "job.progressed",
+            )?;
+            Ok(after)
+        })
+    }
+
+    fn request_cancellation_at(
+        &self,
+        request: &JobTransitionRequest,
+        timestamp: &str,
+    ) -> Result<JobDescriptor, JobError> {
+        self.transition_to_at_internal(
+            TransitionRequest::Plain(request),
+            JobStatus::Cancelling,
+            timestamp,
+            true,
+        )
+    }
+
+    fn complete_cancellation_at(
+        &self,
+        request: &JobTransitionRequest,
+        timestamp: &str,
+    ) -> Result<JobDescriptor, JobError> {
+        self.transition_to_at(
+            TransitionRequest::Plain(request),
+            JobStatus::Cancelled,
+            timestamp,
+        )
+    }
+
+    fn recover_interrupted_at(
+        &self,
+        correlation_id: &str,
+        timestamp: &str,
+    ) -> Result<Vec<JobDescriptor>, JobError> {
+        validate_uuid(correlation_id, "correlation_id")?;
+        validate_timestamp(timestamp)?;
+        self.with_immediate_transaction(|transaction| {
+            let active = {
+                let mut statement = transaction.prepare(
+                    "SELECT job_id, project_id, kind, status, correlation_id, revision,
+                            created_at, started_at, finished_at, updated_at,
+                            progress_current, progress_total, progress_unit, progress_phase,
+                            progress_message, error_code, error_message, error_retriable
+                     FROM job
+                     WHERE project_id = ?1 AND status IN ('RUNNING', 'CANCELLING')
+                     ORDER BY job_id ASC",
+                )?;
+                let jobs = statement
+                    .query_map([&self.project_id], row_to_descriptor)?
+                    .collect::<Result<Vec<_>, _>>()?;
+                jobs
+            };
+            let mut recovered = Vec::with_capacity(active.len());
+            for before in active {
+                ensure_timestamp_not_earlier(timestamp, &before.updated_at)?;
+                let revision = before
+                    .revision
+                    .checked_add(1)
+                    .ok_or_else(|| JobError::DataIntegrity("job revision overflowed".to_owned()))?;
+                let after = JobDescriptor {
+                    correlation_id: correlation_id.to_owned(),
+                    created_at: before.created_at.clone(),
+                    job_id: before.job_id.clone(),
+                    kind: before.kind.clone(),
+                    progress_current: before.progress_current,
+                    project_id: before.project_id.clone(),
+                    revision,
+                    status: JobStatus::Failed.as_str().to_owned(),
+                    updated_at: timestamp.to_owned(),
+                    error_code: Some("INTERRUPTED".to_owned()),
+                    error_message: Some(
+                        "Pekerjaan terhenti saat aplikasi tidak aktif dan dapat dicoba kembali."
+                            .to_owned(),
+                    ),
+                    error_retriable: Some(true),
+                    finished_at: Some(timestamp.to_owned()),
+                    progress_message: before.progress_message.clone(),
+                    progress_phase: before.progress_phase.clone(),
+                    progress_total: before.progress_total,
+                    progress_unit: before.progress_unit.clone(),
+                    started_at: before.started_at.clone(),
+                };
+                persist_mutation(
+                    transaction,
+                    &self.project_id,
+                    &before,
+                    &after,
+                    "job.interrupted",
+                )?;
+                recovered.push(after);
+            }
+            Ok(recovered)
+        })
+    }
+
+    fn transition_to_at(
+        &self,
+        request: TransitionRequest<'_>,
+        to: JobStatus,
+        timestamp: &str,
+    ) -> Result<JobDescriptor, JobError> {
+        self.transition_to_at_internal(request, to, timestamp, false)
+    }
+
+    fn transition_to_at_internal(
+        &self,
+        request: TransitionRequest<'_>,
+        to: JobStatus,
+        timestamp: &str,
+        idempotent_cancelling: bool,
+    ) -> Result<JobDescriptor, JobError> {
+        validate_transition_request(request, to)?;
+        validate_timestamp(timestamp)?;
+        self.with_immediate_transaction(|transaction| {
+            let before = select_job(transaction, &self.project_id, request.job_id())?;
+            if before.revision != request.expected_revision() {
+                return Err(JobError::RevisionConflict {
+                    expected: request.expected_revision(),
+                    actual: before.revision,
+                });
+            }
+            let from = JobStatus::parse(&before.status)?;
+            if idempotent_cancelling && from == JobStatus::Cancelling && to == JobStatus::Cancelling
+            {
+                return Ok(before);
+            }
+            if !transition_allowed(from, to) {
+                return Err(JobError::InvalidTransition {
+                    from: from.as_str().to_owned(),
+                    to: to.as_str().to_owned(),
+                });
+            }
+            ensure_timestamp_not_earlier(timestamp, &before.updated_at)?;
+            let after = transitioned_descriptor(&before, request, from, to, timestamp)?;
+            let action = transition_action(from, to)?;
+            persist_mutation(transaction, &self.project_id, &before, &after, action)?;
+            Ok(after)
+        })
+    }
+
+    fn with_immediate_transaction<T>(
+        &self,
+        operation: impl FnOnce(&Transaction<'_>) -> Result<T, JobError>,
+    ) -> Result<T, JobError> {
+        let mut connection = self.write_connection()?;
+        verify_pinned_metadata(&self.metadata)?;
+        let write_result = (|| {
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let value = operation(&transaction)?;
+            transaction.commit()?;
+            Ok(value)
+        })();
+        self.metadata
+            .refresh_after_authorized_write()
+            .map_err(|_| JobError::DataIntegrity("pinned metadata identity changed".to_owned()))?;
+        write_result
+    }
+
     fn read_connection(&self) -> Result<Connection, JobError> {
         self.validated_connection(ConnectionAccess::ReadOnly)
     }
@@ -483,6 +937,298 @@ fn probe_job_connection(connection: &Connection, project_id: &str) -> Result<(),
     if connected_project_id != project_id {
         return Err(JobError::DataIntegrity(
             "metadata identity changed during connection validation".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn current_timestamp() -> Result<String, JobError> {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .map_err(|error| JobError::Timestamp(error.to_string()))
+}
+
+fn validate_transition_request(
+    request: TransitionRequest<'_>,
+    to: JobStatus,
+) -> Result<(), JobError> {
+    validate_uuid(request.job_id(), "job_id")?;
+    validate_uuid(request.correlation_id(), "correlation_id")?;
+    if request.expected_revision() <= 0 {
+        return Err(JobError::InvalidRequest(
+            "expected_revision must be positive".to_owned(),
+        ));
+    }
+    match (to, request.failure()) {
+        (JobStatus::Failed, Some(failure)) => validate_failure(failure),
+        (JobStatus::Failed, None) => Err(JobError::InvalidRequest(
+            "failure transition requires safe failure details".to_owned(),
+        )),
+        (_, Some(_)) => Err(JobError::InvalidRequest(
+            "failure details are only valid for failed jobs".to_owned(),
+        )),
+        (_, None) => Ok(()),
+    }
+}
+
+fn validate_failure(request: &JobFailureRequest) -> Result<(), JobError> {
+    if !is_safe_error_code(&request.error_code) {
+        return Err(JobError::InvalidRequest(
+            "error_code must be a bounded uppercase identifier".to_owned(),
+        ));
+    }
+    if !is_safe_message(&request.error_message, 500) {
+        return Err(JobError::InvalidRequest(
+            "error_message must be bounded safe text".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn is_safe_error_code(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    (1..=120).contains(&bytes.len())
+        && bytes[0].is_ascii_uppercase()
+        && bytes[1..]
+            .iter()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || *byte == b'_')
+}
+
+fn is_safe_message(value: &str, maximum: usize) -> bool {
+    (1..=maximum).contains(&value.len())
+        && value.trim() == value
+        && !value.chars().any(char::is_control)
+}
+
+fn ensure_timestamp_not_earlier(timestamp: &str, previous: &str) -> Result<(), JobError> {
+    let next = validate_timestamp(timestamp)?;
+    let prior = validate_timestamp(previous)?;
+    if next < prior {
+        return Err(JobError::InvalidRequest(
+            "mutation timestamp cannot precede the persisted snapshot".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn select_job(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    job_id: &str,
+) -> Result<JobDescriptor, JobError> {
+    transaction
+        .query_row(
+            "SELECT job_id, project_id, kind, status, correlation_id, revision,
+                    created_at, started_at, finished_at, updated_at,
+                    progress_current, progress_total, progress_unit, progress_phase,
+                    progress_message, error_code, error_message, error_retriable
+             FROM job
+             WHERE project_id = ?1 AND job_id = ?2",
+            params![project_id, job_id],
+            row_to_descriptor,
+        )
+        .optional()?
+        .ok_or_else(|| JobError::JobNotFound("job identity does not exist".to_owned()))
+}
+
+fn transitioned_descriptor(
+    before: &JobDescriptor,
+    request: TransitionRequest<'_>,
+    from: JobStatus,
+    to: JobStatus,
+    timestamp: &str,
+) -> Result<JobDescriptor, JobError> {
+    let revision = before
+        .revision
+        .checked_add(1)
+        .ok_or_else(|| JobError::DataIntegrity("job revision overflowed".to_owned()))?;
+    let failure = request.failure();
+    Ok(JobDescriptor {
+        correlation_id: request.correlation_id().to_owned(),
+        created_at: before.created_at.clone(),
+        job_id: before.job_id.clone(),
+        kind: before.kind.clone(),
+        progress_current: before.progress_current,
+        project_id: before.project_id.clone(),
+        revision,
+        status: to.as_str().to_owned(),
+        updated_at: timestamp.to_owned(),
+        error_code: failure.map(|value| value.error_code.clone()),
+        error_message: failure.map(|value| value.error_message.clone()),
+        error_retriable: failure.map(|value| value.error_retriable),
+        finished_at: to.is_terminal().then(|| timestamp.to_owned()),
+        progress_message: before.progress_message.clone(),
+        progress_phase: before.progress_phase.clone(),
+        progress_total: before.progress_total,
+        progress_unit: before.progress_unit.clone(),
+        started_at: if from == JobStatus::Queued && to == JobStatus::Running {
+            Some(timestamp.to_owned())
+        } else {
+            before.started_at.clone()
+        },
+    })
+}
+
+fn transition_action(from: JobStatus, to: JobStatus) -> Result<&'static str, JobError> {
+    match (from, to) {
+        (JobStatus::Queued, JobStatus::Running) => Ok("job.started"),
+        (JobStatus::Running, JobStatus::Succeeded) => Ok("job.succeeded"),
+        (JobStatus::Queued | JobStatus::Running, JobStatus::Cancelling) => {
+            Ok("job.cancellation_requested")
+        }
+        (JobStatus::Cancelling, JobStatus::Cancelled) => Ok("job.cancelled"),
+        (JobStatus::Queued | JobStatus::Running | JobStatus::Cancelling, JobStatus::Failed) => {
+            Ok("job.failed")
+        }
+        _ => Err(JobError::DataIntegrity(
+            "transition action is not defined".to_owned(),
+        )),
+    }
+}
+
+fn persist_mutation(
+    transaction: &Transaction<'_>,
+    project_id: &str,
+    before: &JobDescriptor,
+    after: &JobDescriptor,
+    action: &str,
+) -> Result<(), JobError> {
+    let changed = transaction.execute(
+        "UPDATE job
+         SET status = ?1, correlation_id = ?2, revision = ?3,
+             started_at = ?4, finished_at = ?5, updated_at = ?6,
+             progress_current = ?7, progress_total = ?8, progress_unit = ?9,
+             progress_phase = ?10, progress_message = ?11,
+             error_code = ?12, error_message = ?13, error_retriable = ?14
+         WHERE project_id = ?15 AND job_id = ?16 AND revision = ?17",
+        params![
+            after.status,
+            after.correlation_id,
+            after.revision,
+            after.started_at,
+            after.finished_at,
+            after.updated_at,
+            after.progress_current,
+            after.progress_total,
+            after.progress_unit,
+            after.progress_phase,
+            after.progress_message,
+            after.error_code,
+            after.error_message,
+            after.error_retriable.map(i64::from),
+            project_id,
+            after.job_id,
+            before.revision,
+        ],
+    )?;
+    if changed != 1 {
+        return Err(JobError::RevisionConflict {
+            expected: before.revision,
+            actual: before.revision,
+        });
+    }
+    let job_event_id = event_id_at(
+        "job-event",
+        &after.job_id,
+        after.revision,
+        action,
+        &after.updated_at,
+    )?;
+    let audit_event_id = event_id_at(
+        "audit-event",
+        &after.job_id,
+        after.revision,
+        action,
+        &after.updated_at,
+    )?;
+    transaction.execute(
+        "INSERT INTO job_event (
+            event_id, job_id, event_type, from_status, to_status, revision,
+            progress_current, progress_total, progress_unit, progress_phase,
+            progress_message, error_code, error_message, error_retriable,
+            occurred_at, correlation_id
+         ) VALUES (
+            ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+         )",
+        params![
+            job_event_id,
+            after.job_id,
+            action,
+            before.status,
+            after.status,
+            after.revision,
+            after.progress_current,
+            after.progress_total,
+            after.progress_unit,
+            after.progress_phase,
+            after.progress_message,
+            after.error_code,
+            after.error_message,
+            after.error_retriable.map(i64::from),
+            after.updated_at,
+            after.correlation_id,
+        ],
+    )?;
+    let before_hash = snapshot_hash(before)?;
+    let after_hash = snapshot_hash(after)?;
+    transaction.execute(
+        "INSERT INTO audit_event (
+            event_id, actor, action, target_type, target_id,
+            before_hash, after_hash, occurred_at, correlation_id
+         ) VALUES (?1, 'local-user', ?2, 'job', ?3, ?4, ?5, ?6, ?7)",
+        params![
+            audit_event_id,
+            action,
+            after.job_id,
+            before_hash,
+            after_hash,
+            after.updated_at,
+            after.correlation_id,
+        ],
+    )?;
+    Ok(())
+}
+
+fn validate_progress_request(request: &JobProgressUpdateRequest) -> Result<(), JobError> {
+    validate_uuid(&request.job_id, "job_id")?;
+    validate_uuid(&request.correlation_id, "correlation_id")?;
+    if request.expected_revision <= 0 {
+        return Err(JobError::InvalidRequest(
+            "expected_revision must be positive".to_owned(),
+        ));
+    }
+    if request.current < 0 {
+        return Err(JobError::InvalidRequest(
+            "progress current cannot be negative".to_owned(),
+        ));
+    }
+    if request.total.is_some_and(|total| total <= 0) {
+        return Err(JobError::InvalidRequest(
+            "progress total must be positive when present".to_owned(),
+        ));
+    }
+    if request.total.is_some_and(|total| request.current > total) {
+        return Err(JobError::InvalidRequest(
+            "progress current cannot exceed total".to_owned(),
+        ));
+    }
+    if !is_safe_token(&request.phase, 120) {
+        return Err(JobError::InvalidRequest(
+            "progress phase must be a bounded safe identifier".to_owned(),
+        ));
+    }
+    if !is_safe_message(&request.message, 500) {
+        return Err(JobError::InvalidRequest(
+            "progress message must be bounded safe text".to_owned(),
+        ));
+    }
+    if request
+        .unit
+        .as_deref()
+        .is_some_and(|unit| !is_safe_token(unit, 32))
+    {
+        return Err(JobError::InvalidRequest(
+            "progress unit must be a bounded safe identifier".to_owned(),
         ));
     }
     Ok(())
@@ -626,13 +1372,16 @@ mod tests {
     use rusqlite::{params, Connection, Result, TransactionBehavior};
     use sha2::{Digest, Sha256};
     use teratai_contracts::generated::job_enqueue_request::JobEnqueueRequest;
+    use teratai_contracts::generated::job_failure_request::JobFailureRequest;
+    use teratai_contracts::generated::job_progress_update_request::JobProgressUpdateRequest;
+    use teratai_contracts::generated::job_transition_request::JobTransitionRequest;
     use teratai_contracts::generated::project_create_request::ProjectCreateRequest;
     use teratai_contracts::generated::project_manifest::ProjectManifest;
     use teratai_filesystem::REQUIRED_PROJECT_DIRECTORIES;
 
     use super::{
-        event_id_at, full_project_validation_count, snapshot_hash, JobError, JobErrorKind,
-        JobListCursor, JobStore, JOB_MIGRATION,
+        event_id_at, full_project_validation_count, snapshot_hash, transition_allowed, JobError,
+        JobErrorKind, JobListCursor, JobStatus, JobStore, TransitionRequest, JOB_MIGRATION,
     };
     use crate::ProjectService;
 
@@ -642,13 +1391,248 @@ mod tests {
     const JOB_ID: &str = "00000000-0000-7000-8000-000000000210";
     const EVENT_ID: &str = "00000000-0000-7000-8000-000000000211";
     const CORRELATION_ID: &str = "00000000-0000-7000-8000-000000000212";
+    const RECOVERY_ID: &str = "00000000-0000-7000-8000-000000000213";
     const NOW: &str = "2026-07-20T12:00:00Z";
+    const NOW_1: &str = "2026-07-20T12:01:00Z";
+    const NOW_2: &str = "2026-07-20T12:02:00Z";
+    const NOW_3: &str = "2026-07-20T12:03:00Z";
+    const NOW_4: &str = "2026-07-20T12:04:00Z";
+    const NOW_5: &str = "2026-07-20T12:05:00Z";
     const INVALID_CALENDAR_TIMESTAMPS: [&str; 4] = [
         "2026-13-10T12:00:00Z",
         "2026-01-32T12:00:00Z",
         "2026-01-10T23:60:00Z",
         "2026-01-10T23:59:60Z",
     ];
+
+    #[test]
+    fn terminal_state_is_immutable() {
+        let path = create_schema_two_project("terminal");
+        let store = JobStore::open(&path).expect("open store");
+        store.enqueue_at(&enqueue(0), NOW).expect("enqueue job");
+
+        let running = store
+            .start_at(&transition(1), NOW_1)
+            .expect("start queued job");
+        let succeeded = store
+            .succeed_at(&transition(running.revision), NOW_2)
+            .expect("complete running job");
+        assert!(matches!(
+            store.fail_at(&failure(succeeded.revision), NOW_3),
+            Err(JobError::InvalidTransition { .. })
+        ));
+
+        drop(store);
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn stale_revision_writes_nothing() {
+        let path = create_schema_two_project("revision");
+        let store = JobStore::open(&path).expect("open store");
+        store.enqueue_at(&enqueue(0), NOW).expect("enqueue job");
+        let before = job_event_audit_counts(&path);
+
+        assert!(matches!(
+            store.start_at(&transition(99), NOW_1),
+            Err(JobError::RevisionConflict {
+                expected: 99,
+                actual: 1
+            })
+        ));
+        assert_eq!(job_event_audit_counts(&path), before);
+
+        drop(store);
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn transition_matrix_is_exact_and_rejections_write_nothing() {
+        let allowed = [
+            (JobStatus::Queued, JobStatus::Running),
+            (JobStatus::Queued, JobStatus::Cancelling),
+            (JobStatus::Queued, JobStatus::Failed),
+            (JobStatus::Running, JobStatus::Succeeded),
+            (JobStatus::Running, JobStatus::Failed),
+            (JobStatus::Running, JobStatus::Cancelling),
+            (JobStatus::Cancelling, JobStatus::Cancelled),
+            (JobStatus::Cancelling, JobStatus::Failed),
+        ];
+
+        for (from_index, from) in JobStatus::ALL.into_iter().enumerate() {
+            for (to_index, to) in JobStatus::ALL.into_iter().enumerate() {
+                let expected_allowed = allowed.contains(&(from, to));
+                assert_eq!(
+                    transition_allowed(from, to),
+                    expected_allowed,
+                    "unexpected policy for {from:?} -> {to:?}"
+                );
+                let label = format!("matrix-{from_index}-{to_index}");
+                let (path, store) = seeded_store_for_status(&label, from);
+                let current = store.get(&job_id(0)).expect("read seeded state");
+                let request = transition(current.revision);
+                let failure_request = failure(current.revision);
+                let payload = if to == JobStatus::Failed {
+                    TransitionRequest::Failure(&failure_request)
+                } else {
+                    TransitionRequest::Plain(&request)
+                };
+                let before = job_event_audit_counts(&path);
+                let result = store.transition_to_at(payload, to, NOW_3);
+
+                if expected_allowed {
+                    assert_eq!(result.expect("allowed transition").status, to.as_str());
+                    assert_eq!(
+                        job_event_audit_counts(&path),
+                        (before.0, before.1 + 1, before.2 + 1)
+                    );
+                } else {
+                    assert!(matches!(result, Err(JobError::InvalidTransition { .. })));
+                    assert_eq!(job_event_audit_counts(&path), before);
+                    assert_eq!(store.get(&job_id(0)).expect("unchanged job"), current);
+                }
+                drop(store);
+                cleanup_project(&path);
+            }
+        }
+    }
+
+    #[test]
+    fn progress_rejects_regression_but_allows_phase_reset() {
+        let (path, store) = running_store("progress");
+        let first = store
+            .update_progress_at(&progress(2, 40, Some(100), "scan"), NOW_2)
+            .expect("record scan progress");
+        let before_rejection = job_event_audit_counts(&path);
+
+        assert!(matches!(
+            store.update_progress_at(&progress(first.revision, 39, Some(100), "scan"), NOW_3),
+            Err(JobError::InvalidRequest(_))
+        ));
+        assert_eq!(job_event_audit_counts(&path), before_rejection);
+        assert_eq!(
+            store
+                .update_progress_at(&progress(first.revision, 0, Some(10), "write"), NOW_3)
+                .expect("reset progress for a new phase")
+                .progress_current,
+            0
+        );
+
+        drop(store);
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn progress_rejects_invalid_bounds_and_safe_fields_without_writes() {
+        let (path, store) = running_store("progress-validation");
+        let invalid = [
+            progress(2, -1, Some(100), "scan"),
+            progress(2, 1, Some(0), "scan"),
+            progress(2, 101, Some(100), "scan"),
+            JobProgressUpdateRequest {
+                phase: "Invalid Phase".to_owned(),
+                ..progress(2, 1, Some(100), "scan")
+            },
+            JobProgressUpdateRequest {
+                message: " progress".to_owned(),
+                ..progress(2, 1, Some(100), "scan")
+            },
+            JobProgressUpdateRequest {
+                unit: Some("bad unit".to_owned()),
+                ..progress(2, 1, Some(100), "scan")
+            },
+        ];
+
+        for request in invalid {
+            let before = job_event_audit_counts(&path);
+            assert!(matches!(
+                store.update_progress_at(&request, NOW_2),
+                Err(JobError::InvalidRequest(_))
+            ));
+            assert_eq!(job_event_audit_counts(&path), before);
+        }
+        drop(store);
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn cancellation_request_is_idempotent_and_does_not_finish_early() {
+        let (path, store) = running_store("cancel");
+        let running = store.get(&job_id(0)).expect("read running job");
+        let cancelling = store
+            .request_cancellation_at(&transition(running.revision), NOW_2)
+            .expect("request cancellation");
+        assert_eq!(cancelling.status, "CANCELLING");
+        assert!(cancelling.finished_at.is_none());
+        let counts = job_event_audit_counts(&path);
+
+        assert_eq!(
+            store
+                .request_cancellation_at(&transition(cancelling.revision), NOW_3)
+                .expect("repeat cancellation request"),
+            cancelling
+        );
+        assert_eq!(job_event_audit_counts(&path), counts);
+        let cancelled = store
+            .complete_cancellation_at(&transition(cancelling.revision), NOW_3)
+            .expect("complete cooperative cancellation");
+        assert_eq!(cancelled.status, "CANCELLED");
+        assert_eq!(cancelled.finished_at.as_deref(), Some(NOW_3));
+
+        drop(store);
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn recovery_marks_active_jobs_interrupted_once() {
+        let (path, store) = store_with_running_cancelling_and_queued_jobs("recovery");
+
+        let recovered = store
+            .recover_interrupted_at(RECOVERY_ID, NOW_4)
+            .expect("recover interrupted jobs");
+        assert_eq!(recovered.len(), 2);
+        assert!(recovered.iter().all(|job| {
+            job.status == "FAILED"
+                && job.error_code.as_deref() == Some("INTERRUPTED")
+                && job.error_retriable == Some(true)
+                && job.finished_at.as_deref() == Some(NOW_4)
+        }));
+        assert_eq!(store.get(&job_id(2)).expect("queued job").status, "QUEUED");
+        let counts = job_event_audit_counts(&path);
+
+        assert!(store
+            .recover_interrupted_at(RECOVERY_ID, NOW_5)
+            .expect("repeat recovery")
+            .is_empty());
+        assert_eq!(job_event_audit_counts(&path), counts);
+
+        drop(store);
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn audit_failure_rolls_back_snapshot_and_job_event() {
+        let path = create_schema_two_project("atomicity");
+        let store = JobStore::open(&path).expect("open store");
+        store.enqueue_at(&enqueue(0), NOW).expect("enqueue job");
+        drop(store);
+        install_audit_abort_trigger(&path, "job.started");
+        let store = JobStore::open(&path).expect("reopen store");
+        let before = job_event_audit_counts(&path);
+
+        assert!(matches!(
+            store.start_at(&transition(1), NOW_1),
+            Err(JobError::Database(_))
+        ));
+        assert_eq!(job_event_audit_counts(&path), before);
+        assert_eq!(
+            store.get(&job_id(0)).expect("rolled-back job").status,
+            "QUEUED"
+        );
+
+        drop(store);
+        cleanup_project(&path);
+    }
 
     #[test]
     fn jobs_survive_reopen_and_list_is_bounded() {
@@ -1332,6 +2316,54 @@ mod tests {
         path
     }
 
+    fn seeded_store_for_status(label: &str, status: JobStatus) -> (PathBuf, JobStore) {
+        let path = create_schema_two_project(label);
+        let store = JobStore::open(&path).expect("open store for enqueue");
+        store.enqueue_at(&enqueue(0), NOW).expect("enqueue job");
+        drop(store);
+
+        let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        let (revision, started_at, finished_at, error_code, error_message, error_retriable) =
+            match status {
+                JobStatus::Queued => (1, None, None, None, None, None),
+                JobStatus::Running => (2, Some(NOW_1), None, None, None, None),
+                JobStatus::Succeeded => (3, Some(NOW_1), Some(NOW_2), None, None, None),
+                JobStatus::Failed => (
+                    2,
+                    None,
+                    Some(NOW_1),
+                    Some("OPERATION_FAILED"),
+                    Some("Pekerjaan tidak dapat diselesaikan."),
+                    Some(0),
+                ),
+                JobStatus::Cancelling => (2, None, None, None, None, None),
+                JobStatus::Cancelled => (3, None, Some(NOW_2), None, None, None),
+            };
+        connection
+            .execute(
+                "UPDATE job
+                 SET status = ?1, revision = ?2, started_at = ?3, finished_at = ?4,
+                     updated_at = ?5, error_code = ?6, error_message = ?7,
+                     error_retriable = ?8
+                 WHERE job_id = ?9",
+                params![
+                    status.as_str(),
+                    revision,
+                    started_at,
+                    finished_at,
+                    if revision == 1 { NOW } else { NOW_2 },
+                    error_code,
+                    error_message,
+                    error_retriable,
+                    job_id(0),
+                ],
+            )
+            .expect("seed job status");
+        drop(connection);
+        let store = JobStore::open(&path).expect("reopen seeded store");
+        (path, store)
+    }
+
     fn fixture_target(label: &str) -> PathBuf {
         static NEXT_FIXTURE: AtomicU64 = AtomicU64::new(1);
         let fixture = NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed);
@@ -1351,6 +2383,90 @@ mod tests {
             progress_total: Some(100),
             progress_unit: Some("step".to_owned()),
         }
+    }
+
+    fn transition(expected_revision: i64) -> JobTransitionRequest {
+        transition_for(&job_id(0), expected_revision)
+    }
+
+    fn transition_for(job_id: &str, expected_revision: i64) -> JobTransitionRequest {
+        JobTransitionRequest {
+            correlation_id: CORRELATION_ID.to_owned(),
+            expected_revision,
+            job_id: job_id.to_owned(),
+        }
+    }
+
+    fn failure(expected_revision: i64) -> JobFailureRequest {
+        JobFailureRequest {
+            correlation_id: CORRELATION_ID.to_owned(),
+            error_code: "OPERATION_FAILED".to_owned(),
+            error_message: "Pekerjaan tidak dapat diselesaikan.".to_owned(),
+            error_retriable: false,
+            expected_revision,
+            job_id: job_id(0),
+        }
+    }
+
+    fn progress(
+        expected_revision: i64,
+        current: i64,
+        total: Option<i64>,
+        phase: &str,
+    ) -> JobProgressUpdateRequest {
+        JobProgressUpdateRequest {
+            correlation_id: CORRELATION_ID.to_owned(),
+            current,
+            expected_revision,
+            job_id: job_id(0),
+            message: "Memproses pekerjaan.".to_owned(),
+            phase: phase.to_owned(),
+            total,
+            unit: Some("row".to_owned()),
+        }
+    }
+
+    fn running_store(label: &str) -> (PathBuf, JobStore) {
+        let path = create_schema_two_project(label);
+        let store = JobStore::open(&path).expect("open store");
+        store.enqueue_at(&enqueue(0), NOW).expect("enqueue job");
+        store
+            .start_at(&transition(1), NOW_1)
+            .expect("start queued job");
+        (path, store)
+    }
+
+    fn store_with_running_cancelling_and_queued_jobs(label: &str) -> (PathBuf, JobStore) {
+        let path = create_schema_two_project(label);
+        let store = JobStore::open(&path).expect("open store");
+        for index in 0..3 {
+            store
+                .enqueue_at(&enqueue(index), NOW)
+                .expect("enqueue recovery fixture job");
+        }
+        store
+            .start_at(&transition_for(&job_id(0), 1), NOW_1)
+            .expect("start running recovery job");
+        let running = store
+            .start_at(&transition_for(&job_id(1), 1), NOW_1)
+            .expect("start cancelling recovery job");
+        store
+            .request_cancellation_at(&transition_for(&job_id(1), running.revision), NOW_2)
+            .expect("request cancellation for recovery job");
+        (path, store)
+    }
+
+    fn install_audit_abort_trigger(path: &Path, action: &str) {
+        assert!(super::is_safe_token(action, 120));
+        let connection = Connection::open(path.join("metadata.sqlite")).expect("open metadata");
+        connection
+            .execute_batch(&format!(
+                "CREATE TRIGGER fail_job_audit
+                 BEFORE INSERT ON audit_event
+                 WHEN NEW.action = '{action}'
+                 BEGIN SELECT RAISE(ABORT, 'test audit failure'); END;"
+            ))
+            .expect("install audit abort trigger");
     }
 
     fn job_id(index: u8) -> String {
