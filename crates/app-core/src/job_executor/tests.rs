@@ -368,6 +368,79 @@ impl JobHandler for PanicHandler {
     }
 }
 
+struct FullBudgetFailingHandler {
+    entered: mpsc::SyncSender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl JobHandler for FullBudgetFailingHandler {
+    fn kind(&self) -> &'static str {
+        "full-budget.failure"
+    }
+
+    fn estimate(&self) -> ResourceEstimate {
+        ResourceEstimate {
+            memory_bytes: ExecutorFixture::budget().memory_bytes,
+            disk_bytes: ExecutorFixture::budget().disk_bytes,
+            duration: DurationClass::Medium,
+        }
+    }
+
+    fn run(&self, _context: &mut ExecutionContext<'_>) -> Result<HandlerOutcome, JobHandlerError> {
+        self.entered.send(()).expect("signal failing handler");
+        self.release
+            .lock()
+            .expect("failure release receiver")
+            .recv_timeout(Duration::from_secs(2))
+            .expect("release failing handler");
+        Err(
+            JobHandlerError::new("MOCK_FAILED", "Pekerjaan mock gagal.", true)
+                .expect("valid test failure"),
+        )
+    }
+}
+
+struct FullBudgetSuccessHandler;
+
+impl JobHandler for FullBudgetSuccessHandler {
+    fn kind(&self) -> &'static str {
+        "full-budget.success"
+    }
+
+    fn estimate(&self) -> ResourceEstimate {
+        ResourceEstimate {
+            memory_bytes: ExecutorFixture::budget().memory_bytes,
+            disk_bytes: ExecutorFixture::budget().disk_bytes,
+            duration: DurationClass::Medium,
+        }
+    }
+
+    fn run(&self, _context: &mut ExecutionContext<'_>) -> Result<HandlerOutcome, JobHandlerError> {
+        Ok(HandlerOutcome::Completed)
+    }
+}
+
+fn job_history_counts(project_path: &std::path::Path, job_id: &str) -> (i64, i64) {
+    let connection =
+        rusqlite::Connection::open(project_path.join("metadata.sqlite")).expect("open metadata");
+    let job_events = connection
+        .query_row(
+            "SELECT COUNT(*) FROM job_event WHERE job_id = ?1",
+            [job_id],
+            |row| row.get(0),
+        )
+        .expect("count job events");
+    let audit_events = connection
+        .query_row(
+            "SELECT COUNT(*) FROM audit_event
+             WHERE target_type = 'job' AND target_id = ?1",
+            [job_id],
+            |row| row.get(0),
+        )
+        .expect("count job audit events");
+    (job_events, audit_events)
+}
+
 #[test]
 fn over_budget_job_fails_preflight_without_invoking_handler() {
     let mut fixture = ExecutorFixture::new("over-budget-failure");
@@ -425,6 +498,22 @@ fn over_budget_job_fails_preflight_without_invoking_handler() {
 }
 
 #[test]
+fn poisoned_resource_ledger_is_an_internal_failure_not_a_resource_limit() {
+    let mut fixture = ExecutorFixture::new("poisoned-resource-ledger");
+    let job = fixture.enqueue("passive.kind");
+    let core = fixture.executor_core(vec![Arc::new(PassiveHandler)]);
+    core.resource_ledger.poison_for_test();
+
+    super::execute_job(&core, &job.job_id).expect("normalize poisoned ledger");
+
+    let failed = fixture.store().get(&job.job_id).expect("internal failure");
+    assert_eq!(failed.status, "FAILED");
+    assert_eq!(failed.error_code.as_deref(), Some("OPERATION_FAILED"));
+    assert_ne!(failed.error_code.as_deref(), Some("RESOURCE_LIMIT"));
+    assert_eq!(failed.error_retriable, Some(false));
+}
+
+#[test]
 fn typed_handler_failure_preserves_validated_safe_fields() {
     let mut fixture = ExecutorFixture::new("typed-handler-failure");
     let failed_job = fixture.enqueue("mock.failure");
@@ -477,12 +566,103 @@ fn typed_handler_failure_preserves_validated_safe_fields() {
 }
 
 #[test]
+fn failed_failure_transaction_releases_admission_and_full_resource_budget() {
+    let mut fixture = ExecutorFixture::new("failure-transaction-cleanup");
+    let failing_job = fixture.enqueue("full-budget.failure");
+    let following_job = fixture.enqueue("full-budget.success");
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
+    let (release_sender, release_receiver) = mpsc::sync_channel(1);
+    let (completed_sender, completed_receiver) = mpsc::sync_channel(2);
+    let executor = JobExecutor::new(
+        Arc::clone(fixture.store()),
+        vec![
+            Arc::new(FullBudgetFailingHandler {
+                entered: entered_sender,
+                release: Mutex::new(release_receiver),
+            }),
+            Arc::new(FullBudgetSuccessHandler),
+        ],
+        ExecutorFixture::config(2),
+        Arc::new(FixedClock),
+    )
+    .expect("start executor");
+    executor
+        .core
+        .set_after_job_hook(Arc::new(move |job_id| {
+            completed_sender
+                .send(job_id.to_owned())
+                .expect("signal completed worker iteration");
+        }))
+        .expect("install after-job hook");
+
+    executor
+        .submit(&failing_job.job_id)
+        .expect("submit full-budget failing job");
+    entered_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("failing handler holds full reservation");
+    let running = fixture
+        .store()
+        .get(&failing_job.job_id)
+        .expect("running snapshot before injected failure");
+    let history_before = job_history_counts(&fixture.project_path, &failing_job.job_id);
+    let audit_fault = crate::job::install_audit_insert_fault_for_test("full-budget.failure");
+    release_sender.send(()).expect("release failing handler");
+    assert_eq!(
+        completed_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("failed persistence iteration completes"),
+        failing_job.job_id
+    );
+
+    assert_eq!(
+        fixture
+            .store()
+            .get(&failing_job.job_id)
+            .expect("failure transaction rolled back"),
+        running
+    );
+    assert_eq!(
+        job_history_counts(&fixture.project_path, &failing_job.job_id),
+        history_before
+    );
+    assert!(!executor
+        .core
+        .admitted
+        .lock()
+        .expect("admission set")
+        .contains(&failing_job.job_id));
+
+    drop(audit_fault);
+    executor
+        .submit(&following_job.job_id)
+        .expect("submit following full-budget job");
+    assert_eq!(
+        completed_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("following full-budget job completes"),
+        following_job.job_id
+    );
+    assert_eq!(
+        fixture
+            .store()
+            .get(&following_job.job_id)
+            .expect("following terminal snapshot")
+            .status,
+        "SUCCEEDED"
+    );
+}
+
+#[test]
 fn panic_is_sanitized_and_same_worker_runs_following_job() {
     let mut fixture = ExecutorFixture::new("panic-containment");
     let panicking_job = fixture.enqueue("mock.panic");
     let following_job = fixture.enqueue("following.success");
     let following_invocations = Arc::new(AtomicUsize::new(0));
     let (following_sender, following_receiver) = mpsc::sync_channel(1);
+    let (panic_sender, panic_receiver) = mpsc::sync_channel(1);
+    let _panic_observer =
+        super::set_handler_panic_observer_for_test(panic_sender).expect("install panic observer");
     let executor = JobExecutor::new(
         Arc::clone(fixture.store()),
         vec![
@@ -522,6 +702,11 @@ fn panic_is_sanitized_and_same_worker_runs_following_job() {
         .store()
         .get(&following_job.job_id)
         .expect("following job");
+    let emitted = panic_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("executor hook emits sanitized panic");
+    assert_eq!(emitted, "Handler job gagal secara internal.");
+    assert!(!emitted.contains("sentinel"));
     assert_eq!(panicked.status, "FAILED");
     assert_eq!(panicked.error_code.as_deref(), Some("OPERATION_FAILED"));
     assert_eq!(

@@ -127,6 +127,15 @@ impl ResourceLedger {
             }
         }
     }
+
+    #[cfg(test)]
+    pub(super) fn poison_for_test(&self) {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _reserved = self.inner.reserved.lock().expect("unpoisoned ledger");
+            panic!("poison resource ledger for test");
+        }));
+        assert!(result.is_err());
+    }
 }
 
 impl Drop for ResourceReservation {

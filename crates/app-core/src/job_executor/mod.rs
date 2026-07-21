@@ -2,23 +2,115 @@ mod queue;
 
 pub mod resource;
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
-use std::sync::{mpsc, Arc, Mutex};
+use std::io::Write;
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use self::queue::{BoundedQueue, PushError};
-use self::resource::{ResourceBudget, ResourceEstimate, ResourceLedger};
+use self::resource::{ResourceBudget, ResourceError, ResourceEstimate, ResourceLedger};
 use crate::job::{
     JobDescriptor, JobError, JobErrorKind, JobFailureRequest, JobProgressUpdateRequest, JobStatus,
     JobStore, JobTransitionRequest,
 };
 
 const RESOURCE_LIMIT_MESSAGE: &str = "Pekerjaan melebihi batas resource yang dikonfigurasi.";
+const RESOURCE_INTERNAL_MESSAGE: &str = "Resource executor tidak tersedia untuk pekerjaan ini.";
 const PANIC_FAILURE_MESSAGE: &str = "Pekerjaan gagal karena kesalahan operasi internal.";
+const HANDLER_PANIC_HOOK_MESSAGE: &str = "Handler job gagal secara internal.";
+
+static HANDLER_PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
+
+thread_local! {
+    static HANDLER_PANIC_ACTIVE: Cell<bool> = const { Cell::new(false) };
+}
+
+#[cfg(test)]
+static HANDLER_PANIC_OBSERVER: Mutex<Option<mpsc::SyncSender<&'static str>>> = Mutex::new(None);
+
+struct HandlerPanicScope {
+    previous: bool,
+}
+
+impl HandlerPanicScope {
+    fn enter() -> Self {
+        let previous = HANDLER_PANIC_ACTIVE.with(|active| active.replace(true));
+        Self { previous }
+    }
+}
+
+impl Drop for HandlerPanicScope {
+    fn drop(&mut self) {
+        HANDLER_PANIC_ACTIVE.with(|active| active.set(self.previous));
+    }
+}
+
+fn ensure_handler_panic_hook() -> Result<(), JobExecutorError> {
+    if thread::panicking() {
+        return Err(JobExecutorError::InvalidConfiguration);
+    }
+    HANDLER_PANIC_HOOK_INSTALLED.get_or_init(|| {
+        let previous_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |panic_info| {
+            let handler_panic = HANDLER_PANIC_ACTIVE.with(Cell::get);
+            if handler_panic {
+                emit_sanitized_handler_panic();
+            } else {
+                previous_hook(panic_info);
+            }
+        }));
+    });
+    Ok(())
+}
+
+fn emit_sanitized_handler_panic() {
+    let mut stderr = std::io::stderr().lock();
+    let _message_result = stderr.write_all(HANDLER_PANIC_HOOK_MESSAGE.as_bytes());
+    let _newline_result = stderr.write_all(b"\n");
+    #[cfg(test)]
+    {
+        let observer = match HANDLER_PANIC_OBSERVER.lock() {
+            Ok(observer) => observer.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        if let Some(observer) = observer {
+            let _send_result = observer.try_send(HANDLER_PANIC_HOOK_MESSAGE);
+        }
+    }
+}
+
+#[cfg(test)]
+struct HandlerPanicObserverGuard;
+
+#[cfg(test)]
+impl Drop for HandlerPanicObserverGuard {
+    fn drop(&mut self) {
+        let mut observer = match HANDLER_PANIC_OBSERVER.lock() {
+            Ok(observer) => observer,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *observer = None;
+    }
+}
+
+#[cfg(test)]
+fn set_handler_panic_observer_for_test(
+    sender: mpsc::SyncSender<&'static str>,
+) -> Result<HandlerPanicObserverGuard, JobExecutorError> {
+    let mut observer = HANDLER_PANIC_OBSERVER
+        .lock()
+        .map_err(|_| JobExecutorError::PersistenceFailed)?;
+    if observer.is_some() {
+        return Err(JobExecutorError::InvalidConfiguration);
+    }
+    *observer = Some(sender);
+    Ok(HandlerPanicObserverGuard)
+}
 
 #[derive(Debug, Clone)]
 pub struct JobExecutorConfig {
@@ -424,6 +516,7 @@ impl JobExecutor {
         clock: Arc<dyn ExecutorClock>,
     ) -> Result<Self, JobExecutorError> {
         let core = Arc::new(ExecutorCore::new(store, handlers, config, clock)?);
+        ensure_handler_panic_hook()?;
         let reaper_capacity = core
             .config
             .worker_count
@@ -538,8 +631,12 @@ impl Drop for AdmissionGuard {
 
 fn worker_loop(core: &ExecutorCore) {
     while let Some(job_id) = core.queue.pop() {
-        let _admission = AdmissionGuard::new(Arc::clone(&core.admitted), job_id.clone());
-        let _execution_result = execute_job(core, &job_id);
+        {
+            let _admission = AdmissionGuard::new(Arc::clone(&core.admitted), job_id.clone());
+            let _execution_result = execute_job(core, &job_id);
+        }
+        #[cfg(test)]
+        core.run_after_job_hook(&job_id);
     }
 }
 
@@ -558,17 +655,37 @@ fn execute_job(core: &ExecutorCore, job_id: &str) -> Result<(), JobExecutorError
         .get(queued.kind.as_str())
         .cloned()
         .ok_or(JobExecutorError::HandlerNotFound)?;
-    let Ok(reservation) = core.resource_ledger.reserve(handler.estimate()) else {
-        return persist_terminal_failure(
-            core,
-            job_id,
-            TerminalFailure {
-                code: "RESOURCE_LIMIT",
-                message: RESOURCE_LIMIT_MESSAGE,
-                retriable: false,
-            },
-            FailureOrigin::Preflight,
-        );
+    let reservation = match core.resource_ledger.reserve(handler.estimate()) {
+        Ok(reservation) => reservation,
+        Err(
+            ResourceError::MemoryExceeded
+            | ResourceError::DiskExceeded
+            | ResourceError::DurationExceeded
+            | ResourceError::ArithmeticOverflow,
+        ) => {
+            return persist_terminal_failure(
+                core,
+                job_id,
+                TerminalFailure {
+                    code: "RESOURCE_LIMIT",
+                    message: RESOURCE_LIMIT_MESSAGE,
+                    retriable: false,
+                },
+                FailureOrigin::Preflight,
+            );
+        }
+        Err(ResourceError::InvalidBudget | ResourceError::Poisoned) => {
+            return persist_terminal_failure(
+                core,
+                job_id,
+                TerminalFailure {
+                    code: "OPERATION_FAILED",
+                    message: RESOURCE_INTERNAL_MESSAGE,
+                    retriable: false,
+                },
+                FailureOrigin::Preflight,
+            );
+        }
     };
     let _reservation = reservation;
     let started_at = core
@@ -591,7 +708,11 @@ fn execute_job(core: &ExecutorCore, job_id: &str) -> Result<(), JobExecutorError
         clock: core.clock.as_ref(),
     };
 
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.run(&mut context))) {
+    let handler_result = {
+        let _panic_scope = HandlerPanicScope::enter();
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.run(&mut context)))
+    };
+    match handler_result {
         Ok(Ok(HandlerOutcome::Completed)) => finish_completed_job(core, job_id)?,
         Ok(Ok(HandlerOutcome::Cancelled)) => finish_cancelled_job(core, job_id)?,
         Ok(Err(error)) => persist_terminal_failure(
@@ -836,7 +957,12 @@ pub(crate) struct ExecutorCore {
     admission_bound: usize,
     #[cfg(test)]
     before_queue_push: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
+    #[cfg(test)]
+    after_job: Mutex<Option<AfterJobHook>>,
 }
+
+#[cfg(test)]
+type AfterJobHook = Arc<dyn Fn(&str) + Send + Sync>;
 
 impl ExecutorCore {
     pub(crate) fn new(
@@ -885,6 +1011,8 @@ impl ExecutorCore {
             admission_bound,
             #[cfg(test)]
             before_queue_push: Mutex::new(None),
+            #[cfg(test)]
+            after_job: Mutex::new(None),
         })
     }
 
@@ -953,6 +1081,26 @@ impl ExecutorCore {
             hook();
         }
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn set_after_job_hook(&self, hook: AfterJobHook) -> Result<(), JobExecutorError> {
+        *self
+            .after_job
+            .lock()
+            .map_err(|_| JobExecutorError::PersistenceFailed)? = Some(hook);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn run_after_job_hook(&self, job_id: &str) {
+        let hook = match self.after_job.lock() {
+            Ok(hook) => hook.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        if let Some(hook) = hook {
+            hook(job_id);
+        }
     }
 }
 

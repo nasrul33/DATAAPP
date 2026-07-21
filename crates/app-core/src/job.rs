@@ -29,6 +29,65 @@ static AFTER_COMMIT_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<AfterCommi
     std::sync::OnceLock::new();
 
 #[cfg(test)]
+static AUDIT_INSERT_FAULT_KIND: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct AuditInsertFaultGuard {
+    kind: String,
+}
+
+#[cfg(test)]
+impl Drop for AuditInsertFaultGuard {
+    fn drop(&mut self) {
+        let mut fault = match AUDIT_INSERT_FAULT_KIND
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+        {
+            Ok(fault) => fault,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if fault.as_deref() == Some(self.kind.as_str()) {
+            *fault = None;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_audit_insert_fault_for_test(kind: &str) -> AuditInsertFaultGuard {
+    assert!(is_safe_token(kind, 120));
+    let mut fault = AUDIT_INSERT_FAULT_KIND
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("audit insert fault is available");
+    assert!(fault.is_none(), "audit insert fault is already installed");
+    *fault = Some(kind.to_owned());
+    AuditInsertFaultGuard {
+        kind: kind.to_owned(),
+    }
+}
+
+#[cfg(test)]
+fn inject_audit_insert_failure(
+    transaction: &Transaction<'_>,
+    after: &JobDescriptor,
+) -> Result<(), JobError> {
+    let should_fail = AUDIT_INSERT_FAULT_KIND
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .map_err(|_| JobError::Database(rusqlite::Error::InvalidQuery))?
+        .as_deref()
+        == Some(after.kind.as_str());
+    if should_fail {
+        transaction.execute(
+            "INSERT INTO audit_event (missing_test_column) VALUES (NULL)",
+            [],
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 fn install_after_commit_hook(hook: Option<AfterCommitHook>) {
     *AFTER_COMMIT_HOOK
         .get_or_init(|| std::sync::Mutex::new(None))
@@ -1260,6 +1319,8 @@ fn persist_mutation(
     )?;
     let before_hash = snapshot_hash(before)?;
     let after_hash = snapshot_hash(after)?;
+    #[cfg(test)]
+    inject_audit_insert_failure(transaction, after)?;
     transaction.execute(
         "INSERT INTO audit_event (
             event_id, actor, action, target_type, target_id,
