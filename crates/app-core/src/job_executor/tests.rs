@@ -310,6 +310,234 @@ impl JobHandler for GateHandler {
     }
 }
 
+struct OverBudgetHandler {
+    invocations: Arc<AtomicUsize>,
+}
+
+impl JobHandler for OverBudgetHandler {
+    fn kind(&self) -> &'static str {
+        "resource.over-budget"
+    }
+
+    fn estimate(&self) -> ResourceEstimate {
+        ResourceEstimate {
+            memory_bytes: ExecutorFixture::budget().memory_bytes + 1,
+            disk_bytes: 1,
+            duration: DurationClass::Short,
+        }
+    }
+
+    fn run(&self, _context: &mut ExecutionContext<'_>) -> Result<HandlerOutcome, JobHandlerError> {
+        self.invocations.fetch_add(1, Ordering::SeqCst);
+        Ok(HandlerOutcome::Completed)
+    }
+}
+
+struct FailingHandler;
+
+impl JobHandler for FailingHandler {
+    fn kind(&self) -> &'static str {
+        "mock.failure"
+    }
+
+    fn estimate(&self) -> ResourceEstimate {
+        PassiveHandler.estimate()
+    }
+
+    fn run(&self, _context: &mut ExecutionContext<'_>) -> Result<HandlerOutcome, JobHandlerError> {
+        Err(
+            JobHandlerError::new("MOCK_FAILED", "Pekerjaan mock gagal.", true)
+                .expect("valid test failure"),
+        )
+    }
+}
+
+struct PanicHandler;
+
+impl JobHandler for PanicHandler {
+    fn kind(&self) -> &'static str {
+        "mock.panic"
+    }
+
+    fn estimate(&self) -> ResourceEstimate {
+        PassiveHandler.estimate()
+    }
+
+    fn run(&self, _context: &mut ExecutionContext<'_>) -> Result<HandlerOutcome, JobHandlerError> {
+        panic!("sentinel-secret-must-not-persist")
+    }
+}
+
+#[test]
+fn over_budget_job_fails_preflight_without_invoking_handler() {
+    let mut fixture = ExecutorFixture::new("over-budget-failure");
+    let rejected = fixture.enqueue("resource.over-budget");
+    let following = fixture.enqueue("following.success");
+    let rejected_invocations = Arc::new(AtomicUsize::new(0));
+    let following_invocations = Arc::new(AtomicUsize::new(0));
+    let (following_sender, following_receiver) = mpsc::sync_channel(1);
+    let executor = JobExecutor::new(
+        Arc::clone(fixture.store()),
+        vec![
+            Arc::new(OverBudgetHandler {
+                invocations: Arc::clone(&rejected_invocations),
+            }),
+            Arc::new(CountingHandler {
+                kind: "following.success",
+                invocations: Arc::clone(&following_invocations),
+                estimates: None,
+                entered: Some(following_sender),
+            }),
+        ],
+        ExecutorFixture::config(2),
+        Arc::new(FixedClock),
+    )
+    .expect("start executor");
+
+    executor
+        .submit(&rejected.job_id)
+        .expect("submit over-budget job");
+    executor
+        .submit(&following.job_id)
+        .expect("submit following job");
+    following_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("following handler proves preflight completed");
+    assert!(executor.core.queue.close_and_drain().is_empty());
+    executor.workers[0]
+        .completed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("worker completes after preflight failure");
+
+    let preflight = fixture
+        .store()
+        .get(&rejected.job_id)
+        .expect("preflight failure");
+    assert_eq!(preflight.status, "FAILED");
+    assert_eq!(preflight.error_code.as_deref(), Some("RESOURCE_LIMIT"));
+    assert_eq!(
+        preflight.error_message.as_deref(),
+        Some("Pekerjaan melebihi batas resource yang dikonfigurasi.")
+    );
+    assert_eq!(preflight.error_retriable, Some(false));
+    assert_eq!(rejected_invocations.load(Ordering::SeqCst), 0);
+    assert_eq!(following_invocations.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn typed_handler_failure_preserves_validated_safe_fields() {
+    let mut fixture = ExecutorFixture::new("typed-handler-failure");
+    let failed_job = fixture.enqueue("mock.failure");
+    let following = fixture.enqueue("following.success");
+    let following_invocations = Arc::new(AtomicUsize::new(0));
+    let (following_sender, following_receiver) = mpsc::sync_channel(1);
+    let executor = JobExecutor::new(
+        Arc::clone(fixture.store()),
+        vec![
+            Arc::new(FailingHandler),
+            Arc::new(CountingHandler {
+                kind: "following.success",
+                invocations: Arc::clone(&following_invocations),
+                estimates: None,
+                entered: Some(following_sender),
+            }),
+        ],
+        ExecutorFixture::config(2),
+        Arc::new(FixedClock),
+    )
+    .expect("start executor");
+
+    executor
+        .submit(&failed_job.job_id)
+        .expect("submit failing job");
+    executor
+        .submit(&following.job_id)
+        .expect("submit following job");
+    following_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("following handler proves failure completed");
+    assert!(executor.core.queue.close_and_drain().is_empty());
+    executor.workers[0]
+        .completed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("worker completes after typed failure");
+
+    let failed = fixture
+        .store()
+        .get(&failed_job.job_id)
+        .expect("typed failure");
+    assert_eq!(failed.status, "FAILED");
+    assert_eq!(failed.error_code.as_deref(), Some("MOCK_FAILED"));
+    assert_eq!(
+        failed.error_message.as_deref(),
+        Some("Pekerjaan mock gagal.")
+    );
+    assert_eq!(failed.error_retriable, Some(true));
+    assert_eq!(following_invocations.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn panic_is_sanitized_and_same_worker_runs_following_job() {
+    let mut fixture = ExecutorFixture::new("panic-containment");
+    let panicking_job = fixture.enqueue("mock.panic");
+    let following_job = fixture.enqueue("following.success");
+    let following_invocations = Arc::new(AtomicUsize::new(0));
+    let (following_sender, following_receiver) = mpsc::sync_channel(1);
+    let executor = JobExecutor::new(
+        Arc::clone(fixture.store()),
+        vec![
+            Arc::new(PanicHandler),
+            Arc::new(CountingHandler {
+                kind: "following.success",
+                invocations: Arc::clone(&following_invocations),
+                estimates: None,
+                entered: Some(following_sender),
+            }),
+        ],
+        ExecutorFixture::config(2),
+        Arc::new(FixedClock),
+    )
+    .expect("start executor");
+
+    executor
+        .submit(&panicking_job.job_id)
+        .expect("submit panicking job");
+    executor
+        .submit(&following_job.job_id)
+        .expect("submit following job");
+    following_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("same worker survives panic");
+    assert!(executor.core.queue.close_and_drain().is_empty());
+    executor.workers[0]
+        .completed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("worker completes after contained panic");
+
+    let panicked = fixture
+        .store()
+        .get(&panicking_job.job_id)
+        .expect("panicked job");
+    let following = fixture
+        .store()
+        .get(&following_job.job_id)
+        .expect("following job");
+    assert_eq!(panicked.status, "FAILED");
+    assert_eq!(panicked.error_code.as_deref(), Some("OPERATION_FAILED"));
+    assert_eq!(
+        panicked.error_message.as_deref(),
+        Some("Pekerjaan gagal karena kesalahan operasi internal.")
+    );
+    assert!(!panicked
+        .error_message
+        .as_deref()
+        .unwrap_or_default()
+        .contains("sentinel"));
+    assert_eq!(panicked.error_retriable, Some(false));
+    assert_eq!(following.status, "SUCCEEDED");
+    assert_eq!(following_invocations.load(Ordering::SeqCst), 1);
+}
+
 #[test]
 fn mock_job_persists_progress_and_succeeds() {
     let mut fixture = ExecutorFixture::new("mock-success");

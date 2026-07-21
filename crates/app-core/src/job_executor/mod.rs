@@ -13,9 +13,12 @@ use time::OffsetDateTime;
 use self::queue::{BoundedQueue, PushError};
 use self::resource::{ResourceBudget, ResourceEstimate, ResourceLedger};
 use crate::job::{
-    JobDescriptor, JobError, JobErrorKind, JobProgressUpdateRequest, JobStatus, JobStore,
-    JobTransitionRequest,
+    JobDescriptor, JobError, JobErrorKind, JobFailureRequest, JobProgressUpdateRequest, JobStatus,
+    JobStore, JobTransitionRequest,
 };
+
+const RESOURCE_LIMIT_MESSAGE: &str = "Pekerjaan melebihi batas resource yang dikonfigurasi.";
+const PANIC_FAILURE_MESSAGE: &str = "Pekerjaan gagal karena kesalahan operasi internal.";
 
 #[derive(Debug, Clone)]
 pub struct JobExecutorConfig {
@@ -555,10 +558,19 @@ fn execute_job(core: &ExecutorCore, job_id: &str) -> Result<(), JobExecutorError
         .get(queued.kind.as_str())
         .cloned()
         .ok_or(JobExecutorError::HandlerNotFound)?;
-    let _reservation = core
-        .resource_ledger
-        .reserve(handler.estimate())
-        .map_err(|_| JobExecutorError::PreflightRejected)?;
+    let Ok(reservation) = core.resource_ledger.reserve(handler.estimate()) else {
+        return persist_terminal_failure(
+            core,
+            job_id,
+            TerminalFailure {
+                code: "RESOURCE_LIMIT",
+                message: RESOURCE_LIMIT_MESSAGE,
+                retriable: false,
+            },
+            FailureOrigin::Preflight,
+        );
+    };
+    let _reservation = reservation;
     let started_at = core
         .clock
         .now()
@@ -579,12 +591,110 @@ fn execute_job(core: &ExecutorCore, job_id: &str) -> Result<(), JobExecutorError
         clock: core.clock.as_ref(),
     };
 
-    match handler.run(&mut context) {
-        Ok(HandlerOutcome::Completed) => finish_completed_job(core, job_id)?,
-        Ok(HandlerOutcome::Cancelled) => finish_cancelled_job(core, job_id)?,
-        Err(_) => {}
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler.run(&mut context))) {
+        Ok(Ok(HandlerOutcome::Completed)) => finish_completed_job(core, job_id)?,
+        Ok(Ok(HandlerOutcome::Cancelled)) => finish_cancelled_job(core, job_id)?,
+        Ok(Err(error)) => persist_terminal_failure(
+            core,
+            job_id,
+            TerminalFailure {
+                code: error.code(),
+                message: error.message(),
+                retriable: error.retriable(),
+            },
+            FailureOrigin::Handler,
+        )?,
+        Err(_) => persist_terminal_failure(
+            core,
+            job_id,
+            TerminalFailure {
+                code: "OPERATION_FAILED",
+                message: PANIC_FAILURE_MESSAGE,
+                retriable: false,
+            },
+            FailureOrigin::Handler,
+        )?,
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+struct TerminalFailure<'a> {
+    code: &'a str,
+    message: &'a str,
+    retriable: bool,
+}
+
+#[derive(Clone, Copy)]
+enum FailureOrigin {
+    Preflight,
+    Handler,
+}
+
+impl FailureOrigin {
+    const fn accepts(self, status: JobStatus) -> bool {
+        matches!(
+            (self, status),
+            (Self::Preflight, JobStatus::Queued) | (Self::Handler, JobStatus::Running)
+        )
+    }
+}
+
+fn persist_terminal_failure(
+    core: &ExecutorCore,
+    job_id: &str,
+    failure: TerminalFailure<'_>,
+    origin: FailureOrigin,
+) -> Result<(), JobExecutorError> {
+    let descriptor = core
+        .store
+        .get(job_id)
+        .map_err(|error| map_persistence_error(&error))?;
+    fail_from_snapshot(core, &descriptor, failure, origin, true)
+}
+
+fn fail_from_snapshot(
+    core: &ExecutorCore,
+    descriptor: &JobDescriptor,
+    failure: TerminalFailure<'_>,
+    origin: FailureOrigin,
+    reconcile_once: bool,
+) -> Result<(), JobExecutorError> {
+    let status =
+        JobStatus::parse(&descriptor.status).map_err(|error| map_persistence_error(&error))?;
+    if status == JobStatus::Cancelling {
+        return complete_cancellation_from_snapshot(core, descriptor);
+    }
+    if status.is_terminal() {
+        return Ok(());
+    }
+    if !origin.accepts(status) {
+        return Err(JobExecutorError::PersistenceConflict);
+    }
+
+    let failed_at = core
+        .clock
+        .now()
+        .map_err(|_| JobExecutorError::PersistenceFailed)?;
+    let request = JobFailureRequest {
+        correlation_id: descriptor.correlation_id.clone(),
+        error_code: failure.code.to_owned(),
+        error_message: failure.message.to_owned(),
+        error_retriable: failure.retriable,
+        expected_revision: descriptor.revision,
+        job_id: descriptor.job_id.clone(),
+    };
+    match core.store.fail_at(&request, &failed_at) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == JobErrorKind::RevisionConflict && reconcile_once => {
+            let refreshed = core
+                .store
+                .get(&descriptor.job_id)
+                .map_err(|read_error| map_persistence_error(&read_error))?;
+            fail_from_snapshot(core, &refreshed, failure, origin, false)
+        }
+        Err(error) => Err(map_persistence_error(&error)),
+    }
 }
 
 fn reconcile_start_conflict(core: &ExecutorCore, job_id: &str) -> Result<(), JobExecutorError> {
