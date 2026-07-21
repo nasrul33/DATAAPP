@@ -38,6 +38,12 @@ Exit gate: clean clone builds, tests, launches, and verifies engine handshake.
 - Resource preflight and error envelope.
 - UI job center.
 
+| Task | Scope | Main paths | Acceptance |
+|---|---|---|---|
+| T-0110 | Persistent job state foundation | `crates/app-core`, `crates/filesystem`, `migrations/metadata-sqlite`, `packages/contracts` | schema-1 projects upgrade explicitly; job state/history survives restart; illegal/concurrent transitions fail atomically; interrupted active jobs remain traceable |
+
+T-0110 hanya membangun persistence foundation: migration eksplisit schema 1 ke 2, snapshot `job` plus riwayat `job_event` append-only, optimistic revision/CAS, cancellation kooperatif idempotent, dan recovery `FAILED/INTERRUPTED`. Background executor, Tauri job commands/events, resource preflight, retry orchestration, dan UI job center tetap dimiliki task lanjutan EPIC-110.
+
 Exit gate: mock long job can run, cancel, fail, recover, and remain traceable after restart.
 
 ## Phase 2 — Data ingestion and profiling
