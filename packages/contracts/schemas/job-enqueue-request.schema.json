@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/job/job-enqueue-request.schema.json",
+  "title": "JobEnqueueRequest",
+  "description": "Safe flat request to persist a newly queued background job.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["job_id", "kind", "correlation_id"],
+  "properties": {
+    "job_id": { "description": "UUID v7 identity assigned before the enqueue mutation.", "type": "string" },
+    "kind": { "description": "Stable job kind identifier.", "type": "string" },
+    "correlation_id": { "description": "UUID v7 trace identity for the atomic enqueue mutation.", "type": "string" },
+    "progress_total": { "description": "Optional known total progress amount.", "type": "integer" },
+    "progress_unit": { "description": "Optional safe progress measurement unit.", "type": "string" }
+  }
+}

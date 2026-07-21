@@ -7,6 +7,11 @@ import type {
   EngineError,
   EngineHandshakeRequest,
   EngineHandshakeResponse,
+  JobDescriptor,
+  JobEnqueueRequest,
+  JobFailureRequest,
+  JobProgressUpdateRequest,
+  JobTransitionRequest,
   ProjectCreateRequest,
   ProjectDescriptor,
   ProjectManifest,
@@ -148,5 +153,61 @@ describe("engine handshake contracts", () => {
 
     expect(response.healthy).toBe(true);
     expect(error.correlation_id).toBe(request.request_id);
+  });
+});
+
+describe("job contracts", () => {
+  it("represents persistent job lifecycle payloads", () => {
+    const descriptor = {
+      correlation_id: "00000000-0000-7000-8000-000000000211",
+      created_at: "2026-07-20T12:00:00Z",
+      job_id: "00000000-0000-7000-8000-000000000211",
+      kind: "system.mock_long",
+      progress_current: 0,
+      progress_message: "Pekerjaan menunggu untuk diproses.",
+      progress_phase: "queued",
+      progress_total: 100,
+      progress_unit: "step",
+      project_id: "00000000-0000-7000-8000-000000000210",
+      revision: 1,
+      status: "QUEUED",
+      updated_at: "2026-07-20T12:00:00Z",
+    } satisfies JobDescriptor;
+    const enqueue = {
+      correlation_id: "00000000-0000-7000-8000-000000000212",
+      job_id: "00000000-0000-7000-8000-000000000212",
+      kind: descriptor.kind,
+      progress_total: 100,
+      progress_unit: "step",
+    } satisfies JobEnqueueRequest;
+    const transition = {
+      correlation_id: "00000000-0000-7000-8000-000000000213",
+      expected_revision: 1,
+      job_id: "00000000-0000-7000-8000-000000000213",
+    } satisfies JobTransitionRequest;
+    const progress = {
+      correlation_id: "00000000-0000-7000-8000-000000000214",
+      current: 0,
+      expected_revision: 1,
+      job_id: "00000000-0000-7000-8000-000000000214",
+      message: "Pekerjaan sedang menyiapkan langkah pertama.",
+      phase: "queued",
+      total: 100,
+      unit: "step",
+    } satisfies JobProgressUpdateRequest;
+    const failure = {
+      correlation_id: "00000000-0000-7000-8000-000000000215",
+      error_code: "JOB_EXECUTION_FAILED",
+      error_message: "Pekerjaan tidak dapat diselesaikan. Silakan coba lagi.",
+      error_retriable: true,
+      expected_revision: 1,
+      job_id: "00000000-0000-7000-8000-000000000215",
+    } satisfies JobFailureRequest;
+
+    expect(descriptor.status).toBe("QUEUED");
+    expect(enqueue.progress_total).toBe(100);
+    expect(transition.expected_revision).toBe(1);
+    expect(progress.current).toBe(0);
+    expect(failure.error_retriable).toBe(true);
   });
 });

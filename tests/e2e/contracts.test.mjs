@@ -16,6 +16,11 @@ const generatedContracts = [
   ["project-manifest", "project_manifest", "ProjectManifest"],
   ["project-open-request", "project_open_request", "ProjectOpenRequest"],
   ["runtime-log-event", "runtime_log_event", "RuntimeLogEvent"],
+  ["job-descriptor", "job_descriptor", "JobDescriptor"],
+  ["job-enqueue-request", "job_enqueue_request", "JobEnqueueRequest"],
+  ["job-failure-request", "job_failure_request", "JobFailureRequest"],
+  ["job-progress-update-request", "job_progress_update_request", "JobProgressUpdateRequest"],
+  ["job-transition-request", "job_transition_request", "JobTransitionRequest"],
 ];
 
 test("canonical schemas generate deterministically into three languages", async () => {
@@ -39,5 +44,27 @@ test("canonical schemas generate deterministically into three languages", async 
     const contract = generatedContracts[Math.floor(index / 3)];
     assert.ok(contract);
     assert.match(source, new RegExp(contract[2]));
+  }
+});
+
+test("job contract fixtures are valid JSON documents", async () => {
+  const fixtureNames = [
+    "job-descriptor",
+    "job-enqueue-request",
+    "job-transition-request",
+    "job-progress-update-request",
+    "job-failure-request",
+  ];
+
+  const fixtures = await Promise.all(
+    fixtureNames.map(async (fixtureName) => {
+      const source = await readFile(`packages/contracts/fixtures/${fixtureName}.valid.json`, "utf8");
+      return JSON.parse(source);
+    }),
+  );
+
+  for (const fixture of fixtures) {
+    assert.equal(typeof fixture, "object");
+    assert.notEqual(fixture, null);
   }
 });

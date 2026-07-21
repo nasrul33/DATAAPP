@@ -51,3 +51,17 @@ Crate `teratai-contracts` di `packages/contracts/rust` menjadi dependency bersam
 ## Project contracts
 
 `ProjectCreateRequest`, `ProjectOpenRequest`, `CorrelationRequest`, `ProjectManifest`, dan `ProjectDescriptor` membentuk lifecycle project native. `DesktopError` menjadi error envelope aman pada batas Tauri. Contract hanya mendeskripsikan wire/storage shape; validasi UUID v7, absolute `.teratai` path, bounded manifest, schema compatibility, SQLite integrity, fingerprint, serta sanitasi error tetap diwajibkan pada Rust sebelum data dipercaya UI.
+
+## Persistent job contracts
+
+T-0110 menambahkan lima kontrak flat dan additive berikut. Seluruh field optional direpresentasikan sebagai property optional karena generator revision 1 tidak mendukung union dengan `null`.
+
+| Contract | Required fields | Optional fields |
+|---|---|---|
+| `JobDescriptor` | `job_id`, `project_id`, `kind`, `status`, `correlation_id`, `revision`, `created_at`, `updated_at`, `progress_current` | `started_at`, `finished_at`, `progress_total`, `progress_unit`, `progress_phase`, `progress_message`, `error_code`, `error_message`, `error_retriable` |
+| `JobEnqueueRequest` | `job_id`, `kind`, `correlation_id` | `progress_total`, `progress_unit` |
+| `JobTransitionRequest` | `job_id`, `correlation_id`, `expected_revision` | - |
+| `JobProgressUpdateRequest` | `job_id`, `correlation_id`, `expected_revision`, `current`, `phase`, `message` | `total`, `unit` |
+| `JobFailureRequest` | `job_id`, `correlation_id`, `expected_revision`, `error_code`, `error_message`, `error_retriable` | - |
+
+Schema tetap `additionalProperties: true` untuk kompatibilitas additive. Generator tidak memvalidasi enum atau format runtime: Rust wajib memvalidasi UUID v7 lowercase, enam nilai status, revision positif, timestamp UTC, token aman, progress bounds, dan teks aman terbatas sebelum persistence atau konsumsi tepercaya. Kontrak ini belum mengekspos page envelope, executor, command/event Tauri, atau UI job center.

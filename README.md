@@ -7,7 +7,7 @@ Target utama: Windows, Tauri 2.x, Python 3.12
 
 ## Prasyarat
 
-Toolchain yang telah diverifikasi untuk T-0001 sampai T-0101:
+Toolchain yang telah diverifikasi untuk T-0001 sampai T-0110:
 
 - Node.js 24.17.0 atau kompatibel dengan `>=24.0.0`.
 - pnpm 11.9.0.
@@ -173,6 +173,21 @@ Verifikasi lifecycle storage secara terisolasi:
 cargo test -p teratai-filesystem -p teratai-app-core --locked
 ```
 
+## Persistent job state
+
+T-0110 menaikkan metadata SQLite project baru ke schema 2 dan menyediakan upgrade eksplisit untuk project schema 1 melalui `ProjectService::upgrade`. `project.open` dan `project.validate` tetap read-only: keduanya tidak melakukan migration terselubung. Upgrade membuat backup schema 1 dan recovery marker yang mengikat digest/panjang backup serta stage aktual, menerapkan migration SQLite dalam transaksi immediate, menulis manifest schema 2 secara atomik, lalu memvalidasi kembali identitas, fingerprint, integrity, dan rantai audit sebelum artifact recovery dibersihkan.
+
+Schema 2 menyimpan snapshot `job`, riwayat `job_event` append-only, dan `audit_event` terkait dalam transaksi yang sama. State machine menggunakan optimistic revision/CAS, termasuk antar-handle `JobStore` dalam proses yang sama; shared operation guard menutup window commit-ke-identity-refresh agar peer reader tidak melihat false corruption. Progress hanya dapat berubah pada `RUNNING`/`CANCELLING`; permintaan cancellation bersifat kooperatif dan idempotent; recovery restart mengubah pekerjaan aktif menjadi `FAILED` dengan kode `INTERRUPTED` yang retriable. Setiap descriptor hasil baca divalidasi kembali sebagai data tidak tepercaya sebelum digunakan atau dikembalikan. Snapshot dan history dapat dibuka kembali setelah restart.
+
+Tidak ada destructive downgrade dari schema 2 ke schema 1. Binary lama harus menolak schema 2; rollback mempertahankan project, job, dan seluruh audit history, lalu menggunakan binary yang mendukung schema 2. Jika upgrade gagal sebelum tervalidasi, backup schema 1 dipulihkan byte-for-byte atau project tetap recovery-required.
+
+T-0110 belum menjalankan pekerjaan di background dan tidak menambahkan executor, command/event Tauri untuk job, resource preflight, retry orchestration, maupun UI job center. Verifikasi foundation ini secara terisolasi:
+
+```powershell
+cargo test -p teratai-filesystem -p teratai-app-core --locked
+pnpm contracts:check
+```
+
 ## Desktop project lifecycle
 
 T-0101 menghubungkan project core ke UI melalui command Tauri typed `project_create`, `project_open`, `project_validate`, `project_current`, dan `project_close`. Buat/buka proyek selalu memakai dialog sistem; capability main window dibatasi ke `dialog:allow-open` dan `dialog:allow-save`.
@@ -239,6 +254,6 @@ tests/golden              Analytics golden test boundary
 
 ## Batas implementasi saat ini
 
-T-0001 sampai T-0007 menyelesaikan foundation runtime. T-0100 dan T-0101 memulai Phase 1 dengan storage project transaksional, metadata SQLite baseline, typed desktop commands, system file picker, dan UI lifecycle lengkap. Operasi analitik serta job runtime belum diimplementasikan; sidecar Python tetap dependency-free.
+T-0001 sampai T-0007 menyelesaikan foundation runtime. T-0100 dan T-0101 memulai Phase 1 dengan storage project transaksional, typed desktop commands, system file picker, dan UI lifecycle lengkap. T-0110 menambahkan metadata schema 2 dan persistent job state foundation, tetapi belum menambahkan background executor atau UI job. Operasi analitik belum diimplementasikan; sidecar Python tetap dependency-free.
 
 MVP berakhir ketika pengguna dapat mengimpor Excel/CSV, melakukan profiling, cleaning, transformasi, join, deteksi duplikasi/outlier/rule, melihat visualisasi, menyimpan workflow, menjalankannya ulang, dan mengekspor hasil beserta audit trail.

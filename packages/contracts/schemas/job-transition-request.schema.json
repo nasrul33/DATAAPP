@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/job/job-transition-request.schema.json",
+  "title": "JobTransitionRequest",
+  "description": "Safe optimistic-concurrency request for one persistent job state transition.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["job_id", "correlation_id", "expected_revision"],
+  "properties": {
+    "job_id": { "description": "UUID v7 identity of the job to transition.", "type": "string" },
+    "correlation_id": { "description": "UUID v7 trace identity for the atomic transition mutation.", "type": "string" },
+    "expected_revision": { "description": "Revision required to prevent a lost concurrent update.", "type": "integer" }
+  }
+}

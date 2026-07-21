@@ -47,6 +47,7 @@
 | REQ-ACC-01 accurate profile | Polars + DuckDB reference | EPIC-220 | profile golden suite |
 | REQ-TRACE-01 full lineage | operation/version entities | EPIC-100/300 | lineage integration tests |
 | REQ-WF-01 rerunnable workflow | DAG execution planner | EPIC-400/410 | restart/rerun e2e |
+| REQ-JOB-01 persistent, cancellable lifecycle | schema-2 job snapshot + append-only history + CAS | T-0110 / EPIC-110 | migration, transition-matrix, atomicity, cancellation, recovery, reopen tests |
 
 ## Open decisions
 - Exact installer/update strategy.
@@ -69,6 +70,7 @@ Codex must read AGENTS, Product, Architecture, Primitives, IPC Contracts, curren
 | T-0007 | Completed | 2026-07-20 | Canonical structured emitters cover desktop, native, and engine layers; the supervised Rust-Python trace preserves one UUID v7 correlation with deterministic sequence and bounded capture |
 | T-0100 | Completed | 2026-07-20 | Transactional project create/open/validate uses recovery-marked staging, atomic publication, SQLite schema 1, manifest fingerprint validation, and append-only initial audit history |
 | T-0101 | Completed | 2026-07-20 | Typed Tauri lifecycle commands, system path selection, safe desktop error mapping, in-memory active session, and complete loading/empty/permission/recovery/error/active UI states |
+| T-0110 | Completed | 2026-07-21 | Explicit schema-1-to-2 upgrade, persistent job snapshot and append-only history, optimistic CAS, idempotent cancellation, restart recovery to `FAILED/INTERRUPTED`, and cross-language flat contracts |
 
 ## T-0001 decisions and deviations
 | ID | Decision/deviation | Reason | Follow-up |
@@ -169,3 +171,24 @@ T-0100 does not expose Tauri commands, file pickers, or UI project actions. It d
 | DEC-F046 | Make recovery/corruption UI non-destructive and omit automatic retry/delete actions | Preserve user data when recovery markers or integrity checks fail | A future recovery workflow requires its own audited design and tests |
 
 T-0101 closes the UI/filesystem-boundary follow-ups in DEC-F022, DEC-F035, DEC-F036, and DEC-F040. No analytics operation, job runtime, source import, schema migration, or automatic project recovery was added.
+
+## T-0110 decisions and deviations
+
+| ID | Decision/deviation | Reason | Follow-up |
+|---|---|---|---|
+| DEC-F047 | Keep project open/validate read-only for schema 1 and 2; require explicit schema-1-to-2 upgrade | Prevent an ordinary read operation from mutating user data and make migration consent/failure state observable | Desktop upgrade command and UX belong to a separately owned integration task |
+| DEC-F048 | Persist a mutable `job` snapshot plus immutable `job_event` history and hash-linked `audit_event` in one immediate transaction | Support efficient reads while preserving an auditable lifecycle and all-or-nothing mutation evidence | Consumers must never update the snapshot outside `JobStore` |
+| DEC-F049 | Require positive optimistic `revision`/CAS for every material mutation after enqueue | Prevent lost updates from concurrent/stale callers; stale requests write no partial events | A future transport must expose typed revision-conflict handling |
+| DEC-F050 | Model cancellation as cooperative and idempotent via `CANCELLING`, with completion only after acknowledgement | A request must not falsely report that background work has stopped | Executor integration must acknowledge the cancellation token before calling completion |
+| DEC-F051 | Recover persisted `RUNNING` and `CANCELLING` jobs as retriable `FAILED/INTERRUPTED`, leaving `QUEUED` and terminal jobs unchanged | Preserve restart traceability without pretending interrupted work continued or succeeded | Future retry policy may create a new execution attempt; it must not reopen terminal snapshots |
+| DEC-F052 | Keep executor, engine dispatch, resource preflight, retry orchestration, Tauri job commands/events, and UI job center out of T-0110 | This reviewable task owns persistence correctness only | Complete the remaining EPIC-110 runtime and UX in explicit follow-up tasks |
+| DEC-F053 | Use stable safe-Rust durability sequence `file sync_all -> atomic rename -> directory sync_all` on Windows | Stable `std` does not expose exact `MOVEFILE_WRITE_THROUGH`; this is the best available no-unsafe sequence and must not be described as that Windows flag | Revisit only through a separately reviewed OS API boundary if stronger power-loss semantics become mandatory |
+| DEC-F054 | Accept that stable safe Rust cannot prove Windows hardlink count or full by-handle file ID; mitigate with reparse rejection, owned/pinned handles, path/handle identity checks, deny-delete sharing, and content proofs | Option B preserves the no-new-dependency/no-unsafe boundary while making the residual explicit | A future hardening task may add an audited Windows API boundary; do not claim full hardlink/file-ID proof before then |
+| DEC-F055 | Bind explicit-upgrade recovery markers to both backup names, lengths, content digests, and durable stages | A crash must leave enough bounded evidence to identify the retained recovery proof and irreversible boundary without in-memory state | Recovery tooling must parse and verify the marker before offering repair actions |
+| DEC-F056 | Share one serialized operation guard and authorized mutable metadata identity across independent in-process `JobStore` handles while retaining a pinned no-follow handle per store | The guard spans read verification/query and write verification/transaction/identity refresh, so a peer cannot observe the commit-to-refresh window as false corruption and stale writes still reach optimistic CAS | Cross-process coordination remains outside T-0110; external replacement/tamper stays fail-closed |
+| DEC-F057 | Revalidate every persisted job descriptor after row decoding and before read, mutation, or recovery use | SQLite integrity alone does not establish safe text, exact boolean encoding, UUID/timeline, or lifecycle cross-field semantics | Future schema changes must update both SQL checks and the centralized Rust trust-boundary validator |
+| DEC-F058 | Require manifest authorization events to have strictly increasing global audit sequences plus exact hash linkage, not adjacent sequence numbers | Unrelated job audit events may legitimately interleave between project manifest authorizations | A future schema migration must preserve the same linked-chain rule or introduce an explicit chain ordinal |
+
+Migration/rollback: schema 2 has no destructive downgrade. Failed upgrade restores and revalidates byte-identical schema-1 control files; if restoration proof fails, backup/marker evidence remains and normal open is blocked. A successfully upgraded project must be retained and opened with a schema-2-capable binary; job/audit history is never deleted to regain compatibility.
+
+T-0110 adds no runtime dependency and no executor/UI behavior. No conflict with confirmed product or architecture decisions was identified; DEC-F053 and DEC-F054 record the user-approved Option B Windows residuals explicitly.

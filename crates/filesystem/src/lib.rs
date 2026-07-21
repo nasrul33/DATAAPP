@@ -1,5 +1,12 @@
 #![doc = "Safe local filesystem capability boundary."]
 
+mod project_upgrade;
+
+pub use project_upgrade::{
+    begin_project_upgrade, pin_project_metadata, PinnedProjectMetadata, PinnedProjectOperation,
+    ProjectUpgrade, ProjectUpgradeBackupProof, ProjectUpgradeFileProof,
+};
+
 use std::ffi::OsStr;
 use std::fmt::{self, Display, Formatter};
 use std::fs::{self, File, OpenOptions};
@@ -239,6 +246,15 @@ pub fn begin_project_creation(
 /// Returns an error when the root is non-canonical, recovery is pending, or a
 /// required directory/file is missing.
 pub fn validate_project_layout(root: &Path) -> Result<ProjectLayout, FilesystemError> {
+    let supplied_root_metadata = fs::symlink_metadata(root)?;
+    if supplied_root_metadata.file_type().is_symlink()
+        || !supplied_root_metadata.is_dir()
+        || is_reparse_point(&supplied_root_metadata)
+    {
+        return Err(FilesystemError::InvalidLayout(
+            "project root must be a non-linked directory".to_owned(),
+        ));
+    }
     let canonical_root = root.canonicalize()?;
     if !canonical_root.is_dir() {
         return Err(FilesystemError::InvalidLayout(
@@ -249,10 +265,28 @@ pub fn validate_project_layout(root: &Path) -> Result<ProjectLayout, FilesystemE
     if marker.exists() {
         return Err(FilesystemError::RecoveryRequired(marker));
     }
+    for recovery_artifact in [
+        canonical_root.join(project_upgrade::UPGRADE_MARKER_FILE),
+        canonical_root
+            .join("recovery")
+            .join(project_upgrade::METADATA_BACKUP_FILE),
+        canonical_root
+            .join("recovery")
+            .join(project_upgrade::MANIFEST_BACKUP_FILE),
+        canonical_root
+            .join("recovery")
+            .join(project_upgrade::UPGRADE_LOCK_FILE),
+    ] {
+        match fs::symlink_metadata(&recovery_artifact) {
+            Ok(_) => return Err(FilesystemError::RecoveryRequired(recovery_artifact)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(FilesystemError::Io(error)),
+        }
+    }
     for directory in REQUIRED_PROJECT_DIRECTORIES {
         let entry = canonical_root.join(directory);
         let metadata = fs::symlink_metadata(&entry)?;
-        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        if metadata.file_type().is_symlink() || !metadata.is_dir() || is_reparse_point(&metadata) {
             return Err(FilesystemError::InvalidLayout(format!(
                 "required directory is missing or linked: {directory}"
             )));
@@ -261,7 +295,7 @@ pub fn validate_project_layout(root: &Path) -> Result<ProjectLayout, FilesystemE
     for file in [MANIFEST_FILE, METADATA_FILE] {
         let entry = canonical_root.join(file);
         let metadata = fs::symlink_metadata(&entry)?;
-        if metadata.file_type().is_symlink() || !metadata.is_file() {
+        if metadata.file_type().is_symlink() || !metadata.is_file() || is_reparse_point(&metadata) {
             return Err(FilesystemError::InvalidLayout(format!(
                 "required file is missing or linked: {file}"
             )));
@@ -279,7 +313,7 @@ pub fn validate_project_layout(root: &Path) -> Result<ProjectLayout, FilesystemE
 /// Returns an error when metadata cannot be read or exceeds the requested bound.
 pub fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, FilesystemError> {
     let metadata = fs::symlink_metadata(path)?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
+    if metadata.file_type().is_symlink() || !metadata.is_file() || is_reparse_point(&metadata) {
         return Err(FilesystemError::InvalidLayout(
             "bounded control file must be a regular file".to_owned(),
         ));
@@ -301,6 +335,19 @@ pub fn read_bounded(path: &Path, limit: u64) -> Result<Vec<u8>, FilesystemError>
         });
     }
     Ok(contents)
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
 }
 
 fn atomic_write(path: &Path, contents: &[u8], token: &str) -> Result<(), FilesystemError> {

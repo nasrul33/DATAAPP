@@ -19,6 +19,7 @@
 - T-0007 adds `RuntimeLogEvent` as the canonical structured runtime trace shared by TypeScript, Rust, and Python.
 - T-0100 adds project create request, manifest, and validated descriptor contracts.
 - T-0101 adds correlation/open request and desktop error contracts, then exposes the lifecycle through typed Tauri commands.
+- T-0110 adds five flat persistent-job contracts: `JobDescriptor`, `JobEnqueueRequest`, `JobTransitionRequest`, `JobProgressUpdateRequest`, and `JobFailureRequest`.
 
 ## Project lifecycle contract
 
@@ -29,6 +30,53 @@
 The desktop adapter exposes `project_create`, `project_open`, `project_validate`, `project_current`, and `project_close`. Every request carries a UUID v7 `correlation_id`; create/open/validate return a trusted `ProjectDescriptor`, current returns the active descriptor or `null`, and close clears only the in-memory session. Native failures cross the boundary as `DesktopError` with a stable code, localized safe message, retriable flag, correlation ID, and bounded field errors. Raw database errors and absolute paths are never returned as error detail.
 
 Project selection uses the operating-system dialog. Only `dialog:allow-open` and `dialog:allow-save` are granted to the main window; arbitrary frontend filesystem access is not enabled.
+
+### Metadata schema 1 to 2
+
+Open and validate are read-only for supported metadata schema 1 and 2. Upgrade is explicit through the native project service; it is never an open-time side effect. Before mutation, schema-1 `metadata.sqlite` and `manifest.json` are copied and synced as recovery proofs and a bounded marker blocks normal open. Migration 0002, its `schema_migrations` row, and the hash-linked `project.metadata_migrated` audit event commit in one `BEGIN IMMEDIATE` transaction; the schema-2 manifest is then atomically replaced and the complete project is revalidated before recovery artifacts are cleared.
+
+Marker upgrade mengikat project/correlation ID, versi sumber/target, manifest hash sebelum/sesudah, nama/panjang/digest kedua backup, dan stage `BACKUP_PREPARED`, `DATABASE_MIGRATED`, `MANIFEST_PUBLISHED`, atau `VALIDATED_READY_TO_COMMIT`. Setiap stage ditulis secara bounded dan durable pada batas irreversible agar recovery tidak bergantung pada state in-memory.
+
+There is no destructive schema-2-to-1 downgrade. Older binaries must reject schema 2. A failed upgrade restores both schema-1 control files byte-for-byte and revalidates them; if that proof fails, artifacts remain and the project stays recovery-required.
+
+## Persistent job contracts (T-0110)
+
+All five contracts are flat, schema-first, additive (`additionalProperties: true`), and generator-revision-1 compatible. Optional persistence values are optional properties rather than nested/nullable union types. Runtime validation remains native because generator revision 1 does not emit enums or format validators.
+
+| Contract | Required | Optional |
+|---|---|---|
+| `JobDescriptor` | `job_id`, `project_id`, `kind`, `status`, `correlation_id`, `revision`, `created_at`, `updated_at`, `progress_current` | `started_at`, `finished_at`, `progress_total`, `progress_unit`, `progress_phase`, `progress_message`, `error_code`, `error_message`, `error_retriable` |
+| `JobEnqueueRequest` | `job_id`, `kind`, `correlation_id` | `progress_total`, `progress_unit` |
+| `JobTransitionRequest` | `job_id`, `correlation_id`, `expected_revision` | - |
+| `JobProgressUpdateRequest` | `job_id`, `correlation_id`, `expected_revision`, `current`, `phase`, `message` | `total`, `unit` |
+| `JobFailureRequest` | `job_id`, `correlation_id`, `expected_revision`, `error_code`, `error_message`, `error_retriable` | - |
+
+`job_id`, `project_id`, dan `correlation_id` adalah lowercase UUID v7. `kind`, phase, dan unit adalah bounded safe identifiers; progress/error messages adalah trimmed, control-character-free safe text maksimum 500 bytes; error code adalah uppercase identifier maksimum 120 bytes. Revision harus positif. Timestamps adalah UTC RFC 3339 dan tidak boleh mundur terhadap snapshot sebelumnya. `progress_current` tidak negatif, total bila ada harus positif, dan current tidak boleh melampaui total.
+
+Row SQLite diperlakukan sebagai input tidak tepercaya. Sebelum descriptor dibaca, dimutasi, atau dipakai recovery, Rust memvalidasi ulang UUID v7, status, revision, timestamp/timeline, hubungan status-progress-error, byte bounds/control characters, serta encoding boolean SQLite tepat `0|1`; pelanggaran menghasilkan typed `DataIntegrity` dan tidak menulis event.
+
+### Transition and atomicity rules
+
+Transition yang diizinkan tepatnya:
+
+```text
+QUEUED     -> RUNNING | CANCELLING | FAILED
+RUNNING    -> SUCCEEDED | CANCELLING | FAILED
+CANCELLING -> CANCELLED | FAILED
+SUCCEEDED  -> (none)
+FAILED     -> (none)
+CANCELLED  -> (none)
+```
+
+Setiap enqueue dan mutasi material memperbarui/menulis snapshot `job`, menambahkan satu `job_event`, dan menambahkan satu `audit_event` berisi before/after snapshot hash di dalam satu `BEGIN IMMEDIATE` transaction. Enqueue adalah operasi pembuatan dan tidak membawa `expected_revision`. Mutasi yang dipicu caller—transition, failure, progress, request cancellation, dan completion cancellation—membawa `expected_revision`; update menggunakan CAS `WHERE revision = expected_revision`, menaikkan revision tepat satu, dan stale caller gagal tanpa event parsial. History `job_event` dan `audit_event` tidak dapat di-update/delete; koreksi harus berupa event baru.
+
+Handle `JobStore` independen dalam proses yang sama berbagi operation guard atas pinned metadata identity. Guard ditahan dari verifikasi hingga query selesai, atau dari verifikasi hingga transaction commit dan authorized identity refresh selesai; peer read/write menunggu window ini dan kemudian tetap mengikuti CAS revision, bukan menghasilkan false corruption.
+
+Progress hanya diizinkan ketika status `RUNNING` atau `CANCELLING`. Current tidak boleh turun dalam phase yang sama; pergantian phase boleh mereset current selama bounds tetap valid. Cancellation bersifat kooperatif: request dari `QUEUED`/`RUNNING` masuk `CANCELLING`; request ulang dengan revision saat ini pada `CANCELLING` mengembalikan snapshot yang sama tanpa menaikkan revision atau menulis event; completion hanya valid dari `CANCELLING` ke `CANCELLED`.
+
+Recovery restart adalah batch internal, bukan mutasi per-job yang dipicu caller. `recover_interrupted(correlation_id)` menerima correlation ID tanpa `expected_revision`, membuka satu `BEGIN IMMEDIATE`, memilih hanya row `RUNNING` dan `CANCELLING`, lalu memakai status terpilih dan revision snapshot internal sebagai safeguard saat setiap row diubah secara atomik menjadi terminal `FAILED`, `error_code = INTERRUPTED`, safe Indonesian message, `error_retriable = true`, dan event `job.interrupted`. `QUEUED` serta semua terminal state tetap utuh; recovery ulang setelah sukses tidak menulis duplicate history.
+
+T-0110 menyediakan persistence/store API dan bounded Rust keyset listing, bukan executor, engine dispatch, retry runner, Tauri job command/event, page envelope lintas bahasa, atau UI job center.
 
 ## Engine startup handshake
 
