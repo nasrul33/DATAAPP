@@ -95,6 +95,10 @@ Each handler declares non-negative `memory_bytes`, `disk_bytes`, and one ordered
 
 T-0111 does not claim that configured budgets equal current physical availability. The desktop/engine integration task will own platform probes and budget selection.
 
+### `WorkerReaper`
+
+Construction creates one executor-private maintenance reaper before any worker starts. The reaper normally receives a stop command and is joined after all workers complete. If `Drop` follows a timed-out explicit shutdown, ownership of every remaining worker `JoinHandle` is transferred to the reaper through a bounded channel; the reaper joins those workers asynchronously and then exits. The caller-facing destructor performs no unbounded wait, while worker handles are never silently discarded.
+
 ## Configuration
 
 `JobExecutorConfig` has no implicit defaults or hidden thresholds. Its native owner must supply:
@@ -155,7 +159,7 @@ Shutdown has three phases:
 
 Queued jobs not started before shutdown remain `QUEUED`. Running or cancelling jobs that do not finish remain in their current persistent state. The executor does not falsely mark them successful or delete their history. On the next application start, the existing T-0110 `recover_interrupted` operation changes `RUNNING` and `CANCELLING` jobs to `FAILED/INTERRUPTED` exactly once.
 
-If all workers join within the deadline, shutdown succeeds. Otherwise it returns `ShutdownTimeout`; it must not detach, kill, or silently abandon a worker while claiming success. The executor object remains responsible for its worker handles, and application termination remains an outer-process decision.
+If all workers and the idle reaper join within the deadline, shutdown succeeds. Otherwise it returns `ShutdownTimeout` and retains outstanding worker handles for a later shutdown attempt. If the executor is then dropped, the outstanding handles are transferred to the already-running reaper without an unbounded caller wait. The executor never kills a worker or claims bounded shutdown success while work remains; application termination remains an outer-process decision.
 
 ## Typed errors
 

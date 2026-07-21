@@ -14,6 +14,7 @@
 - Do not execute Python, shell commands, paths, source rows, dataset values, or arbitrary payloads.
 - Do not add Tauri commands/events, frontend UI, retry behavior, or cross-process coordination.
 - Every queue, string, progress update, resource estimate, worker set, and wait is bounded.
+- Create the executor-private worker reaper before spawning workers; construction fails cleanly if the reaper cannot start.
 - Executor limits are explicit configuration; do not hardcode environment-dependent thresholds or batch sizes.
 - Handler panic text, raw database errors, absolute paths, source values, and secrets must never cross the safe error boundary.
 - Use strict Rust lints; no `unsafe`, `unwrap`, or unjustified `allow` attributes in production code.
@@ -788,8 +789,9 @@ Add tests that prove:
 
 1. `shutdown` rejects later submissions, drains pending IDs, releases their admission claims, leaves their snapshots `QUEUED`, and joins a cooperative active worker.
 2. A gated non-cooperative handler causes `ShutdownTimeout`; after the test releases its gate, a second `shutdown` joins successfully.
-3. Dropping an interrupted process fixture and reopening its store lets `recover_interrupted` change active state to `FAILED/INTERRUPTED` once, while queued state remains unchanged.
-4. Sixteen simultaneous `submit` calls for one `job_id` yield exactly one success, fifteen `AlreadySubmitted` results, and one handler invocation. Use a start barrier and bounded channels; do not use timing as the assertion.
+3. Dropping after `ShutdownTimeout` returns within a bounded test deadline, transfers the outstanding worker handle to the pre-started reaper, and the reaper observes worker completion after the handler gate is released.
+4. Dropping an interrupted process fixture and reopening its store lets `recover_interrupted` change active state to `FAILED/INTERRUPTED` once, while queued state remains unchanged.
+5. Sixteen simultaneous `submit` calls for one `job_id` yield exactly one success, fifteen `AlreadySubmitted` results, and one handler invocation. Hold the admitted handler at a channel-driven gate until all submitters report; use a start barrier and bounded channels, not timing, as the assertion.
 
 - [ ] **Step 2: Run shutdown/stress tests and confirm red**
 
@@ -807,9 +809,10 @@ Expected: FAIL because bounded join/retry and drain cleanup are incomplete.
 - wait on each worker completion receiver only for the remaining duration;
 - join only workers known complete;
 - retain unjoined handles after timeout so a later `shutdown` can retry;
-- return success only when every handle is joined.
+- stop and join the idle reaper only after every worker handle is joined;
+- return success only when every worker and the reaper are joined.
 
-`Drop` closes/drains and then joins remaining workers without claiming a bounded success result. Production owners must call `shutdown`; the blocking drop is the safety fallback that prevents silent worker detachment.
+`JobExecutor::new` starts a panic-free executor-private `WorkerReaper` before worker creation and keeps its bounded command sender plus join handle. `Drop` closes/drains, performs only the configured bounded shutdown attempt, then sends every unjoined worker handle to that existing reaper and returns without joining it. The reaper owns and joins the workers asynchronously, signals completion for deterministic tests, and exits. Production owners must still call `shutdown`; reaper adoption is the safety fallback, not a successful graceful shutdown.
 
 - [ ] **Step 4: Run executor tests repeatedly to expose flakes**
 
@@ -948,7 +951,7 @@ git diff --check main...HEAD
 git status -sb
 ```
 
-Expected: ten focused T-0111 commits including the design and plan commits plus eight implementation-task commits, a clean worktree, and no unrelated file changes.
+Expected: twelve focused T-0111 commits including the design, plan, repository-worktree hygiene, reaper clarification, and eight implementation-task commits, a clean worktree, and no unrelated file changes.
 
 ---
 
