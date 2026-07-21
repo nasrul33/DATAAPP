@@ -139,10 +139,11 @@ impl Drop for ResourceReservation {
             .memory_bytes
             .checked_sub(self.estimate.memory_bytes);
         let disk_bytes = reserved.disk_bytes.checked_sub(self.estimate.disk_bytes);
-        if let (Some(memory_bytes), Some(disk_bytes)) = (memory_bytes, disk_bytes) {
-            reserved.memory_bytes = memory_bytes;
-            reserved.disk_bytes = disk_bytes;
-        }
+        let (Some(memory_bytes), Some(disk_bytes)) = (memory_bytes, disk_bytes) else {
+            panic!("resource ledger reservation invariant violated");
+        };
+        reserved.memory_bytes = memory_bytes;
+        reserved.disk_bytes = disk_bytes;
     }
 }
 
@@ -174,9 +175,33 @@ mod tests {
             Err(ResourceError::MemoryExceeded)
         ));
         drop(first);
+        assert_eq!(ledger.reserved_for_test(), (0, 0));
         assert!(ledger
             .reserve(estimate(100, 200, DurationClass::Medium))
             .is_ok());
+    }
+
+    #[test]
+    fn corrupted_reservation_accounting_fails_closed_on_drop() {
+        let ledger = ResourceLedger::new(ResourceBudget {
+            memory_bytes: 10,
+            disk_bytes: 10,
+            max_duration: DurationClass::Short,
+        })
+        .expect("valid budget");
+        let reservation = ledger
+            .reserve(estimate(1, 1, DurationClass::Short))
+            .expect("reservation");
+        {
+            let mut reserved = ledger.inner.reserved.lock().expect("unpoisoned ledger");
+            reserved.memory_bytes = 0;
+        }
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop(reservation);
+        }));
+
+        assert!(result.is_err());
     }
 
     #[test]
