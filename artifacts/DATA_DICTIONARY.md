@@ -68,17 +68,17 @@ Snapshot mutable terakhir untuk satu pekerjaan. Tabel dibuat sebagai `STRICT`; s
 | `updated_at` | TEXT | No | Check UTC/tanggal identik dengan `created_at` | Waktu mutasi terakhir |
 | `progress_current` | INTEGER | No | Default `0`; `>= 0`; tidak boleh melebihi `progress_total` bila total ada | Nilai progress saat ini |
 | `progress_total` | INTEGER | Yes | `NULL` atau `> 0` | Total progress yang diketahui |
-| `progress_unit` | TEXT | Yes | `NULL` atau trimmed panjang 1-32 | Unit progress aman |
+| `progress_unit` | TEXT | Yes | `NULL` atau 1-32 byte, diawali huruf kecil, hanya `[a-z0-9._-]` | Unit progress aman |
 | `progress_phase` | TEXT | Yes | `NULL` atau panjang 1-120, diawali huruf kecil, hanya `[a-z0-9._-]` | Identifier phase aman |
-| `progress_message` | TEXT | Yes | `NULL` atau trimmed panjang 1-500 | Pesan progress aman tanpa data sumber/path |
+| `progress_message` | TEXT | Yes | `NULL` atau trimmed 1-500 byte tanpa NUL/tab/CR/LF | Pesan progress aman tanpa data sumber/path |
 | `error_code` | TEXT | Yes | `NULL` atau panjang 1-120, diawali huruf besar, hanya `[A-Z0-9_]` | Stable safe failure code |
-| `error_message` | TEXT | Yes | `NULL` atau trimmed panjang 1-500 | Pesan kegagalan aman tanpa raw error/data/path |
+| `error_message` | TEXT | Yes | `NULL` atau trimmed 1-500 byte tanpa NUL/tab/CR/LF | Pesan kegagalan aman tanpa raw error/data/path |
 | `error_retriable` | INTEGER | Yes | `NULL`, `0`, atau `1` | Kebijakan retry |
 
 Checks lintas kolom:
 
 - `progress_total IS NULL OR progress_current <= progress_total`.
-- `QUEUED` mewajibkan `started_at IS NULL`.
+- `QUEUED` mewajibkan `started_at IS NULL`; `RUNNING` dan `SUCCEEDED` mewajibkan `started_at` terisi.
 - Status terminal tepatnya `SUCCEEDED|FAILED|CANCELLED` mewajibkan `finished_at`; semua status non-terminal mewajibkan `finished_at IS NULL`.
 - `FAILED` mewajibkan ketiga field error terisi; semua status lain mewajibkan ketiganya `NULL`.
 
@@ -103,11 +103,11 @@ Timeline snapshot append-only untuk setiap enqueue, transition, progress, cancel
 | `revision` | INTEGER | No | `> 0` | Revision snapshot setelah event |
 | `progress_current` | INTEGER | No | `>= 0`; tidak melebihi total bila total ada | Snapshot progress setelah event |
 | `progress_total` | INTEGER | Yes | `NULL` atau `> 0` | Snapshot total |
-| `progress_unit` | TEXT | Yes | `NULL` atau trimmed panjang 1-32 | Snapshot unit |
+| `progress_unit` | TEXT | Yes | `NULL` atau 1-32 byte, diawali huruf kecil, hanya `[a-z0-9._-]` | Snapshot unit |
 | `progress_phase` | TEXT | Yes | `NULL` atau panjang 1-120, diawali huruf kecil, hanya `[a-z0-9._-]` | Snapshot phase |
-| `progress_message` | TEXT | Yes | `NULL` atau trimmed panjang 1-500 | Snapshot pesan aman |
+| `progress_message` | TEXT | Yes | `NULL` atau trimmed 1-500 byte tanpa NUL/tab/CR/LF | Snapshot pesan aman |
 | `error_code` | TEXT | Yes | `NULL` atau panjang 1-120, diawali huruf besar, hanya `[A-Z0-9_]` | Snapshot stable failure code |
-| `error_message` | TEXT | Yes | `NULL` atau trimmed panjang 1-500 | Snapshot pesan kegagalan aman |
+| `error_message` | TEXT | Yes | `NULL` atau trimmed 1-500 byte tanpa NUL/tab/CR/LF | Snapshot pesan kegagalan aman |
 | `error_retriable` | INTEGER | Yes | `NULL`, `0`, atau `1` | Snapshot kebijakan retry |
 | `occurred_at` | TEXT | No | UTC RFC 3339 berbentuk `YYYY-MM-DDTHH:MM:SS[.fraction]Z`, panjang 20-35, jam 00-23, tanggal kalender valid | Waktu event |
 | `correlation_id` | TEXT | No | Lowercase UUID v7 dengan check panjang/pola/karakter | Trace mutasi |
@@ -130,4 +130,4 @@ Indexes:
 
 ## Migration dan rollback schema 2
 
-Migration 0002 membuat kedua tabel, dua trigger, empat explicit indexes, lalu menetapkan `PRAGMA user_version = 2`; `schema_migrations` versi 2 dan `project.metadata_migrated` ditulis oleh app-core dalam transaksi upgrade yang sama. Upgrade juga mengganti manifest dari metadata schema 1 ke 2 dengan backup/recovery marker dan validasi fingerprint. Tidak ada destructive downgrade: binary lama harus menolak schema 2 dan data job/audit tidak boleh dihapus untuk memaksa kompatibilitas. Detail failure recovery ada di `migrations/metadata-sqlite/0002_job_runtime.rollback.md`.
+Migration 0002 membuat kedua tabel, dua trigger, empat explicit indexes, lalu menetapkan `PRAGMA user_version = 2`; `schema_migrations` versi 2 dan `project.metadata_migrated` ditulis oleh app-core dalam transaksi upgrade yang sama. Upgrade juga mengganti manifest dari metadata schema 1 ke 2 dengan backup/recovery marker bertahap yang mengikat digest dan panjang kedua backup. Tidak ada destructive downgrade: binary lama harus menolak schema 2 dan data job/audit tidak boleh dihapus untuk memaksa kompatibilitas. Detail failure recovery ada di `migrations/metadata-sqlite/0002_job_runtime.rollback.md`.

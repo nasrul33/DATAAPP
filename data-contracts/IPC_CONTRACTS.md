@@ -35,6 +35,8 @@ Project selection uses the operating-system dialog. Only `dialog:allow-open` and
 
 Open and validate are read-only for supported metadata schema 1 and 2. Upgrade is explicit through the native project service; it is never an open-time side effect. Before mutation, schema-1 `metadata.sqlite` and `manifest.json` are copied and synced as recovery proofs and a bounded marker blocks normal open. Migration 0002, its `schema_migrations` row, and the hash-linked `project.metadata_migrated` audit event commit in one `BEGIN IMMEDIATE` transaction; the schema-2 manifest is then atomically replaced and the complete project is revalidated before recovery artifacts are cleared.
 
+Marker upgrade mengikat project/correlation ID, versi sumber/target, manifest hash sebelum/sesudah, nama/panjang/digest kedua backup, dan stage `BACKUP_PREPARED`, `DATABASE_MIGRATED`, `MANIFEST_PUBLISHED`, atau `VALIDATED_READY_TO_COMMIT`. Setiap stage ditulis secara bounded dan durable pada batas irreversible agar recovery tidak bergantung pada state in-memory.
+
 There is no destructive schema-2-to-1 downgrade. Older binaries must reject schema 2. A failed upgrade restores both schema-1 control files byte-for-byte and revalidates them; if that proof fails, artifacts remain and the project stays recovery-required.
 
 ## Persistent job contracts (T-0110)
@@ -50,6 +52,8 @@ All five contracts are flat, schema-first, additive (`additionalProperties: true
 | `JobFailureRequest` | `job_id`, `correlation_id`, `expected_revision`, `error_code`, `error_message`, `error_retriable` | - |
 
 `job_id`, `project_id`, dan `correlation_id` adalah lowercase UUID v7. `kind`, phase, dan unit adalah bounded safe identifiers; progress/error messages adalah trimmed, control-character-free safe text maksimum 500 bytes; error code adalah uppercase identifier maksimum 120 bytes. Revision harus positif. Timestamps adalah UTC RFC 3339 dan tidak boleh mundur terhadap snapshot sebelumnya. `progress_current` tidak negatif, total bila ada harus positif, dan current tidak boleh melampaui total.
+
+Row SQLite diperlakukan sebagai input tidak tepercaya. Sebelum descriptor dibaca, dimutasi, atau dipakai recovery, Rust memvalidasi ulang UUID v7, status, revision, timestamp/timeline, hubungan status-progress-error, byte bounds/control characters, serta encoding boolean SQLite tepat `0|1`; pelanggaran menghasilkan typed `DataIntegrity` dan tidak menulis event.
 
 ### Transition and atomicity rules
 
