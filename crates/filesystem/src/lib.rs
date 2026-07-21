@@ -3,8 +3,8 @@
 mod project_upgrade;
 
 pub use project_upgrade::{
-    begin_project_upgrade, pin_project_metadata, PinnedProjectMetadata, ProjectUpgrade,
-    ProjectUpgradeBackupProof, ProjectUpgradeFileProof,
+    begin_project_upgrade, pin_project_metadata, PinnedProjectMetadata, PinnedProjectOperation,
+    ProjectUpgrade, ProjectUpgradeBackupProof, ProjectUpgradeFileProof,
 };
 
 use std::ffi::OsStr;

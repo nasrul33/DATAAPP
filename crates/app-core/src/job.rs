@@ -11,10 +11,42 @@ pub use teratai_contracts::generated::job_failure_request::JobFailureRequest;
 pub use teratai_contracts::generated::job_progress_update_request::JobProgressUpdateRequest;
 pub use teratai_contracts::generated::job_transition_request::JobTransitionRequest;
 use teratai_filesystem::{
-    pin_project_metadata, validate_project_layout, PinnedProjectMetadata, ProjectLayout,
+    pin_project_metadata, validate_project_layout, PinnedProjectMetadata, PinnedProjectOperation,
+    ProjectLayout,
 };
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
+
+#[cfg(test)]
+type AfterCommitBarrier = Option<(std::thread::ThreadId, std::sync::Arc<std::sync::Barrier>)>;
+
+#[cfg(test)]
+static AFTER_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<AfterCommitBarrier>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+fn install_after_commit_barrier(barrier: Option<std::sync::Arc<std::sync::Barrier>>) {
+    *AFTER_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("after-commit barrier is available") =
+        barrier.map(|value| (std::thread::current().id(), value));
+}
+
+#[cfg(test)]
+fn wait_after_commit_before_identity_refresh() {
+    let barrier = AFTER_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("after-commit barrier is available")
+        .as_ref()
+        .filter(|(thread_id, _)| *thread_id == std::thread::current().id())
+        .map(|(_, barrier)| std::sync::Arc::clone(barrier));
+    if let Some(barrier) = barrier {
+        barrier.wait();
+        barrier.wait();
+    }
+}
 
 /// Metadata schema 1-to-2 migration for persistent job snapshots and history.
 pub const JOB_MIGRATION: &str =
@@ -232,6 +264,7 @@ impl JobStore {
         let metadata = pin_project_metadata(&layout).map_err(|_| {
             JobError::DataIntegrity("project metadata could not be pinned safely".to_owned())
         })?;
+        let operation = begin_pinned_operation(&metadata)?;
         let descriptor = validate_schema_two_project(layout.root())?;
         let canonical_path = PathBuf::from(&descriptor.project_path);
         if canonical_path != layout.root() {
@@ -239,12 +272,13 @@ impl JobStore {
                 "validated project path changed while opening".to_owned(),
             ));
         }
-        verify_pinned_metadata(&metadata)?;
+        verify_pinned_metadata(&operation)?;
         let connection = open_connection(metadata.path(), ConnectionAccess::ReadOnly)?;
-        verify_pinned_metadata(&metadata)?;
+        verify_pinned_metadata(&operation)?;
         probe_job_connection(&connection, &descriptor.project_id)?;
-        verify_pinned_metadata(&metadata)?;
+        verify_pinned_metadata(&operation)?;
         drop(connection);
+        drop(operation);
         Ok(Self {
             project_path: canonical_path,
             project_id: descriptor.project_id,
@@ -362,7 +396,8 @@ impl JobStore {
     /// Returns `InvalidRequest`, `JobNotFound`, or a safe database failure.
     pub fn get(&self, job_id: &str) -> Result<JobDescriptor, JobError> {
         validate_uuid(job_id, "job_id")?;
-        let connection = self.read_connection()?;
+        let operation = begin_pinned_operation(&self.metadata)?;
+        let connection = self.read_connection(&operation)?;
         let decoded = connection
             .query_row(
                 "SELECT job_id, project_id, kind, status, correlation_id, revision,
@@ -402,7 +437,8 @@ impl JobStore {
         let fetch_limit = i64::try_from(limit + 1).map_err(|_| {
             JobError::InvalidRequest("page size cannot be represented safely".to_owned())
         })?;
-        let connection = self.read_connection()?;
+        let operation = begin_pinned_operation(&self.metadata)?;
+        let connection = self.read_connection(&operation)?;
         let decoded = if let Some(value) = cursor {
             let mut statement = connection.prepare(
                 "SELECT job_id, project_id, kind, status, correlation_id, revision,
@@ -493,8 +529,9 @@ impl JobStore {
         let descriptor = validate_persisted_descriptor(descriptor, None)?;
         let after_hash = snapshot_hash(&descriptor)?;
 
-        let mut connection = self.write_connection()?;
-        verify_pinned_metadata(&self.metadata)?;
+        let mut metadata_operation = begin_pinned_operation(&self.metadata)?;
+        let mut connection = self.write_connection(&metadata_operation)?;
+        verify_pinned_metadata(&metadata_operation)?;
         let write_result = (|| -> Result<(), JobError> {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -543,8 +580,11 @@ impl JobStore {
             transaction.commit()?;
             Ok(())
         })();
-        let refresh_result = self
-            .metadata
+        #[cfg(test)]
+        if write_result.is_ok() {
+            wait_after_commit_before_identity_refresh();
+        }
+        let refresh_result = metadata_operation
             .refresh_after_authorized_write()
             .map_err(|_| JobError::DataIntegrity("pinned metadata identity changed".to_owned()));
         refresh_result?;
@@ -799,8 +839,9 @@ impl JobStore {
         &self,
         operation: impl FnOnce(&Transaction<'_>) -> Result<T, JobError>,
     ) -> Result<T, JobError> {
-        let mut connection = self.write_connection()?;
-        verify_pinned_metadata(&self.metadata)?;
+        let mut metadata_operation = begin_pinned_operation(&self.metadata)?;
+        let mut connection = self.write_connection(&metadata_operation)?;
+        verify_pinned_metadata(&metadata_operation)?;
         let write_result = (|| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -808,32 +849,46 @@ impl JobStore {
             transaction.commit()?;
             Ok(value)
         })();
-        self.metadata
+        #[cfg(test)]
+        if write_result.is_ok() {
+            wait_after_commit_before_identity_refresh();
+        }
+        metadata_operation
             .refresh_after_authorized_write()
             .map_err(|_| JobError::DataIntegrity("pinned metadata identity changed".to_owned()))?;
         write_result
     }
 
-    fn read_connection(&self) -> Result<Connection, JobError> {
-        self.validated_connection(ConnectionAccess::ReadOnly)
+    fn read_connection(
+        &self,
+        operation: &PinnedProjectOperation<'_>,
+    ) -> Result<Connection, JobError> {
+        self.validated_connection(operation, ConnectionAccess::ReadOnly)
     }
 
-    fn write_connection(&self) -> Result<Connection, JobError> {
-        self.validated_connection(ConnectionAccess::ReadWrite)
+    fn write_connection(
+        &self,
+        operation: &PinnedProjectOperation<'_>,
+    ) -> Result<Connection, JobError> {
+        self.validated_connection(operation, ConnectionAccess::ReadWrite)
     }
 
-    fn validated_connection(&self, access: ConnectionAccess) -> Result<Connection, JobError> {
+    fn validated_connection(
+        &self,
+        operation: &PinnedProjectOperation<'_>,
+        access: ConnectionAccess,
+    ) -> Result<Connection, JobError> {
         let layout = validated_project_layout(&self.project_path)?;
         if layout.root() != self.project_path || layout.metadata_path() != self.metadata.path() {
             return Err(JobError::DataIntegrity(
                 "project control paths changed after the job store opened".to_owned(),
             ));
         }
-        verify_pinned_metadata(&self.metadata)?;
+        verify_pinned_metadata(operation)?;
         let connection = open_connection(self.metadata.path(), access)?;
-        verify_pinned_metadata(&self.metadata)?;
+        verify_pinned_metadata(operation)?;
         probe_job_connection(&connection, &self.project_id)?;
-        verify_pinned_metadata(&self.metadata)?;
+        verify_pinned_metadata(operation)?;
         Ok(connection)
     }
 }
@@ -875,8 +930,16 @@ fn validated_project_layout(project_path: &Path) -> Result<ProjectLayout, JobErr
         .map_err(|_| JobError::DataIntegrity("project control layout is unsafe".to_owned()))
 }
 
-fn verify_pinned_metadata(metadata: &PinnedProjectMetadata) -> Result<(), JobError> {
+fn begin_pinned_operation(
+    metadata: &PinnedProjectMetadata,
+) -> Result<PinnedProjectOperation<'_>, JobError> {
     metadata
+        .begin_operation()
+        .map_err(|_| JobError::DataIntegrity("pinned metadata identity changed".to_owned()))
+}
+
+fn verify_pinned_metadata(operation: &PinnedProjectOperation<'_>) -> Result<(), JobError> {
+    operation
         .verify()
         .map_err(|_| JobError::DataIntegrity("pinned metadata identity changed".to_owned()))
 }
@@ -1584,6 +1647,9 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::mpsc::{self, RecvTimeoutError};
+    use std::sync::{Arc, Barrier};
+    use std::time::Duration;
 
     use rusqlite::{params, Connection, Result, TransactionBehavior};
     use sha2::{Digest, Sha256};
@@ -1596,9 +1662,9 @@ mod tests {
     use teratai_filesystem::REQUIRED_PROJECT_DIRECTORIES;
 
     use super::{
-        event_id_at, full_project_validation_count, snapshot_hash, transition_allowed,
-        validate_persisted_descriptor, JobError, JobErrorKind, JobListCursor, JobStatus, JobStore,
-        TransitionRequest, JOB_MIGRATION,
+        event_id_at, full_project_validation_count, install_after_commit_barrier, snapshot_hash,
+        transition_allowed, validate_persisted_descriptor, JobError, JobErrorKind, JobListCursor,
+        JobStatus, JobStore, TransitionRequest, JOB_MIGRATION,
     };
     use crate::ProjectService;
 
@@ -1691,6 +1757,47 @@ mod tests {
 
         drop(second);
         drop(first);
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn simultaneous_peer_read_waits_for_authorized_identity_refresh() {
+        let path = create_schema_two_project("simultaneous-peer-handles");
+        let writer = JobStore::open(&path).expect("open writer store");
+        let reader = JobStore::open(&path).expect("open reader store");
+        let barrier = Arc::new(Barrier::new(2));
+        let writer_barrier = Arc::clone(&barrier);
+        let writer_thread = std::thread::spawn(move || {
+            install_after_commit_barrier(Some(writer_barrier));
+            let result = writer.enqueue_at(&enqueue(0), NOW);
+            install_after_commit_barrier(None);
+            result
+        });
+        barrier.wait();
+        let (result_sender, result_receiver) = mpsc::channel();
+        let reader_thread = std::thread::spawn(move || {
+            result_sender
+                .send(reader.get(&job_id(0)))
+                .expect("send reader result");
+        });
+        let before_refresh = result_receiver.recv_timeout(Duration::from_millis(100));
+        barrier.wait();
+
+        let queued = writer_thread
+            .join()
+            .expect("writer thread")
+            .expect("peer enqueue");
+        let observed = match before_refresh {
+            Err(RecvTimeoutError::Timeout) => result_receiver
+                .recv_timeout(Duration::from_secs(2))
+                .expect("reader completed after identity refresh"),
+            Ok(result) => panic!("reader completed before identity refresh: {result:?}"),
+            Err(RecvTimeoutError::Disconnected) => panic!("reader result channel disconnected"),
+        }
+        .expect("read after peer commit");
+        reader_thread.join().expect("reader thread");
+        assert_eq!(observed, queued);
+
         cleanup_project(&path);
     }
 
@@ -2490,7 +2597,13 @@ mod tests {
     fn every_store_connection_enables_foreign_keys() {
         let path = create_schema_two_project("foreign-keys");
         let store = JobStore::open(&path).expect("open store");
-        let connection = store.read_connection().expect("open store connection");
+        let operation = store
+            .metadata
+            .begin_operation()
+            .expect("begin pinned operation");
+        let connection = store
+            .read_connection(&operation)
+            .expect("open store connection");
         let foreign_keys: i64 = connection
             .pragma_query_value(None, "foreign_keys", |row| row.get(0))
             .expect("read foreign key setting");
@@ -2498,6 +2611,7 @@ mod tests {
         assert_eq!(foreign_keys, 1);
         assert!(connection.is_readonly("main").expect("read access mode"));
         drop(connection);
+        drop(operation);
         drop(store);
         cleanup_project(&path);
     }

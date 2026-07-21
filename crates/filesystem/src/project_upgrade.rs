@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
 
 use crate::{
     atomic_write, validate_safe_token, FilesystemError, ProjectLayout, MANIFEST_LIMIT_BYTES,
@@ -94,6 +94,16 @@ pub struct PinnedProjectMetadata {
     identity: Arc<Mutex<FileIdentity>>,
 }
 
+/// One serialized operation over a shared pinned metadata identity.
+///
+/// The guard keeps peer stores from observing a committed write before the
+/// writer refreshes the authorized mutable file identity.
+pub struct PinnedProjectOperation<'a> {
+    path: &'a Path,
+    file: &'a File,
+    identity: MutexGuard<'a, FileIdentity>,
+}
+
 type SharedIdentity = Arc<Mutex<FileIdentity>>;
 type WeakSharedIdentity = Weak<Mutex<FileIdentity>>;
 
@@ -105,6 +115,22 @@ fn pinned_metadata_identities() -> &'static Mutex<HashMap<PathBuf, WeakSharedIde
 }
 
 impl PinnedProjectMetadata {
+    /// Begin one complete read or write operation over this pinned capability.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the shared operation capability is poisoned.
+    pub fn begin_operation(&self) -> Result<PinnedProjectOperation<'_>, FilesystemError> {
+        let identity = self.identity.lock().map_err(|_| {
+            FilesystemError::InvalidLayout("pinned metadata capability is poisoned".to_owned())
+        })?;
+        Ok(PinnedProjectOperation {
+            path: &self.path,
+            file: &self.file,
+            identity,
+        })
+    }
+
     /// Return the canonical metadata path represented by this capability.
     #[must_use]
     pub fn path(&self) -> &Path {
@@ -118,10 +144,7 @@ impl PinnedProjectMetadata {
     /// Returns an error when the path becomes linked, non-regular, replaced,
     /// or changes identity outside an authorized metadata write.
     pub fn verify(&self) -> Result<(), FilesystemError> {
-        let expected = *self.identity.lock().map_err(|_| {
-            FilesystemError::InvalidLayout("pinned metadata capability is poisoned".to_owned())
-        })?;
-        validate_file_handle(&self.path, &self.file, expected, "pinned project metadata")
+        self.begin_operation()?.verify()
     }
 
     /// Accept the current identity after an authorized `SQLite` write completes.
@@ -135,9 +158,36 @@ impl PinnedProjectMetadata {
     /// Returns an error when the handle and path no longer identify the same
     /// non-linked regular file.
     pub fn refresh_after_authorized_write(&self) -> Result<(), FilesystemError> {
+        self.begin_operation()?.refresh_after_authorized_write()
+    }
+}
+
+impl PinnedProjectOperation<'_> {
+    /// Verify the pinned handle and path against the operation's identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the file was linked, replaced, or changed outside
+    /// the serialized authorized operation.
+    pub fn verify(&self) -> Result<(), FilesystemError> {
+        validate_file_handle(
+            self.path,
+            self.file,
+            *self.identity,
+            "pinned project metadata",
+        )
+    }
+
+    /// Refresh the shared identity after this operation commits a write.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the handle and path no longer identify the same
+    /// non-linked regular file.
+    pub fn refresh_after_authorized_write(&mut self) -> Result<(), FilesystemError> {
         let handle_identity =
             identity_from_metadata(&self.file.metadata()?, "pinned project metadata", true)?;
-        let path_metadata = fs::symlink_metadata(&self.path)?;
+        let path_metadata = fs::symlink_metadata(self.path)?;
         validate_regular_metadata(&path_metadata, "pinned project metadata")?;
         let path_identity =
             identity_from_metadata(&path_metadata, "pinned project metadata", true)?;
@@ -146,23 +196,20 @@ impl PinnedProjectMetadata {
                 "pinned project metadata identity changed".to_owned(),
             ));
         }
-        *self.identity.lock().map_err(|_| {
-            FilesystemError::InvalidLayout("pinned metadata capability is poisoned".to_owned())
-        })? = handle_identity;
+        *self.identity = handle_identity;
         Ok(())
     }
 }
 
 impl Drop for PinnedProjectMetadata {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.identity) != 1 {
-            return;
-        }
         if let Ok(mut identities) = pinned_metadata_identities().lock() {
             let remove = identities
                 .get(&self.path)
                 .and_then(Weak::upgrade)
-                .is_some_and(|registered| Arc::ptr_eq(&registered, &self.identity));
+                .is_some_and(|registered| {
+                    Arc::ptr_eq(&registered, &self.identity) && Arc::strong_count(&registered) == 2
+                });
             if remove {
                 identities.remove(&self.path);
             }
