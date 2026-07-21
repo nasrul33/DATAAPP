@@ -6,6 +6,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::Instant;
@@ -438,13 +439,6 @@ impl CompletionReceiver {
         Self(Mutex::new(receiver))
     }
 
-    fn recv(&self) -> Result<(), mpsc::RecvError> {
-        match self.0.lock() {
-            Ok(receiver) => receiver.recv(),
-            Err(poisoned) => poisoned.into_inner().recv(),
-        }
-    }
-
     fn recv_timeout(&self, timeout: std::time::Duration) -> Result<(), mpsc::RecvTimeoutError> {
         match self.0.lock() {
             Ok(receiver) => receiver.recv_timeout(timeout),
@@ -460,68 +454,114 @@ impl CompletionReceiver {
     }
 }
 
+struct WorkerSlot {
+    join: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl WorkerSlot {
+    fn new() -> Self {
+        Self {
+            join: Mutex::new(None),
+        }
+    }
+
+    fn install(&self, join: JoinHandle<()>) {
+        let mut slot = match self.join.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        debug_assert!(slot.is_none(), "worker slot is installed exactly once");
+        *slot = Some(join);
+    }
+
+    fn has_handle(&self) -> bool {
+        let slot = match self.join.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        slot.is_some()
+    }
+
+    fn is_finished(&self) -> bool {
+        let slot = match self.join.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        join_is_finished(slot.as_ref())
+    }
+
+    fn take(&self) -> Option<JoinHandle<()>> {
+        let mut slot = match self.join.lock() {
+            Ok(slot) => slot,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        slot.take()
+    }
+}
+
 struct WorkerHandle {
-    join: Option<JoinHandle<()>>,
+    slot: Arc<WorkerSlot>,
     completed: CompletionReceiver,
+    completion_observed: bool,
 }
 
 enum ReaperCommand {
-    AdoptAndStop(Vec<JoinHandle<()>>),
     Stop,
 }
+
+#[cfg(test)]
+type ExitGate = Arc<dyn Fn() + Send + Sync>;
 
 struct WorkerReaper {
     commands: mpsc::SyncSender<ReaperCommand>,
     join: Option<JoinHandle<()>>,
     completed: CompletionReceiver,
+    completion_observed: bool,
     stop_requested: bool,
     #[cfg(test)]
     completion_observer: Option<CompletionReceiver>,
+    #[cfg(test)]
+    exit_gate: Arc<Mutex<Option<ExitGate>>>,
 }
 
 impl WorkerReaper {
-    fn start() -> Result<Self, JobExecutorError> {
+    fn start(slots: Vec<Arc<WorkerSlot>>) -> Result<Self, JobExecutorError> {
         let (commands, receiver) = mpsc::sync_channel(1);
         let (completed_sender, completed) = mpsc::sync_channel(1);
         #[cfg(test)]
         let (observer_sender, completion_observer) = mpsc::sync_channel(1);
+        #[cfg(test)]
+        let exit_gate = Arc::new(Mutex::new(None::<ExitGate>));
+        #[cfg(test)]
+        let reaper_exit_gate = Arc::clone(&exit_gate);
         let join = thread::Builder::new()
             .name("teratai-job-worker-reaper".to_owned())
             .spawn(move || {
-                if let Ok(command) = receiver.recv() {
-                    match command {
-                        ReaperCommand::AdoptAndStop(workers) => {
-                            for worker in workers {
-                                let _worker_result = worker.join();
-                            }
+                if receiver.recv().is_err() {
+                    for slot in slots {
+                        if let Some(worker) = slot.take() {
+                            let _worker_result = worker.join();
                         }
-                        ReaperCommand::Stop => {}
                     }
                 }
                 let _completion_result = completed_sender.send(());
                 #[cfg(test)]
                 let _observer_result = observer_sender.send(());
+                #[cfg(test)]
+                run_exit_gate(&reaper_exit_gate);
             })
             .map_err(|_| JobExecutorError::InvalidConfiguration)?;
         Ok(Self {
             commands,
             join: Some(join),
             completed: CompletionReceiver::new(completed),
+            completion_observed: false,
             stop_requested: false,
             #[cfg(test)]
             completion_observer: Some(CompletionReceiver::new(completion_observer)),
+            #[cfg(test)]
+            exit_gate,
         })
-    }
-
-    fn adopt_and_stop(mut self, workers: Vec<JoinHandle<()>>) {
-        if self
-            .commands
-            .send(ReaperCommand::AdoptAndStop(workers))
-            .is_ok()
-        {
-            self.stop_requested = true;
-        }
-        let _detached_reaper = self.join.take();
     }
 
     fn stop_and_join_by(&mut self, deadline: Instant) -> bool {
@@ -537,24 +577,15 @@ impl WorkerReaper {
             }
         }
 
-        let completed = wait_for_completion(&self.completed, deadline);
-        if completed {
+        if !self.completion_observed {
+            self.completion_observed = wait_for_completion(&self.completed, deadline);
+        }
+        if self.completion_observed && wait_for_join_exit(self.join.as_ref(), deadline) {
             if let Some(join) = self.join.take() {
                 let _reaper_result = join.join();
             }
         }
-        completed
-    }
-
-    fn stop_and_join(&mut self) {
-        if !self.stop_requested {
-            let _stop_result = self.commands.send(ReaperCommand::Stop);
-            self.stop_requested = true;
-        }
-        let _completion_result = self.completed.recv();
-        if let Some(join) = self.join.take() {
-            let _reaper_result = join.join();
-        }
+        self.join.is_none()
     }
 
     fn detach(mut self) {
@@ -564,6 +595,30 @@ impl WorkerReaper {
     #[cfg(test)]
     fn take_completion_for_test(&mut self) -> Option<CompletionReceiver> {
         self.completion_observer.take()
+    }
+
+    #[cfg(test)]
+    fn set_exit_gate_for_test(&self, gate: ExitGate) -> Result<(), JobExecutorError> {
+        let mut exit_gate = self
+            .exit_gate
+            .lock()
+            .map_err(|_| JobExecutorError::PersistenceFailed)?;
+        if exit_gate.is_some() {
+            return Err(JobExecutorError::InvalidConfiguration);
+        }
+        *exit_gate = Some(gate);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+fn run_exit_gate(gate: &Mutex<Option<ExitGate>>) {
+    let gate = match gate.lock() {
+        Ok(gate) => gate.clone(),
+        Err(poisoned) => poisoned.into_inner().clone(),
+    };
+    if let Some(gate) = gate {
+        gate();
     }
 }
 
@@ -593,16 +648,30 @@ impl JobExecutor {
     ) -> Result<Self, JobExecutorError> {
         let core = Arc::new(ExecutorCore::new(store, handlers, config, clock)?);
         ensure_handler_panic_hook()?;
-        let mut reaper = WorkerReaper::start()?;
-        let mut workers = Vec::new();
-        workers
+        let mut worker_slots = Vec::new();
+        worker_slots
             .try_reserve_exact(core.config.worker_count)
-            .map_err(|_| {
-                reaper.stop_and_join();
-                JobExecutorError::InvalidConfiguration
-            })?;
+            .map_err(|_| JobExecutorError::InvalidConfiguration)?;
+        let mut reaper_slots = Vec::new();
+        reaper_slots
+            .try_reserve_exact(core.config.worker_count)
+            .map_err(|_| JobExecutorError::InvalidConfiguration)?;
+        for _ in 0..core.config.worker_count {
+            let slot = Arc::new(WorkerSlot::new());
+            reaper_slots.push(Arc::clone(&slot));
+            worker_slots.push(slot);
+        }
+        let mut reaper = WorkerReaper::start(reaper_slots)?;
+        let mut workers = Vec::new();
+        if workers.try_reserve_exact(core.config.worker_count).is_err() {
+            let deadline = Instant::now()
+                .checked_add(core.config.shutdown_timeout)
+                .ok_or(JobExecutorError::InvalidConfiguration)?;
+            let _reaper_stopped = reaper.stop_and_join_by(deadline);
+            return Err(JobExecutorError::InvalidConfiguration);
+        }
 
-        for worker_index in 0..core.config.worker_count {
+        for (worker_index, slot) in worker_slots.into_iter().enumerate() {
             let worker_core = Arc::clone(&core);
             let (completed_sender, completed) = mpsc::sync_channel(1);
             let spawn_result = thread::Builder::new()
@@ -610,14 +679,21 @@ impl JobExecutor {
                 .spawn(move || {
                     worker_loop(&worker_core);
                     let _completion_result = completed_sender.send(());
+                    #[cfg(test)]
+                    worker_core.run_worker_exit_gate();
                 });
             if let Ok(join) = spawn_result {
+                slot.install(join);
                 workers.push(WorkerHandle {
-                    join: Some(join),
+                    slot,
                     completed: CompletionReceiver::new(completed),
+                    completion_observed: false,
                 });
             } else {
-                rollback_worker_start(&core, &mut workers, &mut reaper);
+                let deadline = Instant::now()
+                    .checked_add(core.config.shutdown_timeout)
+                    .ok_or(JobExecutorError::InvalidConfiguration)?;
+                rollback_worker_start(&core, &mut workers, &mut reaper, deadline);
                 return Err(JobExecutorError::InvalidConfiguration);
             }
         }
@@ -652,22 +728,26 @@ impl JobExecutor {
     /// Returns [`JobExecutorError::ShutdownTimeout`] when any worker or the
     /// private reaper cannot be joined before the single shutdown deadline.
     pub fn shutdown(&mut self) -> Result<(), JobExecutorError> {
+        self.core.accepting.swap(false, Ordering::AcqRel);
         self.close_queue_once();
         let deadline = Instant::now()
             .checked_add(self.core.config.shutdown_timeout)
             .ok_or(JobExecutorError::InvalidConfiguration)?;
 
         for worker in &mut self.workers {
-            if worker.join.is_none() {
+            if !worker.slot.has_handle() {
                 continue;
             }
-            if wait_for_completion(&worker.completed, deadline) {
-                if let Some(join) = worker.join.take() {
+            if !worker.completion_observed {
+                worker.completion_observed = wait_for_completion(&worker.completed, deadline);
+            }
+            if worker.completion_observed && wait_for_slot_exit(&worker.slot, deadline) {
+                if let Some(join) = worker.slot.take() {
                     let _worker_result = join.join();
                 }
             }
         }
-        if self.workers.iter().any(|worker| worker.join.is_some()) {
+        if self.workers.iter().any(|worker| worker.slot.has_handle()) {
             return Err(JobExecutorError::ShutdownTimeout);
         }
 
@@ -711,22 +791,26 @@ impl JobExecutor {
             .as_mut()
             .and_then(WorkerReaper::take_completion_for_test)
     }
+
+    #[cfg(test)]
+    fn set_worker_exit_gate_for_test(&self, gate: ExitGate) -> Result<(), JobExecutorError> {
+        self.core.set_worker_exit_gate(gate)
+    }
+
+    #[cfg(test)]
+    fn set_reaper_exit_gate_for_test(&self, gate: ExitGate) -> Result<(), JobExecutorError> {
+        self.reaper
+            .as_ref()
+            .ok_or(JobExecutorError::InvalidConfiguration)?
+            .set_exit_gate_for_test(gate)
+    }
 }
 
 impl Drop for JobExecutor {
     fn drop(&mut self) {
         let _shutdown_result = self.shutdown();
-        let outstanding: Vec<_> = self
-            .workers
-            .iter_mut()
-            .filter_map(|worker| worker.join.take())
-            .collect();
         if let Some(reaper) = self.reaper.take() {
-            if outstanding.is_empty() {
-                reaper.detach();
-            } else {
-                reaper.adopt_and_stop(outstanding);
-            }
+            reaper.detach();
         }
     }
 }
@@ -745,19 +829,59 @@ fn wait_for_completion(completed: &CompletionReceiver, deadline: Instant) -> boo
     )
 }
 
+fn wait_for_slot_exit(slot: &WorkerSlot, deadline: Instant) -> bool {
+    loop {
+        if slot.is_finished() {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return slot.is_finished();
+        }
+        thread::yield_now();
+    }
+}
+
+fn wait_for_join_exit(join: Option<&JoinHandle<()>>, deadline: Instant) -> bool {
+    loop {
+        if join_is_finished(join) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return join_is_finished(join);
+        }
+        thread::yield_now();
+    }
+}
+
+fn join_is_finished(join: Option<&JoinHandle<()>>) -> bool {
+    match join {
+        Some(join) => join.is_finished(),
+        None => true,
+    }
+}
+
 fn rollback_worker_start(
     core: &ExecutorCore,
     workers: &mut [WorkerHandle],
     reaper: &mut WorkerReaper,
+    deadline: Instant,
 ) {
+    core.accepting.store(false, Ordering::Release);
     let drained = core.queue.close_and_drain();
     release_drained_admissions(&core.admitted, drained);
-    for worker in workers {
-        if let Some(join) = worker.join.take() {
-            let _worker_result = join.join();
+    for worker in &mut *workers {
+        if !worker.completion_observed {
+            worker.completion_observed = wait_for_completion(&worker.completed, deadline);
+        }
+        if worker.completion_observed && wait_for_slot_exit(&worker.slot, deadline) {
+            if let Some(join) = worker.slot.take() {
+                let _worker_result = join.join();
+            }
         }
     }
-    reaper.stop_and_join();
+    if workers.iter().all(|worker| !worker.slot.has_handle()) {
+        let _reaper_stopped = reaper.stop_and_join_by(deadline);
+    }
 }
 
 fn release_drained_admissions(admitted: &Mutex<HashSet<String>>, drained: Vec<String>) {
@@ -1110,6 +1234,7 @@ fn transition_request(descriptor: &JobDescriptor) -> JobTransitionRequest {
 pub(crate) struct ExecutorCore {
     store: Arc<JobStore>,
     queue: Arc<BoundedQueue<String>>,
+    accepting: AtomicBool,
     handlers: HashMap<&'static str, Arc<dyn JobHandler>>,
     admitted: Arc<Mutex<HashSet<String>>>,
     resource_ledger: ResourceLedger,
@@ -1121,6 +1246,8 @@ pub(crate) struct ExecutorCore {
     before_queue_push: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     #[cfg(test)]
     after_job: Mutex<Option<AfterJobHook>>,
+    #[cfg(test)]
+    worker_exit_gate: Mutex<Option<ExitGate>>,
 }
 
 #[cfg(test)]
@@ -1164,6 +1291,7 @@ impl ExecutorCore {
         Ok(Self {
             store,
             queue,
+            accepting: AtomicBool::new(true),
             handlers: registry,
             admitted: Arc::new(Mutex::new(admitted)),
             resource_ledger,
@@ -1175,10 +1303,15 @@ impl ExecutorCore {
             before_queue_push: Mutex::new(None),
             #[cfg(test)]
             after_job: Mutex::new(None),
+            #[cfg(test)]
+            worker_exit_gate: Mutex::new(None),
         })
     }
 
     pub(crate) fn claim_and_queue(&self, job_id: &str) -> Result<(), JobExecutorError> {
+        if !self.accepting.load(Ordering::Acquire) {
+            return Err(JobExecutorError::ShuttingDown);
+        }
         {
             let admitted = self
                 .admitted
@@ -1272,6 +1405,24 @@ impl ExecutorCore {
         if let Some(hook) = hook {
             hook(job_id);
         }
+    }
+
+    #[cfg(test)]
+    fn set_worker_exit_gate(&self, gate: ExitGate) -> Result<(), JobExecutorError> {
+        let mut exit_gate = self
+            .worker_exit_gate
+            .lock()
+            .map_err(|_| JobExecutorError::PersistenceFailed)?;
+        if exit_gate.is_some() {
+            return Err(JobExecutorError::InvalidConfiguration);
+        }
+        *exit_gate = Some(gate);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn run_worker_exit_gate(&self) {
+        run_exit_gate(&self.worker_exit_gate);
     }
 }
 

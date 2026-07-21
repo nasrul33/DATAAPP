@@ -8,9 +8,9 @@ use teratai_contracts::generated::project_create_request::ProjectCreateRequest;
 
 use super::resource::{DurationClass, ResourceBudget, ResourceEstimate};
 use super::{
-    CheckpointDecision, ClockError, ExecutionContext, ExecutorClock, ExecutorCore, HandlerOutcome,
-    JobExecutor, JobExecutorConfig, JobExecutorError, JobHandler, JobHandlerError, JobProgress,
-    SystemExecutorClock,
+    wait_for_join_exit, CheckpointDecision, ClockError, ExecutionContext, ExecutorClock,
+    ExecutorCore, HandlerOutcome, JobExecutor, JobExecutorConfig, JobExecutorError, JobHandler,
+    JobHandlerError, JobProgress, ReaperCommand, SystemExecutorClock, WorkerSlot,
 };
 use crate::job::{JobProgressUpdateRequest, JobTransitionRequest};
 use crate::{JobEnqueueRequest, JobStore, ProjectService};
@@ -1331,6 +1331,10 @@ fn shutdown_timeout_retains_worker_for_successful_retry() {
         executor.shutdown(),
         Err(JobExecutorError::ShutdownTimeout)
     ));
+    assert!(matches!(
+        executor.submit(&job.job_id),
+        Err(JobExecutorError::ShuttingDown)
+    ));
 
     release_sender.send(()).expect("release gated handler");
     executor.shutdown().expect("retry joins completed worker");
@@ -1345,7 +1349,124 @@ fn shutdown_timeout_retains_worker_for_successful_retry() {
 }
 
 #[test]
-fn drop_after_timeout_is_bounded_and_reaper_observes_worker_completion() {
+fn worker_completion_notification_is_not_worker_exit_proof() {
+    let fixture = ExecutorFixture::new("worker-exit-proof");
+    let (exit_gate_entered_sender, exit_gate_entered_receiver) = mpsc::sync_channel(1);
+    let (exit_gate_release_sender, exit_gate_release_receiver) = mpsc::sync_channel(1);
+    let exit_gate_release_receiver = Mutex::new(exit_gate_release_receiver);
+    let mut config = ExecutorFixture::config(1);
+    config.shutdown_timeout = Duration::from_millis(100);
+    let mut executor = JobExecutor::new(
+        Arc::clone(fixture.store()),
+        Vec::new(),
+        config,
+        Arc::new(SystemExecutorClock),
+    )
+    .expect("start executor");
+    executor
+        .set_worker_exit_gate_for_test(Arc::new(move || {
+            exit_gate_entered_sender
+                .send(())
+                .expect("signal worker exit gate");
+            exit_gate_release_receiver
+                .lock()
+                .expect("worker exit gate receiver")
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release worker exit gate");
+        }))
+        .expect("install worker exit gate");
+
+    assert!(matches!(
+        executor.shutdown(),
+        Err(JobExecutorError::ShutdownTimeout)
+    ));
+    exit_gate_entered_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("worker reached gate after completion notification");
+    exit_gate_release_sender
+        .send(())
+        .expect("release worker exit gate");
+    executor.shutdown().expect("retry joins exited worker");
+}
+
+#[test]
+fn reaper_completion_notification_is_not_reaper_exit_proof() {
+    let fixture = ExecutorFixture::new("reaper-exit-proof");
+    let (exit_gate_entered_sender, exit_gate_entered_receiver) = mpsc::sync_channel(1);
+    let (exit_gate_release_sender, exit_gate_release_receiver) = mpsc::sync_channel(1);
+    let exit_gate_release_receiver = Mutex::new(exit_gate_release_receiver);
+    let mut config = ExecutorFixture::config(1);
+    config.shutdown_timeout = Duration::from_millis(100);
+    let mut executor = JobExecutor::new(
+        Arc::clone(fixture.store()),
+        Vec::new(),
+        config,
+        Arc::new(SystemExecutorClock),
+    )
+    .expect("start executor");
+    executor
+        .set_reaper_exit_gate_for_test(Arc::new(move || {
+            exit_gate_entered_sender
+                .send(())
+                .expect("signal reaper exit gate");
+            exit_gate_release_receiver
+                .lock()
+                .expect("reaper exit gate receiver")
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release reaper exit gate");
+        }))
+        .expect("install reaper exit gate");
+
+    assert!(matches!(
+        executor.shutdown(),
+        Err(JobExecutorError::ShutdownTimeout)
+    ));
+    exit_gate_entered_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("reaper reached gate after completion notification");
+    exit_gate_release_sender
+        .send(())
+        .expect("release reaper exit gate");
+    executor.shutdown().expect("retry joins exited reaper");
+}
+
+#[test]
+fn reaper_command_errors_never_own_or_drop_worker_handles() {
+    let slot = WorkerSlot::new();
+    let (worker_done_sender, worker_done_receiver) = mpsc::sync_channel(1);
+    slot.install(std::thread::spawn(move || {
+        worker_done_sender.send(()).expect("signal worker body");
+    }));
+    worker_done_receiver
+        .recv_timeout(Duration::from_secs(1))
+        .expect("worker body completed");
+
+    let (command_sender, command_receiver) = mpsc::sync_channel(1);
+    command_sender
+        .try_send(ReaperCommand::Stop)
+        .expect("fill command channel");
+    assert!(matches!(
+        command_sender.try_send(ReaperCommand::Stop),
+        Err(mpsc::TrySendError::Full(ReaperCommand::Stop))
+    ));
+    assert!(slot.has_handle());
+    drop(command_receiver);
+    assert!(matches!(
+        command_sender.try_send(ReaperCommand::Stop),
+        Err(mpsc::TrySendError::Disconnected(ReaperCommand::Stop))
+    ));
+    assert!(slot.has_handle());
+
+    let worker = slot.take().expect("worker handle remains in slot");
+    let exit_deadline = std::time::Instant::now()
+        .checked_add(Duration::from_secs(1))
+        .expect("bounded worker exit deadline");
+    assert!(wait_for_join_exit(Some(&worker), exit_deadline));
+    worker.join().expect("join retained worker");
+}
+
+#[test]
+fn drop_after_timeout_disconnects_reaper_to_join_shared_worker_slot() {
     let mut fixture = ExecutorFixture::new("shutdown-drop-reaper");
     let job = fixture.enqueue("shutdown.drop");
     let (entered_sender, entered_receiver) = mpsc::sync_channel(1);
