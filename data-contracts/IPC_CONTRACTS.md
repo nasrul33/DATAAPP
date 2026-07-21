@@ -78,6 +78,20 @@ Recovery restart adalah batch internal, bukan mutasi per-job yang dipicu caller.
 
 T-0110 menyediakan persistence/store API dan bounded Rust keyset listing, bukan executor, engine dispatch, retry runner, Tauri job command/event, page envelope lintas bahasa, atau UI job center.
 
+## Background job executor core (T-0111)
+
+T-0111 menambahkan executor Rust project-scoped di `crates/app-core`; tidak ada canonical schema baru, command/event Tauri baru, atau dispatch ke Python engine. Caller native terlebih dahulu melakukan enqueue melalui `JobStore`, lalu menyerahkan hanya `job_id` kepada `JobExecutor`. Handler berasal dari registry native bertipe dan tidak menerima path, source row, nilai dataset, script, shell command, atau payload executable.
+
+Admission exactly-once berlaku hanya dalam satu instance executor dan satu proses. Bounded queue bersifat non-blocking saat submit; duplicate, queue penuh, shutdown, state tidak valid, atau handler yang tidak dikenal menghasilkan klasifikasi error aman tanpa mengubah lifecycle persisten. Koordinasi lintas proses/multi-instance tetap di luar scope.
+
+Cancellation tetap memakai snapshot persisten `CANCELLING` milik T-0110, bukan flag volatile kedua. Worker membaca ulang descriptor tepercaya pada checkpoint bounded, merekonsiliasi konflik CAS satu kali, lalu menyelesaikan `CANCELLED` melalui transaksi snapshot/job-event/audit yang sudah ada. Progress tunduk pada validasi bounded dan monotonic T-0110 serta tetap tersedia setelah store dibuka ulang.
+
+Setiap handler mendeklarasikan estimasi memory, disk, dan duration class. Executor mereservasi estimasi tersebut terhadap budget eksplisit yang diberikan konfigurasi sebelum status `RUNNING`; rejection dipersistenkan sebagai `FAILED/RESOURCE_LIMIT` tanpa memanggil handler. Budget ini adalah policy ceiling, bukan klaim hasil discovery physical memory atau free disk.
+
+Panic hanya ditangkap pada boundary `JobHandler::run`. Payload dan lokasi panic dibuang, tidak diformat atau dipersistenkan, lalu lifecycle dipetakan ke `FAILED/OPERATION_FAILED` dengan pesan Indonesia yang tetap dan aman. Private reaper dibuat sebelum worker; shutdown menghentikan admission, menguras job yang belum dimulai tetap sebagai `QUEUED`, dan menunggu sampai deadline konfigurasi. Handler native yang tidak kooperatif tidak dipaksa berhenti dan menghasilkan `ShutdownTimeout`; Drop menyerahkan ownership handle tersisa kepada reaper tanpa caller-facing wait tak terbatas.
+
+T-0111 tidak menambahkan automatic retry, operation-specific payload persistence, platform resource probe, command/event Tauri, Python execution, atau Job Center UI.
+
 ## Engine startup handshake
 
 The native host launches the configured Python 3.12 executable with an explicit engine module root, sends `engine.handshake`, and verifies:

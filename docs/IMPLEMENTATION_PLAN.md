@@ -41,8 +41,11 @@ Exit gate: clean clone builds, tests, launches, and verifies engine handshake.
 | Task | Scope | Main paths | Acceptance |
 |---|---|---|---|
 | T-0110 | Persistent job state foundation | `crates/app-core`, `crates/filesystem`, `migrations/metadata-sqlite`, `packages/contracts` | schema-1 projects upgrade explicitly; job state/history survives restart; illegal/concurrent transitions fail atomically; interrupted active jobs remain traceable |
+| T-0111 | Background job executor core | `crates/app-core` | bounded mock job runs asynchronously; progress/cancellation/failure remain persistent and audit-backed; resource preflight, panic containment, shutdown, and restart recovery are deterministic |
 
-T-0110 hanya membangun persistence foundation: migration eksplisit schema 1 ke 2, snapshot `job` plus riwayat `job_event` append-only, optimistic revision/CAS, cancellation kooperatif idempotent, dan recovery `FAILED/INTERRUPTED`. Background executor, Tauri job commands/events, resource preflight, retry orchestration, dan UI job center tetap dimiliki task lanjutan EPIC-110.
+T-0110 membangun persistence foundation: migration eksplisit schema 1 ke 2, snapshot `job` plus riwayat `job_event` append-only, optimistic revision/CAS, cancellation kooperatif idempotent, dan recovery `FAILED/INTERRUPTED`.
+
+T-0111 menambahkan executor Rust project-scoped dengan worker/queue bounded, admission exactly-once dalam satu proses, progress dan cancellation melalui `JobStore`, resource preflight berbasis budget konfigurasi, panic containment, serta bounded shutdown dengan private reaper. T-0111 tidak menambahkan Python engine dispatch, command/event Tauri, platform resource probe, retry orchestration, atau UI Job Center; capability tersebut tetap dimiliki task lanjutan EPIC-110.
 
 Exit gate: mock long job can run, cancel, fail, recover, and remain traceable after restart.
 

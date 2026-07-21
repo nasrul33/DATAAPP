@@ -47,7 +47,7 @@
 | REQ-ACC-01 accurate profile | Polars + DuckDB reference | EPIC-220 | profile golden suite |
 | REQ-TRACE-01 full lineage | operation/version entities | EPIC-100/300 | lineage integration tests |
 | REQ-WF-01 rerunnable workflow | DAG execution planner | EPIC-400/410 | restart/rerun e2e |
-| REQ-JOB-01 persistent, cancellable lifecycle | schema-2 job snapshot + append-only history + CAS | T-0110 / EPIC-110 | migration, transition-matrix, atomicity, cancellation, recovery, reopen tests |
+| REQ-JOB-01 persistent, cancellable lifecycle | schema-2 job snapshot + append-only history + CAS + bounded native executor | T-0110/T-0111 / EPIC-110 | migration, transition-matrix, atomicity, progress, cancellation, failure, shutdown, recovery, reopen, and duplicate-admission tests |
 
 ## Open decisions
 - Exact installer/update strategy.
@@ -71,6 +71,7 @@ Codex must read AGENTS, Product, Architecture, Primitives, IPC Contracts, curren
 | T-0100 | Completed | 2026-07-20 | Transactional project create/open/validate uses recovery-marked staging, atomic publication, SQLite schema 1, manifest fingerprint validation, and append-only initial audit history |
 | T-0101 | Completed | 2026-07-20 | Typed Tauri lifecycle commands, system path selection, safe desktop error mapping, in-memory active session, and complete loading/empty/permission/recovery/error/active UI states |
 | T-0110 | Completed | 2026-07-21 | Explicit schema-1-to-2 upgrade, persistent job snapshot and append-only history, optimistic CAS, idempotent cancellation, restart recovery to `FAILED/INTERRUPTED`, and cross-language flat contracts |
+| T-0111 | Completed | 2026-07-21 | Project-scoped bounded Rust executor runs a persisted mock job asynchronously; progress, cancellation, resource rejection, typed failure, panic containment, shutdown, reaper cleanup, duplicate admission, and restart recovery are deterministic and audit-backed |
 
 ## T-0001 decisions and deviations
 | ID | Decision/deviation | Reason | Follow-up |
@@ -192,3 +193,45 @@ T-0101 closes the UI/filesystem-boundary follow-ups in DEC-F022, DEC-F035, DEC-F
 Migration/rollback: schema 2 has no destructive downgrade. Failed upgrade restores and revalidates byte-identical schema-1 control files; if restoration proof fails, backup/marker evidence remains and normal open is blocked. A successfully upgraded project must be retained and opened with a schema-2-capable binary; job/audit history is never deleted to regain compatibility.
 
 T-0110 adds no runtime dependency and no executor/UI behavior. No conflict with confirmed product or architecture decisions was identified; DEC-F053 and DEC-F054 record the user-approved Option B Windows residuals explicitly.
+
+## T-0111 decisions and deviations
+
+| ID | Decision/deviation | Reason | Follow-up |
+|---|---|---|---|
+| DEC-F059 | Use a project-scoped in-process Rust executor with a bounded FIFO, explicit worker count, typed native handler registry, and standard-library synchronization only | Reuse the trusted T-0110 lifecycle authority without adding another protocol or runtime dependency | Engine operation dispatch must integrate through a separately versioned command contract |
+| DEC-F060 | Guarantee duplicate admission only within one executor instance and retain T-0110 CAS as the durable concurrency boundary | The volatile set prevents one-process duplicate execution without overstating cross-process coordination | Multi-instance/cross-process exactly-once requires a separately designed lease/ownership mechanism |
+| DEC-F061 | Observe cancellation exclusively through persistent `CANCELLING` snapshots and reconcile a conflicting CAS once | Avoid a second volatile cancellation truth while keeping each checkpoint wait bounded | Every future native/engine handler must checkpoint at an explicit bounded work interval |
+| DEC-F062 | Treat configured memory, disk, and duration budgets as policy ceilings and reserve estimates with checked RAII accounting | T-0111 intentionally has no trusted platform resource discovery and must reject before handler invocation | Platform memory/free-disk probes and budget selection belong to desktop/engine integration |
+| DEC-F063 | Install one executor-aware panic hook before the private reaper/workers, delegate unrelated panics, and discard marked handler payload/location | Contain handler defects without leaking source-derived or arbitrary panic text into stderr, persistence, errors, or audit metadata | Keep handler failure messages typed and safe; do not expose panic payloads in future transport/logging |
+| DEC-F064 | Create the minimal private reaper foundation in Task 4 instead of waiting for Task 7 | The approved global constraint requires successful reaper startup before any worker can start | Task 7 completed public bounded shutdown, handle retention/retry, Drop handoff, and deterministic exit proof over that foundation |
+| DEC-F065 | Use one configured shutdown deadline and never forcibly terminate a native handler | Rust threads cannot be killed safely; false success or silently dropped handles would violate lifecycle integrity | A non-cooperative handler surfaces `ShutdownTimeout`; restart recovery later marks retained `RUNNING`/`CANCELLING` state `FAILED/INTERRUPTED` once |
+| DEC-F066 | Keep Python dispatch, Tauri job command/event, Job Center UI, retry runner, operation payload persistence, and platform probes outside T-0111 | Preserve a reviewable executor-core boundary and avoid authorizing arbitrary execution | Deliver each capability in an explicit EPIC-110 follow-up with contracts, UI states, and tests |
+
+No schema migration or dependency was added by T-0111. Source data remains immutable, and `JobStore` remains the only writer of job snapshot, immutable job history, and hash-linked audit history.
+
+### T-0111 completion evidence
+
+Fresh verification on Windows 11, 2026-07-21, used `CI=true`, `UV_CACHE_DIR=D:\DATAAPP\.uv-cache`, `PYTEST_ADDOPTS=-p no:cacheprovider`, and the worktree-local pnpm store `D:\DATAAPP\.worktrees\t0111-background-executor\.pnpm-store` where applicable.
+
+| Command | Exact result |
+|---|---|
+| `pnpm install --frozen-lockfile` | exit 0; all 6 workspace projects already up to date; pnpm 11.9.0 |
+| `uv sync --frozen` | exit 0; 12 packages checked |
+| `pnpm lint` | exit 0; 16 schemas current; ESLint, Cargo fmt/Clippy, and Ruff clean |
+| `pnpm typecheck` | exit 0; strict TypeScript clean; Cargo workspace check clean; mypy found no issues in 26 source files |
+| `pnpm test` | exit 0; 20 TypeScript tests, 4 e2e tests, 125 Rust tests, and 11 Python tests passed; 0 failed |
+| `pnpm test:e2e` | exit 0; 4 passed, 0 failed |
+| `pnpm build` | exit 0; TypeScript/Vite, Cargo workspace, and Python bytecode builds succeeded |
+| `cargo fmt --check` | exit 0; no formatting diff |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0; no warnings |
+| `cargo test --workspace --locked` | exit 0; app-core 91 unit + 1 integration, desktop 3, engine-host 6, filesystem 23, secure-store 1; 125 total passed, 0 failed |
+| `cargo test -p teratai-app-core job_executor::tests --locked` | exit 0; 27 executor tests passed, 0 failed |
+| `uv run ruff check engine` | exit 0; all checks passed |
+| `uv run mypy engine` | exit 0; no issues in 25 source files |
+| `uv run pytest -p no:cacheprovider engine/tests tests/golden` | exit 0; 11 passed, 0 failed |
+| `pnpm contracts:check` | exit 0; 16 canonical schemas verified, no stale generated artifact |
+| `git diff --check` | exit 0; no whitespace error |
+
+Dependency review: `git diff -- Cargo.toml Cargo.lock pnpm-lock.yaml uv.lock` produced no output. T-0111 adds no runtime dependency or lockfile change.
+
+Residual risks accepted for this task: exactly-once admission is in-process only; policy budgets do not measure physical availability; a non-cooperative native handler cannot be forcibly killed and remains observable as `ShutdownTimeout`; engine dispatch, platform resource probes, Tauri job commands/events, automatic retry, and Job Center UI remain unimplemented. Panic payloads are deliberately discarded and never persisted.

@@ -7,7 +7,7 @@ Target utama: Windows, Tauri 2.x, Python 3.12
 
 ## Prasyarat
 
-Toolchain yang telah diverifikasi untuk T-0001 sampai T-0110:
+Toolchain yang telah diverifikasi untuk T-0001 sampai T-0111:
 
 - Node.js 24.17.0 atau kompatibel dengan `>=24.0.0`.
 - pnpm 11.9.0.
@@ -188,6 +188,18 @@ cargo test -p teratai-filesystem -p teratai-app-core --locked
 pnpm contracts:check
 ```
 
+## Background job executor core
+
+T-0111 menyediakan `JobExecutor` Rust project-scoped dengan worker dan submission queue bounded. Caller native mempersistenkan job melalui `JobStore`, lalu submit hanya `job_id`; handler terdaftar berjalan di background, menulis progress melalui CAS, mengamati cancellation persisten pada checkpoint, dan menghasilkan lifecycle plus audit history yang tetap dapat dibaca setelah reopen. Resource estimate ditolak sebelum handler berjalan jika melampaui budget memory/disk/duration yang dikonfigurasi. Handler error dan panic dipetakan ke failure metadata yang aman, sedangkan shutdown memakai deadline eksplisit dan private reaper untuk mempertahankan ownership worker handle.
+
+Verifikasi executor secara terisolasi dari root repository:
+
+```powershell
+cargo test -p teratai-app-core job_executor::tests --locked
+```
+
+T-0111 adalah API native Rust; belum ada command/event Tauri, Python engine dispatch, automatic retry, platform memory/free-disk probe, atau Job Center UI. Exactly-once admission berlaku hanya di dalam satu instance executor. Handler native wajib checkpoint secara bounded; handler non-kooperatif tidak dapat dipaksa berhenti dan akan terlihat sebagai `ShutdownTimeout`.
+
 ## Desktop project lifecycle
 
 T-0101 menghubungkan project core ke UI melalui command Tauri typed `project_create`, `project_open`, `project_validate`, `project_current`, dan `project_close`. Buat/buka proyek selalu memakai dialog sistem; capability main window dibatasi ke `dialog:allow-open` dan `dialog:allow-save`.
@@ -254,6 +266,6 @@ tests/golden              Analytics golden test boundary
 
 ## Batas implementasi saat ini
 
-T-0001 sampai T-0007 menyelesaikan foundation runtime. T-0100 dan T-0101 memulai Phase 1 dengan storage project transaksional, typed desktop commands, system file picker, dan UI lifecycle lengkap. T-0110 menambahkan metadata schema 2 dan persistent job state foundation, tetapi belum menambahkan background executor atau UI job. Operasi analitik belum diimplementasikan; sidecar Python tetap dependency-free.
+T-0001 sampai T-0007 menyelesaikan foundation runtime. T-0100 dan T-0101 memulai Phase 1 dengan storage project transaksional, typed desktop commands, system file picker, dan UI lifecycle lengkap. T-0110 menambahkan metadata schema 2 dan persistent job state foundation; T-0111 menambahkan executor background native yang bounded tanpa Tauri/Python/UI integration. Operasi analitik belum diimplementasikan; sidecar Python tetap dependency-free.
 
 MVP berakhir ketika pengguna dapat mengimpor Excel/CSV, melakukan profiling, cleaning, transformasi, join, deteksi duplikasi/outlier/rule, melihat visualisasi, menyimpan workflow, menjalankannya ulang, dan mengekspor hasil beserta audit trail.

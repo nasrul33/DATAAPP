@@ -951,7 +951,7 @@ git diff --check main...HEAD
 git status -sb
 ```
 
-Expected: twelve focused T-0111 commits including the design, plan, repository-worktree hygiene, reaper clarification, and eight implementation-task commits, a clean worktree, and no unrelated file changes.
+Expected: focused T-0111 history contains the design, implementation plan, repository-worktree hygiene, reaper clarification, all eight implementation tasks, and any review-fix commits required by task gates; the worktree is clean and the branch contains no unrelated file changes. Verify scope from the complete `main...HEAD` diff rather than a brittle fixed commit count.
 
 ---
 
