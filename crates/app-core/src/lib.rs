@@ -1,6 +1,7 @@
 #![doc = "Application orchestration boundary for Teratai Analytics Desktop."]
 
 pub mod job;
+pub mod job_executor;
 mod project_upgrade;
 
 pub use job::{
