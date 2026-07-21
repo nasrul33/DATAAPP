@@ -638,8 +638,11 @@ impl JobExecutor {
     /// # Errors
     ///
     /// Returns a safe configuration error when validation, reaper startup, or
-    /// worker startup fails. A partial worker set is closed and joined before
-    /// construction returns an error.
+    /// worker startup fails. Partial workers are closed and joined only within
+    /// the configured construction-cleanup deadline. Any handle still owned at
+    /// that deadline remains in its shared slot; when construction returns the
+    /// error, disconnect wakes the already-started reaper to join it
+    /// asynchronously.
     pub fn new(
         store: Arc<JobStore>,
         handlers: Vec<Arc<dyn JobHandler>>,
