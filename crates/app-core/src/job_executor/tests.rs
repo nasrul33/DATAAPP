@@ -10,8 +10,9 @@ use super::resource::{DurationClass, ResourceBudget, ResourceEstimate};
 use super::{
     CheckpointDecision, ClockError, ExecutionContext, ExecutorClock, ExecutorCore, HandlerOutcome,
     JobExecutor, JobExecutorConfig, JobExecutorError, JobHandler, JobHandlerError, JobProgress,
+    SystemExecutorClock,
 };
-use crate::job::JobTransitionRequest;
+use crate::job::{JobProgressUpdateRequest, JobTransitionRequest};
 use crate::{JobEnqueueRequest, JobStore, ProjectService};
 
 const PROJECT_ID: &str = "00000000-0000-7000-8000-000000000301";
@@ -160,6 +161,54 @@ struct GateHandler {
     invocations: Arc<AtomicUsize>,
 }
 
+struct CountingHandler {
+    kind: &'static str,
+    invocations: Arc<AtomicUsize>,
+    estimates: Option<Arc<AtomicUsize>>,
+    entered: Option<mpsc::SyncSender<()>>,
+}
+
+impl JobHandler for CountingHandler {
+    fn kind(&self) -> &'static str {
+        self.kind
+    }
+
+    fn estimate(&self) -> ResourceEstimate {
+        if let Some(estimates) = &self.estimates {
+            estimates.fetch_add(1, Ordering::SeqCst);
+        }
+        PassiveHandler.estimate()
+    }
+
+    fn run(&self, _context: &mut ExecutionContext<'_>) -> Result<HandlerOutcome, JobHandlerError> {
+        self.invocations.fetch_add(1, Ordering::SeqCst);
+        if let Some(entered) = &self.entered {
+            entered.send(()).expect("signal handler invocation");
+        }
+        Ok(HandlerOutcome::Completed)
+    }
+}
+
+struct BlockingCheckpointClock {
+    calls: AtomicUsize,
+    blocked: mpsc::SyncSender<()>,
+    release: Mutex<mpsc::Receiver<()>>,
+}
+
+impl ExecutorClock for BlockingCheckpointClock {
+    fn now(&self) -> Result<String, ClockError> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 1 {
+            self.blocked.send(()).expect("signal blocked checkpoint");
+            self.release
+                .lock()
+                .expect("clock release receiver")
+                .recv_timeout(Duration::from_secs(2))
+                .expect("release blocked checkpoint");
+        }
+        SystemExecutorClock.now()
+    }
+}
+
 impl JobHandler for GateHandler {
     fn kind(&self) -> &'static str {
         "mock.success"
@@ -263,6 +312,313 @@ fn mock_job_persists_progress_and_succeeds() {
         reopened.get(&queued.job_id).expect("reopened job"),
         succeeded
     );
+}
+
+#[test]
+fn queued_cancellation_skips_handler_and_completes_cancelled() {
+    let mut fixture = ExecutorFixture::new("queued-cancellation");
+    let blocker = fixture.enqueue("mock.success");
+    let cancelled = fixture.enqueue("cancel.queued");
+    let sentinel = fixture.enqueue("sentinel.kind");
+    let blocker_invocations = Arc::new(AtomicUsize::new(0));
+    let cancelled_invocations = Arc::new(AtomicUsize::new(0));
+    let cancelled_estimates = Arc::new(AtomicUsize::new(0));
+    let sentinel_invocations = Arc::new(AtomicUsize::new(0));
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(2);
+    let (release_sender, release_receiver) = mpsc::sync_channel(2);
+    let (sentinel_sender, sentinel_receiver) = mpsc::sync_channel(1);
+    let executor = JobExecutor::new(
+        Arc::clone(fixture.store()),
+        vec![
+            Arc::new(GateHandler {
+                entered: entered_sender,
+                release: Mutex::new(release_receiver),
+                invocations: Arc::clone(&blocker_invocations),
+            }),
+            Arc::new(CountingHandler {
+                kind: "cancel.queued",
+                invocations: Arc::clone(&cancelled_invocations),
+                estimates: Some(Arc::clone(&cancelled_estimates)),
+                entered: None,
+            }),
+            Arc::new(CountingHandler {
+                kind: "sentinel.kind",
+                invocations: Arc::clone(&sentinel_invocations),
+                estimates: None,
+                entered: Some(sentinel_sender),
+            }),
+        ],
+        ExecutorFixture::config(2),
+        Arc::new(FixedClock),
+    )
+    .expect("start executor");
+
+    executor.submit(&blocker.job_id).expect("submit blocker");
+    assert_eq!(
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocker enters first checkpoint"),
+        1
+    );
+    executor
+        .submit(&cancelled.job_id)
+        .expect("submit queued cancellation target");
+    executor.submit(&sentinel.job_id).expect("submit sentinel");
+    let cancelling = fixture
+        .store()
+        .request_cancellation(&JobTransitionRequest {
+            correlation_id: cancelled.correlation_id.clone(),
+            expected_revision: cancelled.revision,
+            job_id: cancelled.job_id.clone(),
+        })
+        .expect("request queued cancellation");
+
+    release_sender
+        .send(())
+        .expect("release blocker first checkpoint");
+    assert_eq!(
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("blocker enters second checkpoint"),
+        2
+    );
+    release_sender
+        .send(())
+        .expect("release blocker second checkpoint");
+    sentinel_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("worker advances past cancelled job");
+    assert!(executor.core.queue.close_and_drain().is_empty());
+    executor.workers[0]
+        .completed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("worker completes after closed queue");
+
+    let terminal = fixture
+        .store()
+        .get(&cancelled.job_id)
+        .expect("cancelled queued job");
+    assert_eq!(terminal.status, "CANCELLED");
+    assert_eq!(terminal.revision, cancelling.revision + 1);
+    assert_eq!(cancelled_invocations.load(Ordering::SeqCst), 0);
+    assert_eq!(cancelled_estimates.load(Ordering::SeqCst), 0);
+    assert_eq!(blocker_invocations.load(Ordering::SeqCst), 1);
+    assert_eq!(sentinel_invocations.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn running_cancellation_stops_before_second_work_unit_without_duplicate_event() {
+    let mut fixture = ExecutorFixture::new("running-cancellation");
+    let job = fixture.enqueue("mock.success");
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(2);
+    let (release_sender, release_receiver) = mpsc::sync_channel(2);
+    let executor = JobExecutor::new(
+        Arc::clone(fixture.store()),
+        vec![Arc::new(GateHandler {
+            entered: entered_sender,
+            release: Mutex::new(release_receiver),
+            invocations: Arc::clone(&invocations),
+        })],
+        ExecutorFixture::config(1),
+        Arc::new(SystemExecutorClock),
+    )
+    .expect("start executor");
+
+    executor
+        .submit(&job.job_id)
+        .expect("submit cancellable job");
+    assert_eq!(
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handler enters first checkpoint"),
+        1
+    );
+    let running = fixture.store().get(&job.job_id).expect("running snapshot");
+    let cancelling = fixture
+        .store()
+        .request_cancellation(&JobTransitionRequest {
+            job_id: job.job_id.clone(),
+            correlation_id: job.correlation_id.clone(),
+            expected_revision: running.revision,
+        })
+        .expect("request cancellation");
+    let repeated = fixture
+        .store()
+        .request_cancellation(&JobTransitionRequest {
+            job_id: job.job_id.clone(),
+            correlation_id: job.correlation_id.clone(),
+            expected_revision: cancelling.revision,
+        })
+        .expect("repeat cancellation");
+    assert_eq!(repeated, cancelling);
+
+    release_sender
+        .send(())
+        .expect("release cancelled checkpoint");
+    assert!(executor.core.queue.close_and_drain().is_empty());
+    executor.workers[0]
+        .completed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("worker completes after cancellation");
+
+    let terminal = fixture.store().get(&job.job_id).expect("cancelled job");
+    assert_eq!(terminal.status, "CANCELLED");
+    assert_eq!(terminal.progress_current, 0);
+    assert_eq!(terminal.revision, cancelling.revision + 1);
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        entered_receiver.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Disconnected | mpsc::RecvTimeoutError::Timeout)
+    ));
+}
+
+#[test]
+fn cancellation_winning_progress_cas_is_reconciled_once_without_progress_write() {
+    let mut fixture = ExecutorFixture::new("cancellation-progress-cas");
+    let job = fixture.enqueue("mock.success");
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(2);
+    let (release_sender, release_receiver) = mpsc::sync_channel(2);
+    let (clock_blocked_sender, clock_blocked_receiver) = mpsc::sync_channel(1);
+    let (clock_release_sender, clock_release_receiver) = mpsc::sync_channel(1);
+    let executor = JobExecutor::new(
+        Arc::clone(fixture.store()),
+        vec![Arc::new(GateHandler {
+            entered: entered_sender,
+            release: Mutex::new(release_receiver),
+            invocations: Arc::clone(&invocations),
+        })],
+        ExecutorFixture::config(1),
+        Arc::new(BlockingCheckpointClock {
+            calls: AtomicUsize::new(0),
+            blocked: clock_blocked_sender,
+            release: Mutex::new(clock_release_receiver),
+        }),
+    )
+    .expect("start executor");
+
+    executor
+        .submit(&job.job_id)
+        .expect("submit cancellable job");
+    assert_eq!(
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handler enters first checkpoint"),
+        1
+    );
+    release_sender.send(()).expect("start checkpoint write");
+    clock_blocked_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("checkpoint blocks after reading running revision");
+    let running = fixture.store().get(&job.job_id).expect("running snapshot");
+    let cancelling = fixture
+        .store()
+        .request_cancellation(&JobTransitionRequest {
+            job_id: job.job_id.clone(),
+            correlation_id: job.correlation_id.clone(),
+            expected_revision: running.revision,
+        })
+        .expect("cancellation wins progress CAS");
+    clock_release_sender
+        .send(())
+        .expect("release stale progress write");
+    assert!(executor.core.queue.close_and_drain().is_empty());
+    executor.workers[0]
+        .completed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("worker reconciles cancellation");
+
+    let terminal = fixture.store().get(&job.job_id).expect("cancelled job");
+    assert_eq!(terminal.status, "CANCELLED");
+    assert_eq!(terminal.progress_current, 0);
+    assert_eq!(terminal.revision, cancelling.revision + 1);
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    assert!(matches!(
+        entered_receiver.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Disconnected | mpsc::RecvTimeoutError::Timeout)
+    ));
+}
+
+#[test]
+fn running_progress_cas_conflict_retries_only_the_same_progress_once() {
+    let mut fixture = ExecutorFixture::new("running-progress-cas");
+    let job = fixture.enqueue("mock.success");
+    let invocations = Arc::new(AtomicUsize::new(0));
+    let (entered_sender, entered_receiver) = mpsc::sync_channel(2);
+    let (release_sender, release_receiver) = mpsc::sync_channel(2);
+    let (clock_blocked_sender, clock_blocked_receiver) = mpsc::sync_channel(1);
+    let (clock_release_sender, clock_release_receiver) = mpsc::sync_channel(1);
+    let executor = JobExecutor::new(
+        Arc::clone(fixture.store()),
+        vec![Arc::new(GateHandler {
+            entered: entered_sender,
+            release: Mutex::new(release_receiver),
+            invocations: Arc::clone(&invocations),
+        })],
+        ExecutorFixture::config(1),
+        Arc::new(BlockingCheckpointClock {
+            calls: AtomicUsize::new(0),
+            blocked: clock_blocked_sender,
+            release: Mutex::new(clock_release_receiver),
+        }),
+    )
+    .expect("start executor");
+
+    executor
+        .submit(&job.job_id)
+        .expect("submit progressing job");
+    assert_eq!(
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handler enters first checkpoint"),
+        1
+    );
+    release_sender.send(()).expect("start checkpoint write");
+    clock_blocked_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("checkpoint blocks after reading running revision");
+    let running = fixture.store().get(&job.job_id).expect("running snapshot");
+    fixture
+        .store()
+        .update_progress(&JobProgressUpdateRequest {
+            correlation_id: job.correlation_id.clone(),
+            current: 0,
+            expected_revision: running.revision,
+            job_id: job.job_id.clone(),
+            message: "Progress eksternal".to_owned(),
+            phase: "external.work".to_owned(),
+            total: Some(2),
+            unit: Some("step".to_owned()),
+        })
+        .expect("external progress wins first CAS");
+    clock_release_sender
+        .send(())
+        .expect("release stale progress write");
+    assert_eq!(
+        entered_receiver
+            .recv_timeout(Duration::from_secs(2))
+            .expect("handler continues after one retry"),
+        2
+    );
+    let reconciled = fixture
+        .store()
+        .get(&job.job_id)
+        .expect("reconciled handler progress");
+    assert_eq!(reconciled.status, "RUNNING");
+    assert_eq!(reconciled.progress_current, 1);
+    assert_eq!(reconciled.progress_phase.as_deref(), Some("mock.work"));
+
+    release_sender.send(()).expect("release second checkpoint");
+    assert!(executor.core.queue.close_and_drain().is_empty());
+    executor.workers[0]
+        .completed
+        .recv_timeout(Duration::from_secs(2))
+        .expect("worker completes after reconciled progress");
+    let terminal = fixture.store().get(&job.job_id).expect("succeeded job");
+    assert_eq!(terminal.status, "SUCCEEDED");
+    assert_eq!(terminal.progress_current, 2);
+    assert_eq!(invocations.load(Ordering::SeqCst), 1);
 }
 
 #[test]

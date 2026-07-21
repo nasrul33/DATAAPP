@@ -102,32 +102,59 @@ impl ExecutionContext<'_> {
             .store
             .get(&self.descriptor.job_id)
             .map_err(|error| map_persistence_error(&error))?;
-        match JobStatus::parse(&self.descriptor.status)
-            .map_err(|error| map_persistence_error(&error))?
-        {
+        let status = JobStatus::parse(&self.descriptor.status)
+            .map_err(|error| map_persistence_error(&error))?;
+        match status {
             JobStatus::Cancelling => return Ok(CheckpointDecision::Cancelled),
             JobStatus::Running => {}
+            terminal if terminal.is_terminal() => return Ok(CheckpointDecision::Cancelled),
             _ => return Err(JobExecutorError::InvalidState),
         }
         let timestamp = self
             .clock
             .now()
             .map_err(|_| JobExecutorError::PersistenceFailed)?;
-        let request = JobProgressUpdateRequest {
-            correlation_id: self.descriptor.correlation_id.clone(),
-            current: progress.current,
-            expected_revision: self.descriptor.revision,
-            job_id: self.descriptor.job_id.clone(),
-            message: progress.message,
-            phase: progress.phase,
-            total: progress.total,
-            unit: progress.unit,
-        };
-        self.descriptor = self
+        let request = progress_request(&self.descriptor, &progress);
+        match self.store.update_progress_at(&request, &timestamp) {
+            Ok(descriptor) => {
+                self.descriptor = descriptor;
+                Ok(CheckpointDecision::Continue)
+            }
+            Err(error) if error.kind() == JobErrorKind::RevisionConflict => {
+                self.reconcile_progress_conflict(progress)
+            }
+            Err(error) => Err(map_persistence_error(&error)),
+        }
+    }
+
+    fn reconcile_progress_conflict(
+        &mut self,
+        progress: JobProgress,
+    ) -> Result<CheckpointDecision, JobExecutorError> {
+        let refreshed = self
             .store
-            .update_progress_at(&request, &timestamp)
+            .get(&self.descriptor.job_id)
             .map_err(|error| map_persistence_error(&error))?;
-        Ok(CheckpointDecision::Continue)
+        let status =
+            JobStatus::parse(&refreshed.status).map_err(|error| map_persistence_error(&error))?;
+        self.descriptor = refreshed;
+        match status {
+            JobStatus::Cancelling => Ok(CheckpointDecision::Cancelled),
+            terminal if terminal.is_terminal() => Ok(CheckpointDecision::Cancelled),
+            JobStatus::Running => {
+                let timestamp = self
+                    .clock
+                    .now()
+                    .map_err(|_| JobExecutorError::PersistenceFailed)?;
+                let request = owned_progress_request(&self.descriptor, progress);
+                self.descriptor = self
+                    .store
+                    .update_progress_at(&request, &timestamp)
+                    .map_err(|error| map_persistence_error(&error))?;
+                Ok(CheckpointDecision::Continue)
+            }
+            _ => Err(JobExecutorError::PersistenceConflict),
+        }
     }
 
     /// Refresh the trusted snapshot and report cooperative cancellation state.
@@ -159,6 +186,38 @@ impl ExecutionContext<'_> {
     #[must_use]
     pub fn correlation_id(&self) -> &str {
         &self.descriptor.correlation_id
+    }
+}
+
+fn progress_request(
+    descriptor: &JobDescriptor,
+    progress: &JobProgress,
+) -> JobProgressUpdateRequest {
+    JobProgressUpdateRequest {
+        correlation_id: descriptor.correlation_id.clone(),
+        current: progress.current,
+        expected_revision: descriptor.revision,
+        job_id: descriptor.job_id.clone(),
+        message: progress.message.clone(),
+        phase: progress.phase.clone(),
+        total: progress.total,
+        unit: progress.unit.clone(),
+    }
+}
+
+fn owned_progress_request(
+    descriptor: &JobDescriptor,
+    progress: JobProgress,
+) -> JobProgressUpdateRequest {
+    JobProgressUpdateRequest {
+        correlation_id: descriptor.correlation_id.clone(),
+        current: progress.current,
+        expected_revision: descriptor.revision,
+        job_id: descriptor.job_id.clone(),
+        message: progress.message,
+        phase: progress.phase,
+        total: progress.total,
+        unit: progress.unit,
     }
 }
 
@@ -486,10 +545,10 @@ fn execute_job(core: &ExecutorCore, job_id: &str) -> Result<(), JobExecutorError
         .store
         .get(job_id)
         .map_err(|error| map_persistence_error(&error))?;
-    if JobStatus::parse(&queued.status).map_err(|error| map_persistence_error(&error))?
-        != JobStatus::Queued
-    {
-        return Ok(());
+    match JobStatus::parse(&queued.status).map_err(|error| map_persistence_error(&error))? {
+        JobStatus::Queued => {}
+        JobStatus::Cancelling => return complete_cancellation_from_snapshot(core, &queued),
+        _ => return Ok(()),
     }
     let handler = core
         .handlers
@@ -504,20 +563,42 @@ fn execute_job(core: &ExecutorCore, job_id: &str) -> Result<(), JobExecutorError
         .clock
         .now()
         .map_err(|_| JobExecutorError::PersistenceFailed)?;
-    let running = core
+    let running = match core
         .store
         .start_at(&transition_request(&queued), &started_at)
-        .map_err(|error| map_persistence_error(&error))?;
+    {
+        Ok(running) => running,
+        Err(error) if error.kind() == JobErrorKind::RevisionConflict => {
+            return reconcile_start_conflict(core, job_id);
+        }
+        Err(error) => return Err(map_persistence_error(&error)),
+    };
     let mut context = ExecutionContext {
         store: core.store.as_ref(),
         descriptor: running,
         clock: core.clock.as_ref(),
     };
 
-    if matches!(handler.run(&mut context), Ok(HandlerOutcome::Completed)) {
-        finish_completed_job(core, job_id)?;
+    match handler.run(&mut context) {
+        Ok(HandlerOutcome::Completed) => finish_completed_job(core, job_id)?,
+        Ok(HandlerOutcome::Cancelled) => finish_cancelled_job(core, job_id)?,
+        Err(_) => {}
     }
     Ok(())
+}
+
+fn reconcile_start_conflict(core: &ExecutorCore, job_id: &str) -> Result<(), JobExecutorError> {
+    let refreshed = core
+        .store
+        .get(job_id)
+        .map_err(|error| map_persistence_error(&error))?;
+    let status =
+        JobStatus::parse(&refreshed.status).map_err(|error| map_persistence_error(&error))?;
+    match status {
+        JobStatus::Cancelling => complete_cancellation_from_snapshot(core, &refreshed),
+        terminal if terminal.is_terminal() => Ok(()),
+        _ => Err(JobExecutorError::PersistenceConflict),
+    }
 }
 
 fn finish_completed_job(core: &ExecutorCore, job_id: &str) -> Result<(), JobExecutorError> {
@@ -533,17 +614,93 @@ fn finish_completed_job(core: &ExecutorCore, job_id: &str) -> Result<(), JobExec
         .map_err(|_| JobExecutorError::PersistenceFailed)?;
     let request = transition_request(&descriptor);
     match status {
-        JobStatus::Running => core
-            .store
-            .succeed_at(&request, &finished_at)
-            .map(|_| ())
-            .map_err(|error| map_persistence_error(&error)),
-        JobStatus::Cancelling => core
-            .store
-            .complete_cancellation_at(&request, &finished_at)
-            .map(|_| ())
-            .map_err(|error| map_persistence_error(&error)),
-        _ => Ok(()),
+        JobStatus::Running => match core.store.succeed_at(&request, &finished_at) {
+            Ok(_) => Ok(()),
+            Err(error) if error.kind() == JobErrorKind::RevisionConflict => {
+                reconcile_completion_conflict(core, job_id)
+            }
+            Err(error) => Err(map_persistence_error(&error)),
+        },
+        JobStatus::Cancelling => complete_cancellation_from_snapshot(core, &descriptor),
+        terminal if terminal.is_terminal() => Ok(()),
+        _ => Err(JobExecutorError::PersistenceConflict),
+    }
+}
+
+fn finish_cancelled_job(core: &ExecutorCore, job_id: &str) -> Result<(), JobExecutorError> {
+    let descriptor = core
+        .store
+        .get(job_id)
+        .map_err(|error| map_persistence_error(&error))?;
+    let status =
+        JobStatus::parse(&descriptor.status).map_err(|error| map_persistence_error(&error))?;
+    match status {
+        JobStatus::Cancelling => complete_cancellation_from_snapshot(core, &descriptor),
+        terminal if terminal.is_terminal() => Ok(()),
+        _ => Err(JobExecutorError::InvalidState),
+    }
+}
+
+fn reconcile_completion_conflict(
+    core: &ExecutorCore,
+    job_id: &str,
+) -> Result<(), JobExecutorError> {
+    let refreshed = core
+        .store
+        .get(job_id)
+        .map_err(|error| map_persistence_error(&error))?;
+    let status =
+        JobStatus::parse(&refreshed.status).map_err(|error| map_persistence_error(&error))?;
+    match status {
+        JobStatus::Cancelling => complete_cancellation_from_snapshot(core, &refreshed),
+        terminal if terminal.is_terminal() => Ok(()),
+        _ => Err(JobExecutorError::PersistenceConflict),
+    }
+}
+
+fn complete_cancellation_from_snapshot(
+    core: &ExecutorCore,
+    descriptor: &JobDescriptor,
+) -> Result<(), JobExecutorError> {
+    let finished_at = core
+        .clock
+        .now()
+        .map_err(|_| JobExecutorError::PersistenceFailed)?;
+    match core
+        .store
+        .complete_cancellation_at(&transition_request(descriptor), &finished_at)
+    {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == JobErrorKind::RevisionConflict => {
+            reconcile_cancellation_completion(core, &descriptor.job_id)
+        }
+        Err(error) => Err(map_persistence_error(&error)),
+    }
+}
+
+fn reconcile_cancellation_completion(
+    core: &ExecutorCore,
+    job_id: &str,
+) -> Result<(), JobExecutorError> {
+    let refreshed = core
+        .store
+        .get(job_id)
+        .map_err(|error| map_persistence_error(&error))?;
+    let status =
+        JobStatus::parse(&refreshed.status).map_err(|error| map_persistence_error(&error))?;
+    match status {
+        JobStatus::Cancelling => {
+            let finished_at = core
+                .clock
+                .now()
+                .map_err(|_| JobExecutorError::PersistenceFailed)?;
+            core.store
+                .complete_cancellation_at(&transition_request(&refreshed), &finished_at)
+                .map(|_| ())
+                .map_err(|error| map_persistence_error(&error))
+        }
+        terminal if terminal.is_terminal() => Ok(()),
+        _ => Err(JobExecutorError::PersistenceConflict),
     }
 }
 
