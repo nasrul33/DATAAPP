@@ -133,4 +133,26 @@ mod tests {
             Err(PushError::Closed("late"))
         ));
     }
+
+    #[test]
+    fn poisoned_mutex_recovers_and_preserves_queue_state() {
+        let queue = Arc::new(BoundedQueue::new(2).expect("valid capacity"));
+        queue.try_push("first").expect("first item");
+
+        let poison_target = Arc::clone(&queue);
+        let poisoner = std::thread::spawn(move || {
+            let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = poison_target.state.lock().expect("acquire queue state");
+                panic!("deliberately poison queue mutex");
+            }));
+            assert!(panic_result.is_err());
+        });
+        poisoner.join().expect("poisoner thread");
+
+        queue.try_push("second").expect("recover and push");
+        assert_eq!(queue.pop(), Some("first"));
+        assert_eq!(queue.pop(), Some("second"));
+        assert!(queue.close_and_drain().is_empty());
+        assert_eq!(queue.pop(), None);
+    }
 }
