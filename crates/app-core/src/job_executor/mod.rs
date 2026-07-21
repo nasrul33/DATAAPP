@@ -608,19 +608,21 @@ fn finish_completed_job(core: &ExecutorCore, job_id: &str) -> Result<(), JobExec
         .map_err(|error| map_persistence_error(&error))?;
     let status =
         JobStatus::parse(&descriptor.status).map_err(|error| map_persistence_error(&error))?;
-    let finished_at = core
-        .clock
-        .now()
-        .map_err(|_| JobExecutorError::PersistenceFailed)?;
-    let request = transition_request(&descriptor);
     match status {
-        JobStatus::Running => match core.store.succeed_at(&request, &finished_at) {
-            Ok(_) => Ok(()),
-            Err(error) if error.kind() == JobErrorKind::RevisionConflict => {
-                reconcile_completion_conflict(core, job_id)
+        JobStatus::Running => {
+            let finished_at = core
+                .clock
+                .now()
+                .map_err(|_| JobExecutorError::PersistenceFailed)?;
+            let request = transition_request(&descriptor);
+            match core.store.succeed_at(&request, &finished_at) {
+                Ok(_) => Ok(()),
+                Err(error) if error.kind() == JobErrorKind::RevisionConflict => {
+                    reconcile_completion_conflict(core, job_id)
+                }
+                Err(error) => Err(map_persistence_error(&error)),
             }
-            Err(error) => Err(map_persistence_error(&error)),
-        },
+        }
         JobStatus::Cancelling => complete_cancellation_from_snapshot(core, &descriptor),
         terminal if terminal.is_terminal() => Ok(()),
         _ => Err(JobExecutorError::PersistenceConflict),
