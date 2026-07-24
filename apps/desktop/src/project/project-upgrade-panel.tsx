@@ -1,4 +1,4 @@
-import { useEffect, useId, useRef, useState, type SyntheticEvent } from "react";
+import { useEffect, useId, useRef, useState, type KeyboardEvent as ReactKeyboardEvent, type SyntheticEvent } from "react";
 import { AlertTriangle, DatabaseBackup, LoaderCircle, ShieldCheck, X } from "lucide-react";
 
 import type { DesktopError, ProjectDescriptor } from "@teratai/contracts";
@@ -15,8 +15,11 @@ interface ProjectUpgradePanelProps {
 
 interface ProjectUpgradeDialogProps {
   readonly confirmationValue: string;
+  readonly error: DesktopError | null;
   readonly onCancel: () => void;
   readonly onConfirmationChange: (value: string) => void;
+  readonly onDismissError: () => void;
+  readonly onRetry: () => void;
   readonly onSubmit: () => void;
   readonly pending: boolean;
   readonly projectName: string;
@@ -27,6 +30,17 @@ export function projectNameMatchesExactly(
   projectName: string,
 ): boolean {
   return confirmationValue === projectName;
+}
+
+export function getNextFocusIndex(
+  currentIndex: number,
+  focusableCount: number,
+  movingBackward: boolean,
+): number | null {
+  if (focusableCount === 0) return null;
+  if (movingBackward && currentIndex <= 0) return focusableCount - 1;
+  if (!movingBackward && currentIndex >= focusableCount - 1) return 0;
+  return null;
 }
 
 export function ProjectUpgradePanel({
@@ -102,7 +116,7 @@ export function ProjectUpgradePanel({
         </button>
       </div>
 
-      {error === null ? null : (
+      {error === null || dialogOpen ? null : (
         <ProjectUpgradeError
           error={error}
           onDismiss={onDismissError}
@@ -116,8 +130,11 @@ export function ProjectUpgradePanel({
       {dialogOpen ? (
         <ProjectUpgradeDialog
           confirmationValue={confirmationValue}
+          error={error}
           onCancel={closeDialog}
           onConfirmationChange={setConfirmationValue}
+          onDismissError={onDismissError}
+          onRetry={() => void submitUpgrade()}
           onSubmit={() => void submitUpgrade()}
           pending={pending}
           projectName={project.name}
@@ -129,40 +146,68 @@ export function ProjectUpgradePanel({
 
 export function ProjectUpgradeDialog({
   confirmationValue,
+  error,
   onCancel,
   onConfirmationChange,
+  onDismissError,
+  onRetry,
   onSubmit,
   pending,
   projectName,
 }: ProjectUpgradeDialogProps) {
   const descriptionId = useId();
+  const errorId = useId();
+  const dialogRef = useRef<HTMLElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const confirmed = projectNameMatchesExactly(confirmationValue, projectName);
 
   useEffect(() => {
+    if (pending) {
+      dialogRef.current?.focus();
+      return;
+    }
     inputRef.current?.focus();
-  }, []);
+  }, [pending]);
 
   function submit(event: SyntheticEvent<HTMLFormElement, SubmitEvent>) {
     event.preventDefault();
     if (!pending && confirmed) onSubmit();
   }
 
+  function containFocus(event: ReactKeyboardEvent<HTMLDivElement>) {
+    if (event.key !== "Tab") return;
+    const focusableElements = Array.from(
+      event.currentTarget.querySelectorAll<HTMLElement>(
+        'button:not([disabled]), input:not([disabled]), [data-focus-container="true"][tabindex="0"]',
+      ),
+    );
+    const currentIndex = focusableElements.indexOf(event.currentTarget.ownerDocument.activeElement as HTMLElement);
+    const nextFocusIndex = getNextFocusIndex(currentIndex, focusableElements.length, event.shiftKey);
+    if (nextFocusIndex === null) return;
+
+    event.preventDefault();
+    focusableElements[nextFocusIndex]?.focus();
+  }
+
   return (
     <div
       className="fixed inset-0 z-50 grid place-items-center bg-emerald-950/55 p-4 backdrop-blur-sm"
       onKeyDown={(event) => {
+        containFocus(event);
         if (event.key === "Escape" && !pending) onCancel();
       }}
       role="presentation"
     >
       <section
         aria-busy={pending}
-        aria-describedby={descriptionId}
+        aria-describedby={error === null ? descriptionId : `${descriptionId} ${errorId}`}
         aria-labelledby="project-upgrade-dialog-title"
         aria-modal="true"
         className="w-full max-w-xl rounded-2xl border border-stone-200 bg-white p-6 shadow-2xl shadow-emerald-950/25"
         role="alertdialog"
+        ref={dialogRef}
+        tabIndex={pending ? 0 : -1}
+        data-focus-container="true"
       >
         <div className="flex items-start justify-between gap-4">
           <span className="grid size-11 place-items-center rounded-xl bg-amber-100 text-amber-900" aria-hidden="true">
@@ -183,6 +228,16 @@ export function ProjectUpgradeDialog({
           <p>Ketik nama proyek persis seperti tercantum untuk mengonfirmasi upgrade metadata dari schema versi 1 ke versi 2.</p>
           <p>Tidak ada downgrade. Bukti pemulihan dibuat sebelum migrasi, dataset sumber tidak berubah, dan aplikasi harus tetap terbuka selama migrasi terbatas berlangsung.</p>
         </div>
+
+        {error === null ? null : (
+          <ProjectUpgradeError
+            error={error}
+            id={errorId}
+            onDismiss={onDismissError}
+            onRetry={onRetry}
+            pending={pending}
+          />
+        )}
 
         <form className="mt-6" onSubmit={submit}>
           <label className="text-sm font-semibold text-stone-800" htmlFor="project-upgrade-confirmation">
@@ -228,16 +283,17 @@ export function ProjectUpgradeDialog({
 
 interface ProjectUpgradeErrorProps {
   readonly error: DesktopError;
+  readonly id?: string;
   readonly onDismiss: () => void;
   readonly onRetry: () => void;
   readonly pending: boolean;
 }
 
-function ProjectUpgradeError({ error, onDismiss, onRetry, pending }: ProjectUpgradeErrorProps) {
+function ProjectUpgradeError({ error, id, onDismiss, onRetry, pending }: ProjectUpgradeErrorProps) {
   const recoveryRequired = error.code === "PROJECT_CORRUPTED";
 
   return (
-    <div className="mt-5 rounded-xl border border-red-200 bg-red-50 p-4" role="alert">
+    <div className="mt-5 rounded-xl border border-red-200 bg-red-50 p-4" id={id} role="alert">
       <p className="text-sm font-semibold text-red-900">
         {recoveryRequired ? "Proyek memerlukan pemulihan" : "Upgrade proyek belum selesai"}
       </p>

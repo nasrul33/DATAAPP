@@ -7,6 +7,7 @@ import { App } from "../src/app/app";
 import { AppShell } from "../src/app/app-shell";
 import { ProjectDialog } from "../src/project/project-dialog";
 import {
+  getNextFocusIndex,
   projectNameMatchesExactly,
   ProjectUpgradeDialog,
   ProjectUpgradePanel,
@@ -220,8 +221,11 @@ describe("desktop project upgrade confirmation surface", () => {
     const mismatched = renderToStaticMarkup(
       <ProjectUpgradeDialog
         confirmationValue="Audit Belanja 2026 "
+        error={null}
         onCancel={() => undefined}
         onConfirmationChange={() => undefined}
+        onDismissError={() => undefined}
+        onRetry={() => undefined}
         onSubmit={() => undefined}
         pending={false}
         projectName={schemaOneDescriptor.name}
@@ -230,8 +234,11 @@ describe("desktop project upgrade confirmation surface", () => {
     const matched = renderToStaticMarkup(
       <ProjectUpgradeDialog
         confirmationValue={schemaOneDescriptor.name}
+        error={null}
         onCancel={() => undefined}
         onConfirmationChange={() => undefined}
+        onDismissError={() => undefined}
+        onRetry={() => undefined}
         onSubmit={() => undefined}
         pending={false}
         projectName={schemaOneDescriptor.name}
@@ -247,8 +254,11 @@ describe("desktop project upgrade confirmation surface", () => {
     const markup = renderToStaticMarkup(
       <ProjectUpgradeDialog
         confirmationValue={schemaOneDescriptor.name}
+        error={null}
         onCancel={() => undefined}
         onConfirmationChange={() => undefined}
+        onDismissError={() => undefined}
+        onRetry={() => undefined}
         onSubmit={() => undefined}
         pending
         projectName={schemaOneDescriptor.name}
@@ -262,6 +272,47 @@ describe("desktop project upgrade confirmation surface", () => {
     expect(markup).toContain('autoComplete="off"');
     expect(markup).toContain('spellCheck="false"');
     expect(markup.match(/disabled=""/g)).toHaveLength(4);
+  });
+
+  it("keeps safe retriable upgrade feedback inside an open dialog without clearing confirmation", () => {
+    const error = desktopError({
+      correlation_id: "00000000-0000-7000-8000-000000000778",
+      detail: "D:\\confidential\\metadata.sqlite",
+      field_errors: ["Metadata schema belum siap."],
+      message: "Upgrade proyek belum dapat diselesaikan.",
+      remediation: "Coba kembali setelah memeriksa ruang penyimpanan.",
+      retriable: true,
+    });
+    const markup = renderToStaticMarkup(
+      <ProjectUpgradeDialog
+        confirmationValue={schemaOneDescriptor.name}
+        error={error}
+        onCancel={() => undefined}
+        onConfirmationChange={() => undefined}
+        onDismissError={() => undefined}
+        onRetry={() => undefined}
+        onSubmit={() => undefined}
+        pending={false}
+        projectName={schemaOneDescriptor.name}
+      />,
+    );
+
+    expect(markup).toContain('role="alertdialog"');
+    expect(markup).toContain(`value="${schemaOneDescriptor.name}"`);
+    expect(markup).toContain(error.message);
+    expect(markup).toContain(error.remediation);
+    expect(markup).toContain(error.field_errors[0]);
+    expect(markup).toContain(error.correlation_id);
+    expect(markup).toContain("Tutup pesan");
+    expect(markup).toContain("Coba lagi");
+    expect(markup).not.toContain(error.detail);
+  });
+
+  it("cycles focus to the opposite dialog boundary on Tab", () => {
+    expect(getNextFocusIndex(0, 4, true)).toBe(3);
+    expect(getNextFocusIndex(3, 4, false)).toBe(0);
+    expect(getNextFocusIndex(1, 4, false)).toBeNull();
+    expect(getNextFocusIndex(0, 0, false)).toBeNull();
   });
 
   it("renders safe retriable error details with retry controls", () => {
