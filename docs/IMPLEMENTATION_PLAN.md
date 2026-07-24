@@ -44,6 +44,7 @@ Exit gate: clean clone builds, tests, launches, and verifies engine handshake.
 | T-0111 | Background job executor core | `crates/app-core` | bounded mock job runs asynchronously; progress/cancellation/failure remain persistent and audit-backed; resource preflight, panic containment, shutdown, and restart recovery are deterministic |
 | T-0112 | Typed desktop job IPC foundation | `apps/desktop`, `apps/desktop/src-tauri`, `crates/app-core`, `packages/contracts` | active-project job get/list/cancel commands are schema-first and project-scoped; durable mutations emit revision-linked best-effort events; invalid, stale, schema-1, and corrupted states return safe typed errors |
 | T-0113 | Job Center desktop UI | `apps/desktop` | active schema-2 projects render bounded durable job pages, revision-aware live updates, explicit lifecycle states, and confirmed cooperative cancellation without adding execution or migration behavior |
+| T-0114 | Explicit active-project schema upgrade | `apps/desktop`, `apps/desktop/src-tauri`, `crates/app-core` | active schema-1 sessions upgrade only after exact project-name confirmation; lifecycle mutations serialize; schema-2 session state is published only after the project-scoped `JobStore` opens; rollback-safe failures preserve schema 1 and retry safely, while recovery-required corruption remains non-destructive with no retry |
 
 T-0110 membangun persistence foundation: migration eksplisit schema 1 ke 2, snapshot `job` plus riwayat `job_event` append-only, optimistic revision/CAS, cancellation kooperatif idempotent, dan recovery `FAILED/INTERRUPTED`.
 
@@ -52,6 +53,8 @@ T-0111 menambahkan executor Rust project-scoped dengan worker/queue bounded, adm
 T-0112 mengekspos query dan cooperative cancellation melalui command Tauri bertipe, keyset page bounded, client TypeScript yang memvalidasi ulang payload, serta event lifecycle best-effort yang selalu mereferensikan snapshot durable dan revision persisten. Persistence tetap source of truth; event yang terlewat dipulihkan melalui `job_get`/`job_list`. Project schema 1 tetap read-only dan menghasilkan `PROJECT_UPGRADE_REQUIRED` untuk command job tanpa migrasi otomatis.
 
 T-0113 menambahkan Job Center pada dashboard proyek aktif. UI memuat page keyset secara bounded, mempertahankan maksimum 100 snapshot, menggabungkan event hanya ketika revision lebih baru, dan selalu menyediakan refresh durable. Pembatalan memerlukan konfirmasi dan tetap cooperative; schema upgrade, enqueue operation, Python dispatch, dan retry runner tetap di luar scope.
+
+T-0114 menggantikan residual schema-upgrade UI dari T-0112/T-0113 dengan command `project_upgrade` khusus sesi aktif tanpa path dari UI. Nama proyek harus cocok persis, termasuk case, whitespace, dan Unicode code points. Create/open/close/upgrade memakai serialisasi lifecycle bersama; descriptor schema 2 hanya dipublikasikan setelah `JobStore` aktif. Kegagalan rollback-safe mempertahankan sesi schema 1 dan dapat dicoba ulang, sedangkan `PROJECT_CORRUPTED` mempertahankan bukti recovery secara non-destruktif tanpa aksi retry. T-0114 tidak menambah migration, dependency, contract schema, atau capability.
 
 Exit gate: mock long job can run, cancel, fail, recover, and remain traceable after restart.
 

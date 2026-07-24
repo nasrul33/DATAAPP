@@ -74,6 +74,7 @@ Codex must read AGENTS, Product, Architecture, Primitives, IPC Contracts, curren
 | T-0111 | Completed | 2026-07-21 | Project-scoped bounded Rust executor runs a persisted mock job asynchronously; progress, cancellation, resource rejection, typed failure, panic containment, shutdown, reaper cleanup, duplicate admission, and restart recovery are deterministic and audit-backed |
 | T-0112 | Completed | 2026-07-24 | Schema-first active-project job get/list/cancel commands, revision-linked durable lifecycle notifications, safe error mapping, and strict TypeScript trust-boundary parsing pass all local quality gates |
 | T-0113 | Completed | 2026-07-24 | Active schema-2 projects render a bounded, revision-aware, accessible Job Center with durable refresh, keyset pagination, complete UI states, and confirmed cooperative cancellation |
+| T-0114 | Completed | 2026-07-24 | Active-session-only explicit schema upgrade replaces the DEC-F071/DEC-F079 UI gap: exact-name confirmation, serialized lifecycle mutation, schema-2 publication only after `JobStore` activation, rollback-safe retry, and non-destructive recovery-required handling; focused Rust (10 desktop + 9 app-core), TypeScript (12), and UI/lifecycle (22 + 29) tests plus task-level typecheck/lint passed |
 
 ## T-0001 decisions and deviations
 | ID | Decision/deviation | Reason | Follow-up |
@@ -334,3 +335,28 @@ Fresh verification on Windows 11, 2026-07-24, used `UV_CACHE_DIR=D:\DATAAPP\.uv-
 | `git diff -- Cargo.toml Cargo.lock pnpm-lock.yaml uv.lock` | no output; dependencies and lockfiles unchanged |
 
 Residual scope after T-0113: lifecycle notification delivery remains process-local and best-effort; loaded-set filters do not claim server-wide totals; schema upgrade, operation enqueue/engine dispatch, platform resource discovery, retry orchestration, and persistent UI preferences remain unimplemented.
+
+## T-0114 decisions and deviations
+
+| ID | Decision/deviation | Reason | Follow-up |
+|---|---|---|---|
+| DEC-F080 | Authorize `project_upgrade` only from the active in-memory session and serialize create/open/close/upgrade through one lifecycle guard; publish a schema-2 session only after the project-scoped `JobStore` opens | The UI must never supply a filesystem path or observe schema 2 without its required job authority, and concurrent lifecycle mutations must not replace the authorized project during upgrade | Keep open, validate, current, and job reads migration-free; cross-process ownership remains a separately designed concern |
+| DEC-F081 | Require exact raw project-name confirmation with no trim, normalization, or case folding | The irreversible control-metadata change needs deliberate confirmation that cannot be satisfied by a visually similar or normalized value | Keep source datasets immutable and do not introduce a schema-2-to-1 downgrade |
+
+T-0114 closes the residual explicit schema-upgrade UI/path authority gaps recorded by DEC-F071 and DEC-F079. `project_upgrade` accepts only a correlation request and resolves the trusted active project natively. Rollback-safe errors retain the active schema-1 session and return retriable `OPERATION_FAILED`; `PROJECT_CORRUPTED` retains recovery evidence, routes to the non-destructive recovery-required state, and offers no retry. No metadata migration, runtime dependency, canonical contract schema, IPC capability, or permission was added.
+
+### T-0114 completion evidence
+
+Focused verification on Windows 11, 2026-07-24:
+
+| Command / suite | Exact result |
+|---|---|
+| Task 1 focused Rust tests | 10 desktop + 9 app-core tests passed |
+| Task 2 TypeScript tests | 12 tests passed |
+| Task 3 focused tests | 22 tests passed |
+| Task 4 focused tests | 29 tests passed |
+| Task-level TypeScript typecheck and lint | passed |
+
+Full repository quality gates remain owned by Task 6 and are not claimed by T-0114.
+
+Remaining scope after T-0114: recovery repair tooling, operation enqueue, Python dispatch, automatic retry runner, platform resource discovery, and persistent UI preferences.
