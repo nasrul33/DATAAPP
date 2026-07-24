@@ -192,6 +192,8 @@ pnpm contracts:check
 
 T-0111 menyediakan `JobExecutor` Rust project-scoped dengan worker dan submission queue bounded. Caller native mempersistenkan job melalui `JobStore`, lalu submit hanya `job_id`; handler terdaftar berjalan di background, menulis progress melalui CAS, mengamati cancellation persisten pada checkpoint, dan menghasilkan lifecycle plus audit history yang tetap dapat dibaca setelah reopen. Resource estimate ditolak sebelum handler berjalan jika melampaui budget memory/disk/duration yang dikonfigurasi. Handler error dan panic dipetakan ke failure metadata yang aman. Shutdown memakai deadline eksplisit; setiap handle tetap di preallocated shared worker slot, dan setelah timed-out Drop, sender disconnection membangunkan private reaper untuk mengambil serta join handle tersisa secara asynchronous.
 
+Outcome cancellation dari handler hanya diterima jika snapshot sudah `CANCELLING`. Outcome cancellation tanpa permintaan aktif dipersistenkan sebagai `FAILED/OPERATION_FAILED` yang aman dan non-retriable, sehingga defect handler tidak meninggalkan job `RUNNING`. Test executor juga membuktikan overflow/aggregate resource rejection serta kontinuitas revision dan before/after audit hash pada jalur success, cancellation, failure, panic, preflight, dan restart recovery.
+
 Verifikasi executor secara terisolasi dari root repository:
 
 ```powershell

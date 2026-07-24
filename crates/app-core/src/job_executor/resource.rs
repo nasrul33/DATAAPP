@@ -183,11 +183,37 @@ mod tests {
             ledger.reserve(estimate(50, 10, DurationClass::Short)),
             Err(ResourceError::MemoryExceeded)
         ));
+        assert!(matches!(
+            ledger.reserve(estimate(10, 121, DurationClass::Short)),
+            Err(ResourceError::DiskExceeded)
+        ));
         drop(first);
         assert_eq!(ledger.reserved_for_test(), (0, 0));
         assert!(ledger
             .reserve(estimate(100, 200, DurationClass::Medium))
             .is_ok());
+    }
+
+    #[test]
+    fn aggregate_arithmetic_overflow_is_rejected_without_corrupting_reservation() {
+        let ledger = ResourceLedger::new(ResourceBudget {
+            memory_bytes: u64::MAX,
+            disk_bytes: u64::MAX,
+            max_duration: DurationClass::Long,
+        })
+        .expect("valid maximum budget");
+        let reservation = ledger
+            .reserve(estimate(u64::MAX, u64::MAX, DurationClass::Long))
+            .expect("maximum reservation");
+
+        assert!(matches!(
+            ledger.reserve(estimate(1, 1, DurationClass::Short)),
+            Err(ResourceError::ArithmeticOverflow)
+        ));
+        assert_eq!(ledger.reserved_for_test(), (u64::MAX, u64::MAX));
+
+        drop(reservation);
+        assert_eq!(ledger.reserved_for_test(), (0, 0));
     }
 
     #[test]

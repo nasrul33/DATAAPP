@@ -1477,6 +1477,11 @@ fn snapshot_hash(descriptor: &JobDescriptor) -> Result<String, JobError> {
     Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
 }
 
+#[cfg(test)]
+pub(crate) fn snapshot_hash_for_test(descriptor: &JobDescriptor) -> Result<String, JobError> {
+    snapshot_hash(descriptor)
+}
+
 fn format_uuid(bytes: [u8; 16]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut result = String::with_capacity(36);

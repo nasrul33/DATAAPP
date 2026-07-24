@@ -90,6 +90,8 @@ Setiap handler mendeklarasikan estimasi memory, disk, dan duration class. Execut
 
 Panic hanya ditangkap pada boundary `JobHandler::run`. Payload dan lokasi panic dibuang, tidak diformat atau dipersistenkan, lalu lifecycle dipetakan ke `FAILED/OPERATION_FAILED` dengan pesan Indonesia yang tetap dan aman. Sebelum worker dibuat, private reaper menerima clone setiap `Arc<WorkerSlot>` yang sudah dialokasikan; `JoinHandle` worker dipasang dan tetap berada di shared slot tersebut, bukan dikirim melalui channel. Shutdown menghentikan admission, menguras job yang belum dimulai tetap sebagai `QUEUED`, dan menunggu sampai deadline konfigurasi. Handler native yang tidak kooperatif tidak dipaksa berhenti dan menghasilkan `ShutdownTimeout`. Jika Drop juga timeout, pelepasan payload-free command sender memutus channel dan membangunkan reaper yang sudah berjalan untuk mengambil serta join handle tersisa secara asynchronous, tanpa caller-facing wait tak terbatas. Command channel hanya membawa `Stop`, sehingga kondisi `Full` atau `Disconnected` tidak pernah memiliki atau menjatuhkan worker handle.
 
+`HandlerOutcome::Cancelled` hanya sah ketika snapshot tepercaya sudah `CANCELLING`. Jika handler mengembalikan outcome tersebut tanpa permintaan cancellation aktif, executor memperlakukannya sebagai defect handler dan menutup lifecycle menjadi `FAILED/OPERATION_FAILED` dengan pesan tetap, aman, non-retriable; job tidak boleh tertinggal `RUNNING`.
+
 T-0111 tidak menambahkan automatic retry, operation-specific payload persistence, platform resource probe, command/event Tauri, Python execution, atau Job Center UI.
 
 ## Engine startup handshake

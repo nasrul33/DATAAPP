@@ -381,6 +381,22 @@ impl JobHandler for FailingHandler {
     }
 }
 
+struct UnexpectedCancelledHandler;
+
+impl JobHandler for UnexpectedCancelledHandler {
+    fn kind(&self) -> &'static str {
+        "mock.unexpected-cancelled"
+    }
+
+    fn estimate(&self) -> ResourceEstimate {
+        PassiveHandler.estimate()
+    }
+
+    fn run(&self, _context: &mut ExecutionContext<'_>) -> Result<HandlerOutcome, JobHandlerError> {
+        Ok(HandlerOutcome::Cancelled)
+    }
+}
+
 struct PanicHandler;
 
 impl JobHandler for PanicHandler {
@@ -470,6 +486,54 @@ fn job_history_counts(project_path: &std::path::Path, job_id: &str) -> (i64, i64
     (job_events, audit_events)
 }
 
+fn assert_job_audit_chain(fixture: &ExecutorFixture, descriptor: &crate::JobDescriptor) {
+    let connection = rusqlite::Connection::open(fixture.project_path.join("metadata.sqlite"))
+        .expect("open metadata for audit proof");
+    let mut revision_statement = connection
+        .prepare("SELECT revision FROM job_event WHERE job_id = ?1 ORDER BY sequence")
+        .expect("prepare job revision query");
+    let revisions = revision_statement
+        .query_map([descriptor.job_id.as_str()], |row| row.get::<_, i64>(0))
+        .expect("query job revisions")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decode job revisions");
+    let expected_revisions = (1..=descriptor.revision).collect::<Vec<_>>();
+    assert_eq!(revisions, expected_revisions);
+
+    let mut audit_statement = connection
+        .prepare(
+            "SELECT before_hash, after_hash
+             FROM audit_event
+             WHERE target_type = 'job' AND target_id = ?1
+             ORDER BY sequence",
+        )
+        .expect("prepare job audit query");
+    let audit_hashes = audit_statement
+        .query_map([descriptor.job_id.as_str()], |row| {
+            Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?))
+        })
+        .expect("query job audit hashes")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("decode job audit hashes");
+    assert_eq!(audit_hashes.len(), revisions.len());
+    assert_eq!(
+        audit_hashes.first().and_then(|entry| entry.0.as_ref()),
+        None
+    );
+    for hashes in audit_hashes.windows(2) {
+        assert_eq!(
+            hashes[0].1,
+            hashes[1].0.as_deref().expect("linked before hash")
+        );
+    }
+    let expected_terminal_hash =
+        crate::job::snapshot_hash_for_test(descriptor).expect("hash terminal descriptor");
+    assert_eq!(
+        audit_hashes.last().map(|entry| entry.1.as_str()),
+        Some(expected_terminal_hash.as_str())
+    );
+}
+
 #[test]
 fn over_budget_job_fails_preflight_without_invoking_handler() {
     let mut fixture = ExecutorFixture::new("over-budget-failure");
@@ -524,6 +588,7 @@ fn over_budget_job_fails_preflight_without_invoking_handler() {
     assert_eq!(preflight.error_retriable, Some(false));
     assert_eq!(rejected_invocations.load(Ordering::SeqCst), 0);
     assert_eq!(following_invocations.load(Ordering::SeqCst), 1);
+    assert_job_audit_chain(&fixture, &preflight);
 }
 
 #[test]
@@ -540,6 +605,7 @@ fn poisoned_resource_ledger_is_an_internal_failure_not_a_resource_limit() {
     assert_eq!(failed.error_code.as_deref(), Some("OPERATION_FAILED"));
     assert_ne!(failed.error_code.as_deref(), Some("RESOURCE_LIMIT"));
     assert_eq!(failed.error_retriable, Some(false));
+    assert_job_audit_chain(&fixture, &failed);
 }
 
 #[test]
@@ -592,6 +658,62 @@ fn typed_handler_failure_preserves_validated_safe_fields() {
     );
     assert_eq!(failed.error_retriable, Some(true));
     assert_eq!(following_invocations.load(Ordering::SeqCst), 1);
+    assert_job_audit_chain(&fixture, &failed);
+}
+
+#[test]
+fn unexpected_cancelled_outcome_becomes_safe_terminal_failure() {
+    let mut fixture = ExecutorFixture::new("unexpected-cancelled-outcome");
+    let invalid_job = fixture.enqueue("mock.unexpected-cancelled");
+    let following_job = fixture.enqueue("following.success");
+    let following_invocations = Arc::new(AtomicUsize::new(0));
+    let (following_sender, following_receiver) = mpsc::sync_channel(1);
+    let mut executor = JobExecutor::new(
+        Arc::clone(fixture.store()),
+        vec![
+            Arc::new(UnexpectedCancelledHandler),
+            Arc::new(CountingHandler {
+                kind: "following.success",
+                invocations: Arc::clone(&following_invocations),
+                estimates: None,
+                entered: Some(following_sender),
+            }),
+        ],
+        ExecutorFixture::config(2),
+        Arc::new(FixedClock),
+    )
+    .expect("start executor");
+
+    executor
+        .submit(&invalid_job.job_id)
+        .expect("submit invalid cancellation outcome");
+    executor
+        .submit(&following_job.job_id)
+        .expect("submit following job");
+    following_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("worker continues after invalid handler outcome");
+    executor.shutdown().expect("join worker");
+
+    let invalid = fixture
+        .store()
+        .get(&invalid_job.job_id)
+        .expect("invalid outcome terminal snapshot");
+    let following = fixture
+        .store()
+        .get(&following_job.job_id)
+        .expect("following terminal snapshot");
+    assert_eq!(invalid.status, "FAILED");
+    assert_eq!(invalid.error_code.as_deref(), Some("OPERATION_FAILED"));
+    assert_eq!(
+        invalid.error_message.as_deref(),
+        Some("Handler job mengembalikan pembatalan tanpa permintaan aktif.")
+    );
+    assert_eq!(invalid.error_retriable, Some(false));
+    assert_eq!(following.status, "SUCCEEDED");
+    assert_eq!(following_invocations.load(Ordering::SeqCst), 1);
+    assert_job_audit_chain(&fixture, &invalid);
+    assert_job_audit_chain(&fixture, &following);
 }
 
 #[test]
@@ -750,6 +872,8 @@ fn panic_is_sanitized_and_same_worker_runs_following_job() {
     assert_eq!(panicked.error_retriable, Some(false));
     assert_eq!(following.status, "SUCCEEDED");
     assert_eq!(following_invocations.load(Ordering::SeqCst), 1);
+    assert_job_audit_chain(&fixture, &panicked);
+    assert_job_audit_chain(&fixture, &following);
 }
 
 #[test]
@@ -809,6 +933,7 @@ fn mock_job_persists_progress_and_succeeds() {
     assert_eq!(succeeded.progress_phase.as_deref(), Some("mock.work"));
     assert_eq!(succeeded.revision, first_progress.revision + 2);
     assert_eq!(invocations.load(Ordering::SeqCst), 1);
+    assert_job_audit_chain(&fixture, &succeeded);
 
     let reopened = JobStore::open(&fixture.project_path).expect("reopen job store");
     assert_eq!(
@@ -907,6 +1032,7 @@ fn queued_cancellation_skips_handler_and_completes_cancelled() {
     assert_eq!(cancelled_estimates.load(Ordering::SeqCst), 0);
     assert_eq!(blocker_invocations.load(Ordering::SeqCst), 1);
     assert_eq!(sentinel_invocations.load(Ordering::SeqCst), 1);
+    assert_job_audit_chain(&fixture, &terminal);
 }
 
 #[test]
@@ -974,6 +1100,7 @@ fn running_cancellation_stops_before_second_work_unit_without_duplicate_event() 
         entered_receiver.recv_timeout(Duration::from_millis(100)),
         Err(mpsc::RecvTimeoutError::Disconnected | mpsc::RecvTimeoutError::Timeout)
     ));
+    assert_job_audit_chain(&fixture, &terminal);
 }
 
 #[test]
@@ -1574,6 +1701,7 @@ fn restart_recovery_fails_active_jobs_once_and_preserves_queued_job() {
         assert_eq!(descriptor.status, "FAILED");
         assert_eq!(descriptor.error_code.as_deref(), Some("INTERRUPTED"));
         assert_eq!(descriptor.error_retriable, Some(true));
+        assert_job_audit_chain(&fixture, descriptor);
     }
     assert_eq!(
         fixture

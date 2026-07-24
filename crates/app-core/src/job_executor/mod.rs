@@ -24,6 +24,8 @@ use crate::job::{
 const RESOURCE_LIMIT_MESSAGE: &str = "Pekerjaan melebihi batas resource yang dikonfigurasi.";
 const RESOURCE_INTERNAL_MESSAGE: &str = "Resource executor tidak tersedia untuk pekerjaan ini.";
 const PANIC_FAILURE_MESSAGE: &str = "Pekerjaan gagal karena kesalahan operasi internal.";
+const INVALID_CANCELLATION_OUTCOME_MESSAGE: &str =
+    "Handler job mengembalikan pembatalan tanpa permintaan aktif.";
 const HANDLER_PANIC_HOOK_MESSAGE: &str = "Handler job gagal secara internal.";
 
 static HANDLER_PANIC_HOOK_INSTALLED: OnceLock<()> = OnceLock::new();
@@ -1159,6 +1161,17 @@ fn finish_cancelled_job(core: &ExecutorCore, job_id: &str) -> Result<(), JobExec
     match status {
         JobStatus::Cancelling => complete_cancellation_from_snapshot(core, &descriptor),
         terminal if terminal.is_terminal() => Ok(()),
+        JobStatus::Running => fail_from_snapshot(
+            core,
+            &descriptor,
+            TerminalFailure {
+                code: "OPERATION_FAILED",
+                message: INVALID_CANCELLATION_OUTCOME_MESSAGE,
+                retriable: false,
+            },
+            FailureOrigin::Handler,
+            true,
+        ),
         _ => Err(JobExecutorError::InvalidState),
     }
 }
