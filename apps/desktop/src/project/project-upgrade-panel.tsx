@@ -43,6 +43,17 @@ export function getNextFocusIndex(
   return null;
 }
 
+function recoveryRequired(error: DesktopError | null): boolean {
+  return error?.code === "PROJECT_CORRUPTED";
+}
+
+export function canUpgradeProject(
+  actionStatus: ProjectLifecycle["actionStatus"],
+  error: DesktopError | null,
+): boolean {
+  return actionStatus === "idle" && !recoveryRequired(error);
+}
+
 export function ProjectUpgradePanel({
   actionStatus,
   error,
@@ -64,7 +75,7 @@ export function ProjectUpgradePanel({
   }, [dialogOpen]);
 
   function openDialog() {
-    if (actionStatus !== "idle") return;
+    if (!canUpgradeProject(actionStatus, error)) return;
     setAnnouncement("");
     setDialogOpen(true);
   }
@@ -76,7 +87,9 @@ export function ProjectUpgradePanel({
   }
 
   async function submitUpgrade() {
-    if (pending || !projectNameMatchesExactly(confirmationValue, project.name)) return;
+    if (!canUpgradeProject(actionStatus, error)
+      || pending
+      || !projectNameMatchesExactly(confirmationValue, project.name)) return;
 
     const upgraded = await onUpgrade();
     if (upgraded) {
@@ -106,7 +119,7 @@ export function ProjectUpgradePanel({
         </div>
         <button
           className="inline-flex shrink-0 items-center justify-center gap-2 rounded-lg bg-amber-800 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-amber-900 disabled:cursor-not-allowed disabled:bg-amber-800/60"
-          disabled={actionStatus !== "idle"}
+          disabled={!canUpgradeProject(actionStatus, error)}
           onClick={openDialog}
           ref={triggerRef}
           type="button"
@@ -160,6 +173,7 @@ export function ProjectUpgradeDialog({
   const dialogRef = useRef<HTMLElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const confirmed = projectNameMatchesExactly(confirmationValue, projectName);
+  const canSubmit = !pending && confirmed && !recoveryRequired(error);
 
   useEffect(() => {
     if (pending) {
@@ -171,7 +185,7 @@ export function ProjectUpgradeDialog({
 
   function submit(event: SyntheticEvent<HTMLFormElement, SubmitEvent>) {
     event.preventDefault();
-    if (!pending && confirmed) onSubmit();
+    if (canSubmit) onSubmit();
   }
 
   function containFocus(event: ReactKeyboardEvent<HTMLDivElement>) {
@@ -268,7 +282,7 @@ export function ProjectUpgradeDialog({
             </button>
             <button
               className="inline-flex items-center justify-center gap-2 rounded-lg bg-amber-800 px-4 py-2.5 text-sm font-semibold text-white shadow-sm hover:bg-amber-900 disabled:cursor-not-allowed disabled:bg-amber-800/60"
-              disabled={pending || !confirmed}
+              disabled={!canSubmit}
               type="submit"
             >
               {pending ? <LoaderCircle className="animate-spin" size={16} aria-hidden="true" /> : <ShieldCheck size={16} aria-hidden="true" />}
@@ -290,12 +304,12 @@ interface ProjectUpgradeErrorProps {
 }
 
 function ProjectUpgradeError({ error, id, onDismiss, onRetry, pending }: ProjectUpgradeErrorProps) {
-  const recoveryRequired = error.code === "PROJECT_CORRUPTED";
+  const requiresRecovery = recoveryRequired(error);
 
   return (
     <div className="mt-5 rounded-xl border border-red-200 bg-red-50 p-4" id={id} role="alert">
       <p className="text-sm font-semibold text-red-900">
-        {recoveryRequired ? "Proyek memerlukan pemulihan" : "Upgrade proyek belum selesai"}
+        {requiresRecovery ? "Proyek memerlukan pemulihan" : "Upgrade proyek belum selesai"}
       </p>
       <p className="mt-1 text-sm leading-6 text-red-800">{error.message}</p>
       {error.remediation === undefined ? null : (
@@ -307,7 +321,7 @@ function ProjectUpgradeError({ error, id, onDismiss, onRetry, pending }: Project
         </ul>
       )}
       <p className="mt-3 text-xs font-medium text-red-800">ID korelasi: {error.correlation_id}</p>
-      {error.retriable && !recoveryRequired ? (
+      {error.retriable && !requiresRecovery ? (
         <div className="mt-4 flex flex-wrap gap-3">
           <button
             className="rounded-lg border border-red-300 px-3.5 py-2 text-sm font-semibold text-red-900 hover:bg-red-100 disabled:cursor-not-allowed disabled:opacity-50"

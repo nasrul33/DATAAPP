@@ -7,6 +7,7 @@ import { App } from "../src/app/app";
 import { AppShell } from "../src/app/app-shell";
 import { ProjectDialog } from "../src/project/project-dialog";
 import {
+  canUpgradeProject,
   getNextFocusIndex,
   projectNameMatchesExactly,
   ProjectUpgradeDialog,
@@ -364,6 +365,52 @@ describe("desktop project upgrade confirmation surface", () => {
     expect(markup).not.toContain("Coba lagi");
     expect(markup).not.toContain("Hapus proyek");
     expect(markup).not.toContain("Perbaiki proyek");
+    expect(markup).not.toContain("Downgrade proyek");
+  });
+
+  it("blocks every upgrade path for a closed recovery panel", () => {
+    const error = desktopError({
+      code: "PROJECT_CORRUPTED",
+      message: "Proyek memerlukan pemulihan sebelum dapat dibuka.",
+      retriable: false,
+    });
+    const markup = renderToStaticMarkup(
+      <ProjectUpgradePanel
+        actionStatus="idle"
+        error={error}
+        onDismissError={() => undefined}
+        onUpgrade={() => Promise.resolve(false)}
+        project={schemaOneDescriptor}
+      />,
+    );
+
+    expect(canUpgradeProject("idle", error)).toBe(false);
+    expect(markup).toContain('disabled="" type="button"');
+    expect(markup).not.toContain("Coba lagi");
+  });
+
+  it("blocks exact-name upgrade submission in an open recovery dialog", () => {
+    const error = desktopError({
+      code: "PROJECT_CORRUPTED",
+      message: "Proyek memerlukan pemulihan sebelum dapat dibuka.",
+      retriable: false,
+    });
+    const markup = renderToStaticMarkup(
+      <ProjectUpgradeDialog
+        confirmationValue={schemaOneDescriptor.name}
+        error={error}
+        onCancel={() => undefined}
+        onConfirmationChange={() => undefined}
+        onDismissError={() => undefined}
+        onRetry={() => undefined}
+        onSubmit={() => undefined}
+        pending={false}
+        projectName={schemaOneDescriptor.name}
+      />,
+    );
+
+    expect(markup).toContain('disabled="" type="submit"');
+    expect(markup).not.toContain("Coba lagi");
     expect(markup).not.toContain("Downgrade proyek");
   });
 });
