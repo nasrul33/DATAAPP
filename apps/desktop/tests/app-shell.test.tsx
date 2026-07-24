@@ -16,7 +16,7 @@ import { startDesktopTrace } from "../src/runtime-logging";
 
 const descriptor = {
   created_at: "2026-07-20T12:00:00Z",
-  metadata_schema_version: 1,
+  metadata_schema_version: 2,
   name: "Audit Belanja 2026",
   project_id: "00000000-0000-7000-8000-000000000110",
   project_path: "D:\\Projects\\Audit Belanja 2026.teratai",
@@ -53,8 +53,23 @@ describe("desktop project lifecycle UI", () => {
     expect(markup).toContain("Proyek terverifikasi");
     expect(markup).toContain("Audit Belanja 2026");
     expect(markup).toContain("Project storage siap");
+    expect(markup).toContain("Job Center hanya tersedia di aplikasi desktop");
     expect(markup).toContain("Tutup proyek");
     expect(markup).toContain("Import dataset tetap nonaktif");
+  });
+
+  it("renders a non-mutating upgrade state for schema-1 projects", () => {
+    const markup = renderToStaticMarkup(
+      <AppShell
+        lifecycle={lifecycle({
+          project: { ...descriptor, metadata_schema_version: 1 },
+          status: "active",
+        })}
+      />,
+    );
+
+    expect(markup).toContain("Upgrade proyek diperlukan");
+    expect(markup).toContain("tidak di-upgrade otomatis");
   });
 
   it("renders recovery remediation without a destructive action", () => {

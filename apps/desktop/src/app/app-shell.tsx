@@ -28,10 +28,13 @@ import {
 
 import type { DesktopError, ProjectDescriptor } from "@teratai/contracts";
 
+import { JobCenter } from "../job/job-center";
+import type { JobClient } from "../job/job-client";
 import { ProjectDialog } from "../project/project-dialog";
 import type { ProjectLifecycle } from "../project/use-project-lifecycle";
 
 interface AppShellProps {
+  readonly jobClient?: JobClient | null;
   readonly lifecycle: ProjectLifecycle;
 }
 
@@ -44,7 +47,7 @@ const navigation = [
   { icon: Share2, label: "Ekspor", status: "planned" },
 ] as const;
 
-export function AppShell({ lifecycle }: AppShellProps) {
+export function AppShell({ jobClient = null, lifecycle }: AppShellProps) {
   const [createDialogOpen, setCreateDialogOpen] = useState(false);
   const projectActive = lifecycle.project !== null && lifecycle.status === "active";
 
@@ -73,6 +76,7 @@ export function AppShell({ lifecycle }: AppShellProps) {
             {lifecycle.status === "active" && lifecycle.project !== null ? (
               <ActiveProjectDashboard
                 actionStatus={lifecycle.actionStatus}
+                jobClient={jobClient}
                 onClose={() => void lifecycle.closeProject()}
                 project={lifecycle.project}
               />
@@ -259,8 +263,9 @@ function EmptyDashboard({ actionStatus, onCreate, onOpen }: EmptyDashboardProps)
   );
 }
 
-function ActiveProjectDashboard({ actionStatus, onClose, project }: {
+function ActiveProjectDashboard({ actionStatus, jobClient, onClose, project }: {
   readonly actionStatus: ProjectLifecycle["actionStatus"];
+  readonly jobClient: JobClient | null;
   readonly onClose: () => void;
   readonly project: ProjectDescriptor;
 }) {
@@ -301,6 +306,7 @@ function ActiveProjectDashboard({ actionStatus, onClose, project }: {
         </section>
         <SystemStatus workspaceStatus="Terverifikasi" />
       </DashboardGrid>
+      <JobCenter client={jobClient} project={project} />
     </div>
   );
 }

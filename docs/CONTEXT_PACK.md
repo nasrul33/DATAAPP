@@ -73,6 +73,7 @@ Codex must read AGENTS, Product, Architecture, Primitives, IPC Contracts, curren
 | T-0110 | Completed | 2026-07-21 | Explicit schema-1-to-2 upgrade, persistent job snapshot and append-only history, optimistic CAS, idempotent cancellation, restart recovery to `FAILED/INTERRUPTED`, and cross-language flat contracts |
 | T-0111 | Completed | 2026-07-21 | Project-scoped bounded Rust executor runs a persisted mock job asynchronously; progress, cancellation, resource rejection, typed failure, panic containment, shutdown, reaper cleanup, duplicate admission, and restart recovery are deterministic and audit-backed |
 | T-0112 | Completed | 2026-07-24 | Schema-first active-project job get/list/cancel commands, revision-linked durable lifecycle notifications, safe error mapping, and strict TypeScript trust-boundary parsing pass all local quality gates |
+| T-0113 | Completed | 2026-07-24 | Active schema-2 projects render a bounded, revision-aware, accessible Job Center with durable refresh, keyset pagination, complete UI states, and confirmed cooperative cancellation |
 
 ## T-0001 decisions and deviations
 | ID | Decision/deviation | Reason | Follow-up |
@@ -302,3 +303,34 @@ Fresh verification on Windows 11, 2026-07-24:
 | `git diff -- Cargo.toml Cargo.lock pnpm-lock.yaml uv.lock` | no output; dependency and lockfiles unchanged |
 
 Residual scope after T-0112: event delivery is process-local and best-effort; schema-1 upgrade UI, operation enqueue/engine dispatch, platform resource discovery, retry orchestration, and Job Center UI remain unimplemented.
+
+## T-0113 decisions and deviations
+
+| ID | Decision/deviation | Reason | Follow-up |
+|---|---|---|---|
+| DEC-F075 | Implement Job Center state with React hooks and the existing T-0112 client without adding a query/UI dependency | The required lifecycle is small, project-scoped, and already typed; a new dependency would add supply-chain and bundle cost without an owned cross-feature need | Reassess shared query infrastructure only when multiple data-heavy screens require cache coordination |
+| DEC-F076 | Request 25 newest-first jobs per page and retain at most 100 snapshots in UI memory | Keep desktop rendering and filtering bounded while matching the transport-enforced maximum page size | Server-side filtering/search requires a separately versioned list contract |
+| DEC-F077 | Merge live events only when persistent revision increases and protect every asynchronous result with a project-generation guard | Events are best-effort hints, while list/get remain authoritative; an old project response must never overwrite the next active project | Durable cross-process event replay remains outside MVP |
+| DEC-F078 | Require confirmation for cooperative cancellation, track pending mutations per job, and reconcile a failed cancellation through `job_get` | Preserve truthful `CANCELLING` semantics, prevent duplicate commands, support concurrent independent rows, and recover stale revision state | Automatic retry remains prohibited until a dedicated retry policy and attempt model exist |
+| DEC-F079 | Render schema-1 upgrade-required and unavailable-runtime states without invoking job commands | Opening a project remains read-only and browser preview must not emulate native filesystem authority | Explicit project upgrade command/UI remains a separate owned task |
+
+T-0113 adds no runtime dependency, lockfile change, canonical contract, metadata migration, analytics operation, source-data access, Python dispatch, enqueue command, or automatic retry. The UI filters only the bounded loaded set and labels counts as loaded snapshots rather than global totals.
+
+### T-0113 completion evidence
+
+Fresh verification on Windows 11, 2026-07-24, used `UV_CACHE_DIR=D:\DATAAPP\.uv-cache`, `PYTEST_ADDOPTS=-p no:cacheprovider`, and the worktree-local pnpm store `D:\DATAAPP\.worktrees\t0113-job-center\.pnpm-store` where applicable.
+
+| Command | Exact result |
+|---|---|
+| `pnpm install --frozen-lockfile --store-dir .pnpm-store --config.confirmModulesPurge=false` | exit 0; all 6 workspace projects resolved from the frozen lockfile; 188 packages installed; pnpm 11.9.0 |
+| `uv sync --frozen` | exit 0; 12 packages checked |
+| `pnpm lint` | exit 0; 20 canonical schemas current; ESLint, Cargo fmt/Clippy, and Ruff clean |
+| `pnpm typecheck` | exit 0; strict TypeScript clean; Cargo workspace check clean; mypy found no issues in 30 source files |
+| `pnpm test` | exit 0; 30 TypeScript tests, 4 e2e tests, 133 Rust tests, and 12 Python tests passed; 0 failed |
+| `pnpm test:e2e` | exit 0; 4 passed, 0 failed |
+| `pnpm build` | exit 0; TypeScript/Vite, Cargo workspace, and Python bytecode builds succeeded |
+| `pnpm contracts:check` | exit 0; 20 canonical schemas verified, no stale generated artifact |
+| `git diff --check` | exit 0; no whitespace error |
+| `git diff -- Cargo.toml Cargo.lock pnpm-lock.yaml uv.lock` | no output; dependencies and lockfiles unchanged |
+
+Residual scope after T-0113: lifecycle notification delivery remains process-local and best-effort; loaded-set filters do not claim server-wide totals; schema upgrade, operation enqueue/engine dispatch, platform resource discovery, retry orchestration, and persistent UI preferences remain unimplemented.
