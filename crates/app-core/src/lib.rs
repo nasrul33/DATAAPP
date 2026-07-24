@@ -3,6 +3,8 @@
 pub mod job;
 pub mod job_executor;
 mod project_upgrade;
+#[cfg(any(test, feature = "test-utils"))]
+pub mod test_utils;
 
 pub use job::{
     JobDescriptor, JobEnqueueRequest, JobError, JobErrorKind, JobEventSink, JobLifecycleEvent,
@@ -47,6 +49,8 @@ pub enum ProjectError {
     InvalidRequest(String),
     /// Project layout or atomic filesystem operation failed.
     Filesystem(FilesystemError),
+    /// Recovery proof could not be completed, so the project must not be retried automatically.
+    RecoveryRequired(FilesystemError),
     /// A canonical JSON artifact could not be encoded or decoded.
     Serialization(serde_json::Error),
     /// `SQLite` migration, transaction, or validation failed.
@@ -83,6 +87,7 @@ impl ProjectError {
     pub fn kind(&self) -> ProjectErrorKind {
         match self {
             Self::InvalidRequest(_) => ProjectErrorKind::InvalidRequest,
+            Self::RecoveryRequired(_) => ProjectErrorKind::RecoveryRequired,
             Self::Filesystem(FilesystemError::AlreadyExists(_)) => ProjectErrorKind::TargetExists,
             Self::Filesystem(FilesystemError::RecoveryRequired(_)) => {
                 ProjectErrorKind::RecoveryRequired
@@ -112,6 +117,9 @@ impl Display for ProjectError {
         match self {
             Self::InvalidRequest(detail) => write!(formatter, "invalid project request: {detail}"),
             Self::Filesystem(error) => write!(formatter, "project filesystem failed: {error}"),
+            Self::RecoveryRequired(_) => {
+                formatter.write_str("project recovery proof was not completed")
+            }
             Self::Serialization(error) => write!(formatter, "project JSON is invalid: {error}"),
             Self::Database(error) => write!(formatter, "project metadata failed: {error}"),
             Self::IncompatibleProject(detail) => {

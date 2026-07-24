@@ -391,8 +391,9 @@ impl ProjectUpgrade {
     /// # Errors
     ///
     /// Returns an error when a control/recovery entry is unsafe or an artifact
-    /// cannot be removed. Dropping the returned error path attempts restoration.
-    pub fn commit(mut self) -> Result<(), FilesystemError> {
+    /// cannot be removed. The caller retains this guard to observe and prove
+    /// any required restoration before the error crosses a trust boundary.
+    pub fn commit(&mut self) -> Result<(), FilesystemError> {
         self.validate_owned_state()?;
         self.validate_backup_proofs()?;
         let _metadata =
@@ -1443,7 +1444,7 @@ mod tests {
     fn committed_upgrade_removes_marker_and_backups() {
         let fixture = project_fixture("commit");
         let layout = fixture.layout();
-        let upgrade = begin_project_upgrade(layout, CORRELATION_ID, MARKER).unwrap();
+        let mut upgrade = begin_project_upgrade(layout, CORRELATION_ID, MARKER).unwrap();
         upgrade.write_manifest(b"new manifest").unwrap();
         upgrade.commit().unwrap();
         assert!(!layout
@@ -1617,6 +1618,9 @@ mod tests {
             upgrade.inject_finalize_failure(stage);
 
             assert!(upgrade.commit().is_err(), "stage {stage:?}");
+            upgrade
+                .restore()
+                .expect("restore after failed pre-commit finalization");
             assert_eq!(control_file_bytes(layout.root()), before, "stage {stage:?}");
             validate_project_layout(layout.root()).expect("restored layout");
         }
@@ -1638,6 +1642,9 @@ mod tests {
             upgrade.inject_finalize_failure(stage);
 
             assert!(upgrade.commit().is_err(), "stage {stage:?}");
+            upgrade
+                .restore()
+                .expect("restore after failed partial proof finalization");
             assert_eq!(control_file_bytes(layout.root()), before, "stage {stage:?}");
             validate_project_layout(layout.root()).expect("restored layout");
         }
@@ -1840,7 +1847,7 @@ mod tests {
     fn changed_backup_content_keeps_recovery_marker() {
         let fixture = project_fixture("changed-proof");
         let layout = fixture.layout();
-        let upgrade = begin_project_upgrade(layout, CORRELATION_ID, MARKER).unwrap();
+        let mut upgrade = begin_project_upgrade(layout, CORRELATION_ID, MARKER).unwrap();
         let mut backup = upgrade.metadata_backup_file.try_clone().unwrap();
         let length = usize::try_from(backup.metadata().unwrap().len()).unwrap();
         backup.seek(SeekFrom::Start(0)).unwrap();

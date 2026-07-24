@@ -39,6 +39,14 @@ Marker upgrade mengikat project/correlation ID, versi sumber/target, manifest ha
 
 There is no destructive schema-2-to-1 downgrade. Older binaries must reject schema 2. A failed upgrade restores both schema-1 control files byte-for-byte and revalidates them; if that proof fails, artifacts remain and the project stays recovery-required.
 
+### Explicit active-session project upgrade (T-0114)
+
+The desktop adapter exposes `project_upgrade(CorrelationRequest) -> ProjectDescriptor`. It is an active-session-only authority: the frontend sends only the existing canonical `CorrelationRequest` with a lowercase UUID v7 `request_id`; it never sends, selects, or derives a project path for this command. Native code snapshots the trusted active `ProjectDescriptor`, serializes the lifecycle mutation with create/open/close, and passes that descriptor's native path to the project service.
+
+Schema-1 input invokes the explicit durable upgrade. Schema-2 input is idempotent: the trusted descriptor is returned only after a project-scoped `JobStore` is active. In either case, the session never publishes a schema-2 descriptor until `JobStore` activation succeeds; a safe operational activation failure leaves the prior in-memory session intact.
+
+Failures cross the boundary only through the existing typed `DesktopError` envelope. Missing active session or invalid correlation maps to non-retriable `VALIDATION_ERROR`. Filesystem/database/serialization/timestamp failures are retriable `OPERATION_FAILED` only after byte-identical schema-1 rollback and recovery-artifact cleanup have been proven. Any failed or unverifiable restore/cleanup proof, recovery marker, unsafe layout, incompatible schema, or integrity failure maps to non-retriable `PROJECT_CORRUPTED`; recovery artifacts remain for a future explicit recovery workflow. `JobStore` activation maps incompatible-schema and integrity failures to `PROJECT_CORRUPTED`, while safe database/timestamp operational failures map to retriable `OPERATION_FAILED`. Raw paths, SQLite messages, backup names, and recovery-marker contents never cross this command boundary.
+
 ## Persistent job contracts (T-0110)
 
 All five contracts are flat, schema-first, additive (`additionalProperties: true`), and generator-compatible. Optional persistence values are optional properties rather than nested/nullable union types. Runtime validation remains native because the generator does not emit enums or format validators.

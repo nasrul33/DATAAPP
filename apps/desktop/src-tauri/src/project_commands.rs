@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 
 use tauri::{AppHandle, State};
 use teratai_app_core::{
-    JobError, JobEventSink, JobStore, ProjectError, ProjectErrorKind, ProjectService,
+    JobError, JobErrorKind, JobEventSink, JobStore, ProjectError, ProjectErrorKind, ProjectService,
 };
 use teratai_contracts::generated::correlation_request::CorrelationRequest;
 use teratai_contracts::generated::desktop_error::DesktopError;
@@ -130,7 +130,7 @@ impl ProjectSession {
         let job_store = if descriptor.metadata_schema_version == 2 {
             Some(Arc::new(
                 JobStore::open_with_event_sink(Path::new(&descriptor.project_path), event_sink)
-                    .map_err(|error| map_job_activation_error(&error, correlation_id))?,
+                    .map_err(|error| map_project_activation_error(&error, correlation_id))?,
             ))
         } else {
             None
@@ -295,7 +295,7 @@ fn map_project_error(
             "Pilih nama atau lokasi lain.", false, Some("Lokasi tujuan sudah digunakan."),
         ),
         (ProjectErrorKind::RecoveryRequired, _) => ErrorSpec::new(
-            "PROJECT_CORRUPTED", "project creation recovery marker is present", "Proyek memerlukan pemulihan sebelum dapat dibuka.",
+            "PROJECT_CORRUPTED", "project recovery evidence requires explicit handling", "Proyek memerlukan pemulihan sebelum dapat dibuka.",
             "Jangan hapus berkas proyek. Gunakan alur pemulihan pada versi berikutnya atau hubungi administrator.", false, None,
         ),
         (ProjectErrorKind::PermissionDenied, _) => ErrorSpec::new(
@@ -397,8 +397,36 @@ fn session_error(correlation_id: &str) -> Box<DesktopError> {
     })
 }
 
-fn map_job_activation_error(error: &JobError, correlation_id: &str) -> Box<DesktopError> {
-    crate::job_commands::map_job_error(error, correlation_id)
+fn map_project_activation_error(error: &JobError, correlation_id: &str) -> Box<DesktopError> {
+    match error.kind() {
+        JobErrorKind::IncompatibleSchema | JobErrorKind::DataIntegrity => command_error(
+            "PROJECT_CORRUPTED",
+            correlation_id,
+            "project job runtime activation could not verify durable schema or integrity",
+            "Integritas metadata proyek tidak dapat diverifikasi.",
+            "Jangan ubah proyek. Pulihkan dari salinan tepercaya.",
+            false,
+        ),
+        JobErrorKind::Database | JobErrorKind::Timestamp => command_error(
+            "OPERATION_FAILED",
+            correlation_id,
+            "project job runtime activation encountered a safe operational failure",
+            "Runtime pekerjaan proyek belum dapat diaktifkan.",
+            "Pastikan proyek tersedia, lalu coba kembali.",
+            true,
+        ),
+        JobErrorKind::InvalidRequest
+        | JobErrorKind::JobNotFound
+        | JobErrorKind::InvalidTransition
+        | JobErrorKind::RevisionConflict => command_error(
+            "OPERATION_FAILED",
+            correlation_id,
+            "project job runtime activation returned an unsupported lifecycle failure",
+            "Runtime pekerjaan proyek tidak dapat diaktifkan.",
+            "Tutup lalu buka kembali proyek sebelum mencoba lagi.",
+            false,
+        ),
+    }
 }
 
 pub(crate) fn command_error(
@@ -444,10 +472,13 @@ mod tests {
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+    use teratai_app_core::test_utils::create_schema_one_project_fixture;
+
     use super::*;
 
     const PROJECT_ID: &str = "00000000-0000-7000-8000-000000000110";
     const REQUEST_ID: &str = "00000000-0000-7000-8000-000000000111";
+    const CREATE_REQUEST_ID: &str = "00000000-0000-7000-8000-000000000112";
 
     struct TestEventSink;
 
@@ -626,6 +657,137 @@ mod tests {
     }
 
     #[test]
+    fn genuine_schema_one_upgrade_persists_audit_and_activates_job_store() {
+        let fixture = create_schema_one_project_fixture(
+            "desktop-genuine-schema-one",
+            PROJECT_ID,
+            CREATE_REQUEST_ID,
+            "Audit Schema Satu",
+            "2026-07-24T01:00:00Z",
+        )
+        .expect("create genuine schema-one project");
+        let schema_one = ProjectService::open(fixture.path()).expect("open genuine schema one");
+        assert_eq!(schema_one.metadata_schema_version, 1);
+        let session = ProjectSession {
+            lifecycle: Mutex::new(()),
+            current: Mutex::new(Some(ActiveProject {
+                descriptor: schema_one,
+                job_store: None,
+            })),
+        };
+        let request = CorrelationRequest {
+            request_id: REQUEST_ID.to_owned(),
+        };
+
+        let upgraded = session
+            .upgrade(&request, Arc::new(TestEventSink))
+            .expect("upgrade genuine schema-one project");
+
+        assert_eq!(upgraded.metadata_schema_version, 2);
+        assert_eq!(
+            ProjectService::open(fixture.path()).expect("reopen durable schema-two project"),
+            upgraded
+        );
+        assert_eq!(
+            fixture
+                .audit_actions()
+                .expect("read migration audit")
+                .last(),
+            Some(&"project.metadata_migrated".to_owned())
+        );
+        session
+            .job_store(REQUEST_ID)
+            .expect("genuine upgrade must activate a usable job store");
+    }
+
+    #[test]
+    fn durable_schema_two_activation_integrity_failure_is_project_corrupted() {
+        let fixture = create_schema_one_project_fixture(
+            "desktop-activation-integrity",
+            PROJECT_ID,
+            CREATE_REQUEST_ID,
+            "Audit Activation",
+            "2026-07-24T01:00:00Z",
+        )
+        .expect("create genuine schema-one project");
+        let upgraded = ProjectService::upgrade(fixture.path(), REQUEST_ID)
+            .expect("durably upgrade fixture before activation");
+        fixture
+            .set_metadata_user_version(1)
+            .expect("tamper fixture only after durable upgrade");
+        let session = ProjectSession::default();
+
+        let error = session
+            .activate(upgraded, REQUEST_ID, Arc::new(TestEventSink))
+            .expect_err("integrity-invalid job activation must fail");
+
+        assert_eq!(error.code, "PROJECT_CORRUPTED");
+        assert!(!error.retriable);
+        assert!(!error.detail.contains("metadata.sqlite"));
+        assert!(!error
+            .detail
+            .contains(fixture.path().to_string_lossy().as_ref()));
+        assert_eq!(
+            session
+                .current(&CorrelationRequest {
+                    request_id: REQUEST_ID.to_owned(),
+                })
+                .expect("activation failure must not publish a session"),
+            None
+        );
+    }
+
+    #[test]
+    fn genuine_schema_one_cleanup_collision_maps_to_non_retriable_recovery() {
+        let fixture = create_schema_one_project_fixture(
+            "desktop-upgrade-cleanup-collision",
+            PROJECT_ID,
+            CREATE_REQUEST_ID,
+            "Audit Recovery",
+            "2026-07-24T01:00:00Z",
+        )
+        .expect("create genuine schema-one project");
+        let schema_one = ProjectService::open(fixture.path()).expect("open genuine schema one");
+        fs::create_dir(
+            fixture
+                .path()
+                .join(format!(".project-upgrade-cleanup-{REQUEST_ID}")),
+        )
+        .expect("reserve cleanup collision");
+        let session = ProjectSession {
+            lifecycle: Mutex::new(()),
+            current: Mutex::new(Some(ActiveProject {
+                descriptor: schema_one.clone(),
+                job_store: None,
+            })),
+        };
+        let request = CorrelationRequest {
+            request_id: REQUEST_ID.to_owned(),
+        };
+
+        let error = session
+            .upgrade(&request, Arc::new(TestEventSink))
+            .expect_err("unproven cleanup must require recovery");
+
+        assert_eq!(error.code, "PROJECT_CORRUPTED");
+        assert!(!error.retriable);
+        assert!(!error.detail.contains("metadata.sqlite"));
+        assert!(!error
+            .detail
+            .contains(fixture.path().to_string_lossy().as_ref()));
+        assert_eq!(
+            session.current(&request).expect("preserve active session"),
+            Some(schema_one)
+        );
+        assert_eq!(
+            ProjectService::open(fixture.path())
+                .expect_err("recovery proof must remain visible")
+                .kind(),
+            ProjectErrorKind::RecoveryRequired
+        );
+    }
+
+    #[test]
     fn schema_two_upgrade_is_idempotent_and_activates_missing_job_store() {
         let (parent, descriptor) = create_project_fixture("schema-two-active");
         let session = ProjectSession {
@@ -670,6 +832,34 @@ mod tests {
         assert_eq!(recovery.code, "PROJECT_CORRUPTED");
         assert!(!recovery.retriable);
         assert!(!recovery.detail.contains("secret"));
+    }
+
+    #[test]
+    fn maps_project_activation_failures_to_safe_project_states() {
+        let incompatible = map_project_activation_error(
+            &JobError::IncompatibleSchema {
+                expected: 2,
+                actual: 1,
+            },
+            REQUEST_ID,
+        );
+        let integrity = map_project_activation_error(
+            &JobError::DataIntegrity("D:\\secret\\metadata.sqlite".to_owned()),
+            REQUEST_ID,
+        );
+        let operational = map_project_activation_error(
+            &JobError::Timestamp("D:\\secret\\clock-state".to_owned()),
+            REQUEST_ID,
+        );
+
+        assert_eq!(incompatible.code, "PROJECT_CORRUPTED");
+        assert!(!incompatible.retriable);
+        assert_eq!(integrity.code, "PROJECT_CORRUPTED");
+        assert!(!integrity.retriable);
+        assert!(!integrity.detail.contains("secret"));
+        assert_eq!(operational.code, "OPERATION_FAILED");
+        assert!(operational.retriable);
+        assert!(!operational.detail.contains("secret"));
     }
 
     #[test]

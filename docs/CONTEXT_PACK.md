@@ -342,8 +342,10 @@ Residual scope after T-0113: lifecycle notification delivery remains process-loc
 |---|---|---|---|
 | DEC-F080 | Authorize `project_upgrade` only from the active in-memory session and serialize create/open/close/upgrade through one lifecycle guard; publish a schema-2 session only after the project-scoped `JobStore` opens | The UI must never supply a filesystem path or observe schema 2 without its required job authority, and concurrent lifecycle mutations must not replace the authorized project during upgrade | Keep open, validate, current, and job reads migration-free; cross-process ownership remains a separately designed concern |
 | DEC-F081 | Require exact raw project-name confirmation with no trim, normalization, or case folding | The irreversible control-metadata change needs deliberate confirmation that cannot be satisfied by a visually similar or normalized value | Keep source datasets immutable and do not introduce a schema-2-to-1 downgrade |
+| DEC-F082 | Keep the `ProjectUpgrade` guard after a failed finalization so app-core explicitly observes restoration; classify every failed or unverifiable restore/cleanup proof as recovery-required | A consumed guard could rely on `Drop` and return a generic retriable filesystem error even though byte-identical rollback was not proven | Recovery repair remains a future explicit workflow; typed `PROJECT_CORRUPTED` intentionally offers no retry |
+| DEC-F083 | Expose a feature-gated app-core schema-1 fixture only to desktop dev-tests and build it from migration 0001 through real project publication | Command-boundary coverage must exercise real schema-1 SQLite storage, migration audit evidence, and `JobStore` activation without a new dependency or lockfile change | Keep fixture and controlled integrity-tamper utilities behind `test-utils`; do not expose them in the desktop runtime |
 
-T-0114 closes the residual explicit schema-upgrade UI/path authority gaps recorded by DEC-F071 and DEC-F079. `project_upgrade` accepts only a correlation request and resolves the trusted active project natively. Rollback-safe errors retain the active schema-1 session and return retriable `OPERATION_FAILED`; `PROJECT_CORRUPTED` retains recovery evidence, routes to the non-destructive recovery-required state, and offers no retry. No new metadata migration, runtime dependency, canonical contract schema, IPC capability, or permission was added.
+T-0114 closes the residual explicit schema-upgrade UI/path authority gaps recorded by DEC-F071 and DEC-F079. It adds the active-session `project_upgrade` IPC command, which accepts only a correlation request and resolves the trusted active project natively. Rollback-safe errors retain the active schema-1 session and return retriable `OPERATION_FAILED`; failed or unproven recovery maps to `PROJECT_CORRUPTED`, retains recovery evidence, routes to the non-destructive recovery-required state, and offers no retry. No new metadata migration, runtime dependency, canonical contract schema, or Tauri capability permission was added.
 
 ### T-0114 completion evidence
 
@@ -358,5 +360,22 @@ Focused verification on Windows 11, 2026-07-24:
 | Task-level TypeScript typecheck and lint | passed |
 
 Full repository verification completed on Windows 11, 2026-07-24: `pnpm install --frozen-lockfile`, `uv sync --frozen`, `pnpm contracts:check`, `pnpm lint`, `pnpm typecheck`, `pnpm test`, explicit `cargo fmt --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace --locked`, `uv run ruff check engine tests/golden`, `uv run mypy`, `uv run pytest`, `pnpm build`, and the whitespace, worktree-status, scope, and lockfile/contract audits all passed. The full suites passed 44 TypeScript, 4 repository e2e, 139 Rust, and 12 Python tests with zero failures; no lockfile, canonical contract, or migration changes were introduced.
+
+### T-0114 final hardening evidence
+
+Final recovery-boundary verification on Windows 11, 2026-07-24 added five Rust regressions: real cleanup-collision recovery classification, genuine schema-1 command upgrade with migration audit and `JobStore`, real post-upgrade activation-integrity handling, and activation mapper coverage. The close-project UI assertion now targets its own disabled button during upgrade; the existing SSR environment remains intentionally dependency-free.
+
+| Command / suite | Exact result |
+|---|---|
+| `cargo test -p teratai-app-core project_upgrade::tests --locked` | 10 passed |
+| `cargo test -p teratai-desktop project_commands::tests --locked` | 14 passed |
+| `cargo test -p teratai-filesystem project_upgrade::tests --locked` | 20 passed |
+| Focused Vitest app-shell test | 23 passed |
+| `pnpm install --frozen-lockfile --store-dir .pnpm-store --config.confirmModulesPurge=false` and `uv sync --frozen` | passed; frozen dependencies unchanged |
+| `pnpm lint`, `pnpm typecheck`, `cargo fmt --check`, and workspace Clippy with `-D warnings` | passed |
+| `PYTEST_ADDOPTS=-p no:cacheprovider pnpm test` and `pnpm build` | passed; 44 TypeScript, 4 repository e2e, 144 Rust, and 12 Python tests passed |
+| `uv run pytest -p no:cacheprovider engine/tests tests/golden` | 12 passed without cache-provider warning |
+
+The `test-utils` feature is enabled only through the desktop dev-dependency. No runtime dependency, lockfile, metadata migration, canonical contract schema, or Tauri capability permission changed.
 
 Remaining scope after T-0114: recovery repair tooling, operation enqueue, Python dispatch, automatic retry runner, platform resource discovery, and persistent UI preferences.

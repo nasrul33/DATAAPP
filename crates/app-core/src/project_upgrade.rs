@@ -174,16 +174,19 @@ fn upgrade_project_inner(
     })();
 
     match upgrade_result {
-        Ok(upgraded_descriptor) => {
-            guard.commit()?;
-            Ok(upgraded_descriptor)
-        }
+        Ok(upgraded_descriptor) => match guard.commit() {
+            Ok(()) => Ok(upgraded_descriptor),
+            Err(commit_error) => match guard.restore() {
+                Ok(()) => Err(ProjectError::Filesystem(commit_error)),
+                Err(restore_error) => Err(ProjectError::RecoveryRequired(restore_error)),
+            },
+        },
         Err(upgrade_error) => {
             #[cfg(test)]
             inject_restore_fault(fault, &layout);
             match guard.restore() {
                 Ok(()) => Err(upgrade_error),
-                Err(restore_error) => Err(ProjectError::Filesystem(restore_error)),
+                Err(restore_error) => Err(ProjectError::RecoveryRequired(restore_error)),
             }
         }
     }
@@ -384,7 +387,9 @@ mod tests {
     use teratai_filesystem::{begin_project_creation, FilesystemError};
 
     use super::{take_captured_marker, upgrade_with_fault, UpgradeFault};
-    use crate::{ProjectError, ProjectService, PROJECT_MIGRATION, PROJECT_SCHEMA_VERSION};
+    use crate::{
+        ProjectError, ProjectErrorKind, ProjectService, PROJECT_MIGRATION, PROJECT_SCHEMA_VERSION,
+    };
 
     const PROJECT_ID: &str = "00000000-0000-7000-8000-000000000110";
     const CREATE_CORRELATION_ID: &str = "00000000-0000-7000-8000-000000000111";
@@ -542,12 +547,13 @@ mod tests {
         cleanup(&restored);
 
         let unproven = create_schema_one_fixture("unproven");
-        assert!(upgrade_with_fault(
+        let error = upgrade_with_fault(
             &unproven,
             UPGRADE_CORRELATION_ID,
             UpgradeFault::DuringRestoreVerification,
         )
-        .is_err());
+        .expect_err("unverifiable restore must require recovery");
+        assert_eq!(error.kind(), ProjectErrorKind::RecoveryRequired);
         assert!(matches!(
             ProjectService::open(&unproven),
             Err(ProjectError::Filesystem(FilesystemError::RecoveryRequired(
@@ -555,6 +561,25 @@ mod tests {
             )))
         ));
         cleanup(&unproven);
+    }
+
+    #[test]
+    fn cleanup_collision_after_durable_upgrade_requires_recovery_proof() {
+        let path = create_schema_one_fixture("cleanup-collision");
+        fs::create_dir(path.join(format!(".project-upgrade-cleanup-{UPGRADE_CORRELATION_ID}")))
+            .expect("reserve cleanup collision");
+
+        let error = ProjectService::upgrade(&path, UPGRADE_CORRELATION_ID)
+            .expect_err("unproven cleanup must not report a retriable upgrade failure");
+
+        assert_eq!(error.kind(), ProjectErrorKind::RecoveryRequired);
+        assert!(matches!(
+            ProjectService::open(&path),
+            Err(ProjectError::Filesystem(FilesystemError::RecoveryRequired(
+                _
+            )))
+        ));
+        cleanup(&path);
     }
 
     #[test]

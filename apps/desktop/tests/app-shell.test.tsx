@@ -100,7 +100,8 @@ describe("desktop project lifecycle UI", () => {
     );
 
     expect(markup).toContain("Meng-upgrade");
-    expect(markup).toContain("disabled");
+    const closeProjectButton = /<button\b[^>]*>(?:(?!<\/button>)[\s\S])*Tutup proyek<\/button>/.exec(markup)?.[0];
+    expect(closeProjectButton).toContain('disabled=""');
   });
 
   it("renders recovery remediation without a destructive action", () => {
