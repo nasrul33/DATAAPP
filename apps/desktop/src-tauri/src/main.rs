@@ -11,6 +11,7 @@ fn main() {
             project_commands::project_validate,
             project_commands::project_current,
             project_commands::project_close,
+            project_commands::project_upgrade,
             job_commands::job_get,
             job_commands::job_list,
             job_commands::job_cancel,

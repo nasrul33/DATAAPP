@@ -23,6 +23,7 @@ struct ActiveProject {
 /// Owns the currently active project descriptor for the desktop process.
 #[derive(Debug, Default)]
 pub struct ProjectSession {
+    lifecycle: Mutex<()>,
     current: Mutex<Option<ActiveProject>>,
 }
 
@@ -33,6 +34,7 @@ impl ProjectSession {
         event_sink: Arc<dyn JobEventSink>,
     ) -> CommandResult<ProjectDescriptor> {
         validate_request_id(&request.request_id)?;
+        let _lifecycle = self.lock_lifecycle(&request.request_id)?;
         let descriptor = ProjectService::create(request).map_err(|error| {
             map_project_error(&error, &request.request_id, ProjectOperation::Create)
         })?;
@@ -45,6 +47,7 @@ impl ProjectSession {
         event_sink: Arc<dyn JobEventSink>,
     ) -> CommandResult<ProjectDescriptor> {
         validate_open_request(request)?;
+        let _lifecycle = self.lock_lifecycle(&request.request_id)?;
         let descriptor =
             ProjectService::open(Path::new(&request.project_path)).map_err(|error| {
                 map_project_error(&error, &request.request_id, ProjectOperation::Open)
@@ -61,20 +64,61 @@ impl ProjectSession {
 
     fn current(&self, request: &CorrelationRequest) -> CommandResult<Option<ProjectDescriptor>> {
         validate_request_id(&request.request_id)?;
+        self.descriptor_snapshot(&request.request_id)
+    }
+
+    fn descriptor_snapshot(
+        &self,
+        correlation_id: &str,
+    ) -> CommandResult<Option<ProjectDescriptor>> {
         self.current
             .lock()
             .map(|current| current.as_ref().map(|active| active.descriptor.clone()))
-            .map_err(|_| session_error(&request.request_id))
+            .map_err(|_| session_error(correlation_id))
     }
 
     fn close(&self, request: &CorrelationRequest) -> CommandResult<()> {
         validate_request_id(&request.request_id)?;
+        let _lifecycle = self.lock_lifecycle(&request.request_id)?;
         let mut current = self
             .current
             .lock()
             .map_err(|_| session_error(&request.request_id))?;
         *current = None;
         Ok(())
+    }
+
+    pub(crate) fn upgrade(
+        &self,
+        request: &CorrelationRequest,
+        event_sink: Arc<dyn JobEventSink>,
+    ) -> CommandResult<ProjectDescriptor> {
+        validate_request_id(&request.request_id)?;
+        let _lifecycle = self.lock_lifecycle(&request.request_id)?;
+        let descriptor = self
+            .descriptor_snapshot(&request.request_id)?
+            .ok_or_else(|| {
+                command_error(
+                    "VALIDATION_ERROR",
+                    &request.request_id,
+                    "no active project is available for upgrade",
+                    "Tidak ada proyek aktif yang dapat ditingkatkan.",
+                    "Buka proyek schema versi 1 lalu coba kembali.",
+                    false,
+                )
+            })?;
+        let upgraded =
+            ProjectService::upgrade(Path::new(&descriptor.project_path), &request.request_id)
+                .map_err(|error| {
+                    map_project_error(&error, &request.request_id, ProjectOperation::Upgrade)
+                })?;
+        self.activate(upgraded, &request.request_id, event_sink)
+    }
+
+    fn lock_lifecycle(&self, correlation_id: &str) -> CommandResult<std::sync::MutexGuard<'_, ()>> {
+        self.lifecycle
+            .lock()
+            .map_err(|_| session_error(correlation_id))
     }
 
     fn activate(
@@ -175,6 +219,16 @@ pub fn project_close(
     session.close(&request)
 }
 
+#[tauri::command]
+#[allow(clippy::needless_pass_by_value)]
+pub fn project_upgrade(
+    request: CorrelationRequest,
+    app: AppHandle,
+    session: State<'_, ProjectSession>,
+) -> CommandResult<ProjectDescriptor> {
+    session.upgrade(&request, crate::job_commands::tauri_event_sink(app))
+}
+
 fn validate_open_request(request: &ProjectOpenRequest) -> CommandResult<()> {
     validate_request_id(&request.request_id)?;
     let path = Path::new(&request.project_path);
@@ -223,6 +277,7 @@ enum ProjectOperation {
     Create,
     Open,
     Validate,
+    Upgrade,
 }
 
 fn map_project_error(
@@ -278,6 +333,10 @@ fn map_project_error(
         (ProjectErrorKind::Database | ProjectErrorKind::Serialization | ProjectErrorKind::Timestamp, ProjectOperation::Open | ProjectOperation::Validate) => ErrorSpec::new(
             "PROJECT_CORRUPTED", "project control data validation failed", "Data kontrol proyek tidak dapat diverifikasi.",
             "Jangan ubah proyek. Pulihkan dari salinan tepercaya.", false, None,
+        ),
+        (ProjectErrorKind::Database | ProjectErrorKind::Serialization | ProjectErrorKind::Timestamp, ProjectOperation::Upgrade) => ErrorSpec::new(
+            "OPERATION_FAILED", "project control data upgrade failed after safe rollback", "Peningkatan proyek belum dapat diselesaikan.",
+            "Pastikan media tersedia, lalu coba kembali.", true, None,
         ),
     };
     Box::new(specification.into_error(correlation_id))
@@ -381,8 +440,9 @@ fn is_uuid_v7(value: &str) -> bool {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
-    use std::sync::Arc;
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::sync::{mpsc, Arc};
+    use std::thread;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
     use super::*;
 
@@ -404,6 +464,22 @@ mod tests {
             "teratai-desktop-session-{}-{nonce}",
             std::process::id()
         ))
+    }
+
+    fn create_project_fixture(label: &str) -> (PathBuf, ProjectDescriptor) {
+        let parent = test_parent().join(label);
+        fs::create_dir_all(&parent).expect("test parent");
+        let request = ProjectCreateRequest {
+            name: "Audit Persediaan".to_owned(),
+            project_id: PROJECT_ID.to_owned(),
+            project_path: parent
+                .join("Audit Persediaan.teratai")
+                .to_string_lossy()
+                .into_owned(),
+            request_id: REQUEST_ID.to_owned(),
+        };
+        let descriptor = ProjectService::create(&request).expect("create project fixture");
+        (parent, descriptor)
     }
 
     #[test]
@@ -467,6 +543,7 @@ mod tests {
     #[test]
     fn schema_one_session_requires_explicit_upgrade_for_job_access() {
         let session = ProjectSession {
+            lifecycle: Mutex::new(()),
             current: Mutex::new(Some(ActiveProject {
                 descriptor: ProjectDescriptor {
                     created_at: "2026-07-24T01:00:00Z".to_owned(),
@@ -486,5 +563,137 @@ mod tests {
 
         assert_eq!(error.code, "PROJECT_UPGRADE_REQUIRED");
         assert_eq!(error.correlation_id, REQUEST_ID);
+    }
+
+    #[test]
+    fn upgrade_requires_an_active_project() {
+        let session = ProjectSession::default();
+        let request = CorrelationRequest {
+            request_id: REQUEST_ID.to_owned(),
+        };
+
+        let error = session
+            .upgrade(&request, Arc::new(TestEventSink))
+            .expect_err("missing active project must fail");
+
+        assert_eq!(error.code, "VALIDATION_ERROR");
+        assert!(!error.retriable);
+    }
+
+    #[test]
+    fn upgrade_rejects_invalid_correlation_before_session_lookup() {
+        let session = ProjectSession::default();
+        let request = CorrelationRequest {
+            request_id: "not-a-uuid".to_owned(),
+        };
+
+        let error = session
+            .upgrade(&request, Arc::new(TestEventSink))
+            .expect_err("invalid correlation must fail");
+
+        assert_eq!(error.code, "VALIDATION_ERROR");
+        assert!(!error.retriable);
+    }
+
+    #[test]
+    fn schema_one_active_session_upgrades_and_activates_job_store() {
+        let (parent, descriptor) = create_project_fixture("schema-one-active");
+        let session = ProjectSession {
+            lifecycle: Mutex::new(()),
+            current: Mutex::new(Some(ActiveProject {
+                descriptor: ProjectDescriptor {
+                    metadata_schema_version: 1,
+                    ..descriptor
+                },
+                job_store: None,
+            })),
+        };
+        let request = CorrelationRequest {
+            request_id: REQUEST_ID.to_owned(),
+        };
+
+        let upgraded = session
+            .upgrade(&request, Arc::new(TestEventSink))
+            .expect("upgrade project");
+
+        assert_eq!(upgraded.metadata_schema_version, 2);
+        assert_eq!(upgraded.project_id, PROJECT_ID);
+        session
+            .job_store(REQUEST_ID)
+            .expect("upgrade must activate job store");
+        drop(session);
+        fs::remove_dir_all(parent).expect("test cleanup");
+    }
+
+    #[test]
+    fn schema_two_upgrade_is_idempotent_and_activates_missing_job_store() {
+        let (parent, descriptor) = create_project_fixture("schema-two-active");
+        let session = ProjectSession {
+            lifecycle: Mutex::new(()),
+            current: Mutex::new(Some(ActiveProject {
+                descriptor: descriptor.clone(),
+                job_store: None,
+            })),
+        };
+        let request = CorrelationRequest {
+            request_id: REQUEST_ID.to_owned(),
+        };
+
+        let upgraded = session
+            .upgrade(&request, Arc::new(TestEventSink))
+            .expect("upgrade project");
+
+        assert_eq!(upgraded, descriptor);
+        session
+            .job_store(REQUEST_ID)
+            .expect("upgrade must activate job store");
+        drop(session);
+        fs::remove_dir_all(parent).expect("test cleanup");
+    }
+
+    #[test]
+    fn maps_upgrade_failures_without_sensitive_details() {
+        let rollback_safe = map_project_error(
+            &ProjectError::Timestamp("D:\\secret\\clock-state".to_owned()),
+            REQUEST_ID,
+            ProjectOperation::Upgrade,
+        );
+        assert_eq!(rollback_safe.code, "OPERATION_FAILED");
+        assert!(rollback_safe.retriable);
+        assert!(!rollback_safe.detail.contains("secret"));
+
+        let recovery = map_project_error(
+            &ProjectError::DataIntegrity("D:\\secret\\metadata.sqlite".to_owned()),
+            REQUEST_ID,
+            ProjectOperation::Upgrade,
+        );
+        assert_eq!(recovery.code, "PROJECT_CORRUPTED");
+        assert!(!recovery.retriable);
+        assert!(!recovery.detail.contains("secret"));
+    }
+
+    #[test]
+    fn lifecycle_mutations_are_serialized() {
+        let session = Arc::new(ProjectSession::default());
+        let lifecycle = session.lifecycle.lock().expect("lifecycle guard");
+        let competing_session = Arc::clone(&session);
+        let (sender, receiver) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            let result = competing_session.close(&CorrelationRequest {
+                request_id: REQUEST_ID.to_owned(),
+            });
+            sender.send(result).expect("send close result");
+        });
+
+        assert!(matches!(
+            receiver.recv_timeout(Duration::from_millis(50)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        drop(lifecycle);
+        receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("close result after lifecycle release")
+            .expect("close succeeds");
+        worker.join().expect("close worker");
     }
 }
