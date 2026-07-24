@@ -42,10 +42,13 @@ Exit gate: clean clone builds, tests, launches, and verifies engine handshake.
 |---|---|---|---|
 | T-0110 | Persistent job state foundation | `crates/app-core`, `crates/filesystem`, `migrations/metadata-sqlite`, `packages/contracts` | schema-1 projects upgrade explicitly; job state/history survives restart; illegal/concurrent transitions fail atomically; interrupted active jobs remain traceable |
 | T-0111 | Background job executor core | `crates/app-core` | bounded mock job runs asynchronously; progress/cancellation/failure remain persistent and audit-backed; resource preflight, panic containment, shutdown, and restart recovery are deterministic |
+| T-0112 | Typed desktop job IPC foundation | `apps/desktop`, `apps/desktop/src-tauri`, `crates/app-core`, `packages/contracts` | active-project job get/list/cancel commands are schema-first and project-scoped; durable mutations emit revision-linked best-effort events; invalid, stale, schema-1, and corrupted states return safe typed errors |
 
 T-0110 membangun persistence foundation: migration eksplisit schema 1 ke 2, snapshot `job` plus riwayat `job_event` append-only, optimistic revision/CAS, cancellation kooperatif idempotent, dan recovery `FAILED/INTERRUPTED`.
 
 T-0111 menambahkan executor Rust project-scoped dengan worker/queue bounded, admission exactly-once dalam satu proses, progress dan cancellation melalui `JobStore`, resource preflight berbasis budget konfigurasi, panic containment, serta bounded shutdown dengan private reaper. T-0111 tidak menambahkan Python engine dispatch, command/event Tauri, platform resource probe, retry orchestration, atau UI Job Center; capability tersebut tetap dimiliki task lanjutan EPIC-110.
+
+T-0112 mengekspos query dan cooperative cancellation melalui command Tauri bertipe, keyset page bounded, client TypeScript yang memvalidasi ulang payload, serta event lifecycle best-effort yang selalu mereferensikan snapshot durable dan revision persisten. Persistence tetap source of truth; event yang terlewat dipulihkan melalui `job_get`/`job_list`. Project schema 1 tetap read-only dan menghasilkan `PROJECT_UPGRADE_REQUIRED` untuk command job tanpa migrasi otomatis.
 
 Exit gate: mock long job can run, cancel, fail, recover, and remain traceable after restart.
 

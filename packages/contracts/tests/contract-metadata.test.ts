@@ -10,6 +10,10 @@ import type {
   JobDescriptor,
   JobEnqueueRequest,
   JobFailureRequest,
+  JobGetRequest,
+  JobLifecycleEvent,
+  JobListRequest,
+  JobListResponse,
   JobProgressUpdateRequest,
   JobTransitionRequest,
   ProjectCreateRequest,
@@ -23,7 +27,7 @@ import { createCorrelationId, createRuntimeLogEvent } from "../src/index";
 describe("generated contract metadata", () => {
   it("round-trips the canonical fixture shape", () => {
     const metadata = {
-      generator_revision: 1,
+      generator_revision: 2,
       protocol_version: "1.0",
       schema_name: "contract-metadata",
       schema_version: "1.0.0",
@@ -203,11 +207,33 @@ describe("job contracts", () => {
       expected_revision: 1,
       job_id: "00000000-0000-7000-8000-000000000215",
     } satisfies JobFailureRequest;
+    const get = {
+      correlation_id: transition.correlation_id,
+      job_id: transition.job_id,
+    } satisfies JobGetRequest;
+    const list = {
+      correlation_id: transition.correlation_id,
+      limit: 25,
+    } satisfies JobListRequest;
+    const page = {
+      items: [descriptor],
+    } satisfies JobListResponse;
+    const event = {
+      event_name: "job.queued",
+      job: descriptor,
+      occurred_at: descriptor.updated_at,
+      protocol_version: "1.0",
+      sequence: descriptor.revision,
+    } satisfies JobLifecycleEvent;
 
     expect(descriptor.status).toBe("QUEUED");
     expect(enqueue.progress_total).toBe(100);
     expect(transition.expected_revision).toBe(1);
     expect(progress.current).toBe(0);
     expect(failure.error_retriable).toBe(true);
+    expect(get.job_id).toBe(transition.job_id);
+    expect(list.limit).toBe(25);
+    expect(page.items).toEqual([descriptor]);
+    expect(event.sequence).toBe(descriptor.revision);
   });
 });

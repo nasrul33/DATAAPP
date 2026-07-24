@@ -200,7 +200,24 @@ Verifikasi executor secara terisolasi dari root repository:
 cargo test -p teratai-app-core job_executor::tests --locked
 ```
 
-T-0111 adalah API native Rust; belum ada command/event Tauri, Python engine dispatch, automatic retry, platform memory/free-disk probe, atau Job Center UI. Exactly-once admission berlaku hanya di dalam satu instance executor. Handler native wajib checkpoint secara bounded; handler non-kooperatif tidak dapat dipaksa berhenti dan akan terlihat sebagai `ShutdownTimeout`.
+T-0111 sendiri adalah API native Rust. Exactly-once admission berlaku hanya di dalam satu instance executor. Handler native wajib checkpoint secara bounded; handler non-kooperatif tidak dapat dipaksa berhenti dan akan terlihat sebagai `ShutdownTimeout`.
+
+## Typed desktop job IPC
+
+T-0112 menambahkan command Tauri schema-first `job_get`, `job_list`, dan `job_cancel` yang selalu dibatasi ke project aktif. Listing menggunakan keyset cursor dan limit `1..=100`; cancellation membawa revision persisten agar stale caller gagal aman. Project schema 1 tetap dapat dibuka read-only, tetapi command job mengembalikan `PROJECT_UPGRADE_REQUIRED` dan tidak menjalankan migration otomatis.
+
+Setiap mutasi `JobStore` yang sudah commit dapat mengirim event best-effort pada channel `job:lifecycle`. Sequence event sama dengan revision snapshot dan payload selalu membawa `JobDescriptor` durable. Event bukan source of truth; client memulihkan event yang terlewat melalui `job_get` atau `job_list`. Client TypeScript memvalidasi ulang descriptor, page, cursor, event, dan error envelope sebelum dipercaya UI.
+
+Verifikasi IPC job secara terisolasi:
+
+```powershell
+pnpm contracts:check
+pnpm typecheck:ts
+pnpm test:unit
+cargo test -p teratai-app-core -p teratai-desktop --locked
+```
+
+T-0112 belum menambahkan Python engine dispatch, operation enqueue command, automatic retry, platform memory/free-disk probe, project upgrade UI, atau Job Center UI.
 
 ## Desktop project lifecycle
 

@@ -13,7 +13,7 @@
 - Run `pnpm contracts:generate` after changing a schema.
 - Run `pnpm contracts:check` to detect missing or stale TypeScript, Python, or Rust output.
 - Generated files include a canonical schema SHA-256 and must never be edited manually.
-- Generator revision 1 supports the bounded subset documented in `packages/contracts/README.md`; unsupported constructs fail generation.
+- Generator revision 2 supports the bounded subset documented in `packages/contracts/README.md`, including validated acyclic sibling `$ref` composition; unsupported constructs fail generation.
 - T-0004 adds `ContractMetadata` as a generation/serialization proof.
 - T-0006 adds canonical engine handshake request/response and typed engine error schemas. Runtime messages use bounded newline-delimited JSON over controlled process stdio.
 - T-0007 adds `RuntimeLogEvent` as the canonical structured runtime trace shared by TypeScript, Rust, and Python.
@@ -41,7 +41,7 @@ There is no destructive schema-2-to-1 downgrade. Older binaries must reject sche
 
 ## Persistent job contracts (T-0110)
 
-All five contracts are flat, schema-first, additive (`additionalProperties: true`), and generator-revision-1 compatible. Optional persistence values are optional properties rather than nested/nullable union types. Runtime validation remains native because generator revision 1 does not emit enums or format validators.
+All five contracts are flat, schema-first, additive (`additionalProperties: true`), and generator-compatible. Optional persistence values are optional properties rather than nested/nullable union types. Runtime validation remains native because the generator does not emit enums or format validators.
 
 | Contract | Required | Optional |
 |---|---|---|
@@ -93,6 +93,18 @@ Panic hanya ditangkap pada boundary `JobHandler::run`. Payload dan lokasi panic 
 `HandlerOutcome::Cancelled` hanya sah ketika snapshot tepercaya sudah `CANCELLING`. Jika handler mengembalikan outcome tersebut tanpa permintaan cancellation aktif, executor memperlakukannya sebagai defect handler dan menutup lifecycle menjadi `FAILED/OPERATION_FAILED` dengan pesan tetap, aman, non-retriable; job tidak boleh tertinggal `RUNNING`.
 
 T-0111 tidak menambahkan automatic retry, operation-specific payload persistence, platform resource probe, command/event Tauri, Python execution, atau Job Center UI.
+
+## Typed desktop job IPC (T-0112)
+
+T-0112 adds canonical `JobGetRequest`, `JobListRequest`, `JobListResponse`, and `JobLifecycleEvent`. `JobListResponse.items` and `JobLifecycleEvent.job` compose the canonical `JobDescriptor` through validated acyclic sibling `$ref`; generator revision 2 emits matching TypeScript, Python, and Rust imports without permitting arbitrary nested schemas.
+
+The desktop adapter exposes `job_get`, `job_list`, and `job_cancel`. Every command is bound to the active project session and requires a lowercase UUID v7 correlation ID. Listing is newest-first and bounded to `1..=100`; cursor timestamp and job ID are supplied together or rejected. Cancellation reuses `JobTransitionRequest` and persistent optimistic revision handling.
+
+Schema-1 projects remain openable and read-only. Job commands return `PROJECT_UPGRADE_REQUIRED` until an explicit upgrade is completed; T-0112 never upgrades on open.
+
+Every durable `JobStore` mutation can publish a best-effort `JobLifecycleEvent` on Tauri channel `job:lifecycle`. Event `sequence` equals the persistent job revision, `occurred_at` equals `job.updated_at`, and the payload contains the trusted post-mutation descriptor. Publishing occurs only after transaction commit and pinned metadata identity refresh. Event failure never changes persistent state; clients recover through `job_get` and `job_list`.
+
+T-0112 does not add operation enqueue commands, Python dispatch, automatic retry, platform probes, schema migration, or Job Center UI.
 
 ## Engine startup handshake
 
