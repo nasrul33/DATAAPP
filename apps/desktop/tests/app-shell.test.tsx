@@ -7,6 +7,11 @@ import { App } from "../src/app/app";
 import { AppShell } from "../src/app/app-shell";
 import { ProjectDialog } from "../src/project/project-dialog";
 import {
+  projectNameMatchesExactly,
+  ProjectUpgradeDialog,
+  ProjectUpgradePanel,
+} from "../src/project/project-upgrade-panel";
+import {
   parseDesktopError,
   parseProjectDescriptor,
   ProjectClientError,
@@ -175,6 +180,140 @@ describe("desktop project upgrade lifecycle transitions", () => {
       project: null,
       status: "error",
     });
+  });
+});
+
+describe("desktop project upgrade confirmation surface", () => {
+  const schemaOneDescriptor = {
+    ...descriptor,
+    metadata_schema_version: 1,
+  } satisfies ProjectDescriptor;
+
+  it("requires the project name to match exactly without normalization", () => {
+    expect(projectNameMatchesExactly("Audit 2026", "Audit 2026")).toBe(true);
+    expect(projectNameMatchesExactly(" audit 2026", "Audit 2026")).toBe(false);
+    expect(projectNameMatchesExactly("Audit 2026 ", "Audit 2026")).toBe(false);
+    expect(projectNameMatchesExactly("audit 2026", "Audit 2026")).toBe(false);
+    expect(projectNameMatchesExactly("Cafe\u0301", "Café")).toBe(false);
+  });
+
+  it("renders the schema-1 upgrade panel without path authority", () => {
+    const markup = renderToStaticMarkup(
+      <ProjectUpgradePanel
+        actionStatus="idle"
+        error={null}
+        onDismissError={() => undefined}
+        onUpgrade={() => Promise.resolve(true)}
+        project={schemaOneDescriptor}
+      />,
+    );
+
+    expect(markup).toContain("Metadata schema versi 1");
+    expect(markup).toContain("memerlukan versi 2");
+    expect(markup).toContain("Dataset sumber tetap tidak berubah");
+    expect(markup).toContain("Tidak tersedia downgrade");
+    expect(markup).toContain("Upgrade proyek");
+    expect(markup).not.toContain(schemaOneDescriptor.project_path);
+  });
+
+  it("disables upgrade submission until the raw project name matches exactly", () => {
+    const mismatched = renderToStaticMarkup(
+      <ProjectUpgradeDialog
+        confirmationValue="Audit Belanja 2026 "
+        onCancel={() => undefined}
+        onConfirmationChange={() => undefined}
+        onSubmit={() => undefined}
+        pending={false}
+        projectName={schemaOneDescriptor.name}
+      />,
+    );
+    const matched = renderToStaticMarkup(
+      <ProjectUpgradeDialog
+        confirmationValue={schemaOneDescriptor.name}
+        onCancel={() => undefined}
+        onConfirmationChange={() => undefined}
+        onSubmit={() => undefined}
+        pending={false}
+        projectName={schemaOneDescriptor.name}
+      />,
+    );
+
+    expect(mismatched).toContain('disabled="" type="submit"');
+    expect(matched).toContain('type="submit"');
+    expect(matched).not.toContain('disabled="" type="submit"');
+  });
+
+  it("renders a non-dismissible pending upgrade dialog", () => {
+    const markup = renderToStaticMarkup(
+      <ProjectUpgradeDialog
+        confirmationValue={schemaOneDescriptor.name}
+        onCancel={() => undefined}
+        onConfirmationChange={() => undefined}
+        onSubmit={() => undefined}
+        pending
+        projectName={schemaOneDescriptor.name}
+      />,
+    );
+
+    expect(markup).toContain('role="alertdialog"');
+    expect(markup).toContain('aria-modal="true"');
+    expect(markup).toContain('aria-busy="true"');
+    expect(markup).toContain("Meng-upgrade proyek");
+    expect(markup).toContain('autoComplete="off"');
+    expect(markup).toContain('spellCheck="false"');
+    expect(markup.match(/disabled=""/g)).toHaveLength(4);
+  });
+
+  it("renders safe retriable error details with retry controls", () => {
+    const error = desktopError({
+      correlation_id: "00000000-0000-7000-8000-000000000777",
+      detail: "D:\\confidential\\metadata.sqlite",
+      field_errors: ["Metadata schema belum siap."],
+      message: "Upgrade proyek belum dapat diselesaikan.",
+      remediation: "Coba kembali setelah memeriksa ruang penyimpanan.",
+      retriable: true,
+    });
+    const markup = renderToStaticMarkup(
+      <ProjectUpgradePanel
+        actionStatus="idle"
+        error={error}
+        onDismissError={() => undefined}
+        onUpgrade={() => Promise.resolve(false)}
+        project={schemaOneDescriptor}
+      />,
+    );
+
+    expect(markup).toContain(error.message);
+    expect(markup).toContain(error.remediation);
+    expect(markup).toContain(error.field_errors[0]);
+    expect(markup).toContain(error.correlation_id);
+    expect(markup).toContain("Tutup pesan");
+    expect(markup).toContain("Coba lagi");
+    expect(markup).not.toContain(error.detail);
+  });
+
+  it("renders a non-destructive recovery error without retry controls", () => {
+    const error = desktopError({
+      code: "PROJECT_CORRUPTED",
+      message: "Proyek memerlukan pemulihan sebelum dapat dibuka.",
+      remediation: "Jangan hapus berkas proyek.",
+      retriable: false,
+    });
+    const markup = renderToStaticMarkup(
+      <ProjectUpgradePanel
+        actionStatus="idle"
+        error={error}
+        onDismissError={() => undefined}
+        onUpgrade={() => Promise.resolve(false)}
+        project={schemaOneDescriptor}
+      />,
+    );
+
+    expect(markup).toContain(error.remediation);
+    expect(markup).not.toContain("Coba lagi");
+    expect(markup).not.toContain("Hapus proyek");
+    expect(markup).not.toContain("Perbaiki proyek");
+    expect(markup).not.toContain("Downgrade proyek");
   });
 });
 
