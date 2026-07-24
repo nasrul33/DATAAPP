@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [features]
-test-utils = []
+test-utils = ["teratai-filesystem/test-utils"]
 
 [dependencies]
 rusqlite.workspace = true

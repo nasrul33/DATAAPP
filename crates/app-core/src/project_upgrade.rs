@@ -5,15 +5,15 @@ use sha2::{Digest, Sha256};
 use teratai_contracts::generated::project_descriptor::ProjectDescriptor;
 use teratai_contracts::generated::project_manifest::ProjectManifest;
 use teratai_filesystem::{
-    begin_project_upgrade, read_bounded, validate_project_layout, ProjectLayout,
-    ProjectUpgradeBackupProof, MANIFEST_LIMIT_BYTES,
+    begin_project_upgrade, read_bounded, validate_project_layout, FilesystemError, ProjectLayout,
+    ProjectUpgrade, ProjectUpgradeBackupProof, MANIFEST_LIMIT_BYTES,
 };
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::{
     descriptor, is_uuid_v7, read_manifest, validate_database, validate_manifest, ProjectError,
-    METADATA_SCHEMA_VERSION,
+    METADATA_SCHEMA_VERSION, MIN_METADATA_SCHEMA_VERSION,
 };
 
 #[cfg(not(test))]
@@ -111,23 +111,13 @@ fn upgrade_project_inner(
     let migrated_at = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .map_err(|error| ProjectError::Timestamp(error.to_string()))?;
-    let mut backup_proof = None;
-    let mut marker = Vec::new();
-    let mut guard = begin_project_upgrade::<ProjectError, _>(&layout, correlation_id, |proof| {
-        backup_proof = Some(proof.clone());
-        marker = upgrade_marker_bytes(
-            &manifest,
-            correlation_id,
-            &before_hash,
-            &after_hash,
-            proof,
-            UpgradeStage::BackupPrepared,
-        )?;
-        Ok(marker.clone())
-    })?;
-    let backup_proof = backup_proof.ok_or_else(|| {
-        ProjectError::DataIntegrity("upgrade backup proof was not retained".to_owned())
-    })?;
+    let (mut guard, backup_proof, mut marker) = begin_upgrade_guard(
+        &layout,
+        correlation_id,
+        &manifest,
+        &before_hash,
+        &after_hash,
+    )?;
     let marker_context = UpgradeMarkerContext {
         manifest: &manifest,
         correlation_id,
@@ -190,6 +180,72 @@ fn upgrade_project_inner(
             }
         }
     }
+}
+
+fn begin_upgrade_guard(
+    layout: &ProjectLayout,
+    correlation_id: &str,
+    manifest: &ProjectManifest,
+    before_hash: &str,
+    after_hash: &str,
+) -> Result<(ProjectUpgrade, ProjectUpgradeBackupProof, Vec<u8>), ProjectError> {
+    let mut backup_proof = None;
+    let mut marker = Vec::new();
+    let guard = match begin_project_upgrade::<ProjectError, _>(layout, correlation_id, |proof| {
+        backup_proof = Some(proof.clone());
+        marker = upgrade_marker_bytes(
+            manifest,
+            correlation_id,
+            before_hash,
+            after_hash,
+            proof,
+            UpgradeStage::BackupPrepared,
+        )?;
+        Ok(marker.clone())
+    }) {
+        Ok(guard) => guard,
+        Err(begin_error) => {
+            return Err(classify_begin_failure(
+                layout.root(),
+                before_hash,
+                begin_error,
+            ));
+        }
+    };
+    let backup_proof = backup_proof.ok_or_else(|| {
+        ProjectError::DataIntegrity("upgrade backup proof was not retained".to_owned())
+    })?;
+    Ok((guard, backup_proof, marker))
+}
+
+fn classify_begin_failure(
+    path: &Path,
+    original_manifest_hash: &str,
+    begin_error: ProjectError,
+) -> ProjectError {
+    if clean_schema_one_source_is_proven(path, original_manifest_hash) {
+        begin_error
+    } else {
+        ProjectError::RecoveryRequired(FilesystemError::RecoveryRequired(path.to_owned()))
+    }
+}
+
+fn clean_schema_one_source_is_proven(path: &Path, original_manifest_hash: &str) -> bool {
+    let Ok(layout) = validate_project_layout(path) else {
+        return false;
+    };
+    let Ok((manifest, manifest_hash)) = read_manifest(&layout) else {
+        return false;
+    };
+    if manifest_hash != original_manifest_hash
+        || manifest.metadata_schema_version != MIN_METADATA_SCHEMA_VERSION
+    {
+        return false;
+    }
+
+    validate_manifest(&manifest).is_ok()
+        && validate_database(&layout, &manifest, &manifest_hash).is_ok()
+        && descriptor(&layout, &manifest).is_ok()
 }
 
 fn upgrade_marker_bytes(
@@ -388,6 +444,7 @@ mod tests {
 
     use super::{take_captured_marker, upgrade_with_fault, UpgradeFault};
     use crate::{
+        test_utils::{install_begin_project_upgrade_fault_for_test, BeginProjectUpgradeFault},
         ProjectError, ProjectErrorKind, ProjectService, PROJECT_MIGRATION, PROJECT_SCHEMA_VERSION,
     };
 
@@ -579,6 +636,52 @@ mod tests {
                 _
             )))
         ));
+        cleanup(&path);
+    }
+
+    #[test]
+    fn retained_begin_artifacts_require_recovery_for_every_durable_begin_stage() {
+        for (index, fault) in [
+            BeginProjectUpgradeFault::AfterLock,
+            BeginProjectUpgradeFault::AfterMetadataBackup,
+            BeginProjectUpgradeFault::AfterManifestBackup,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let path = create_schema_one_fixture(&format!("retained-begin-artifact-{index}"));
+            let _fault = install_begin_project_upgrade_fault_for_test(fault);
+
+            let error = ProjectService::upgrade(&path, UPGRADE_CORRELATION_ID)
+                .expect_err("retained begin artifact must require explicit recovery");
+
+            assert_eq!(error.kind(), ProjectErrorKind::RecoveryRequired);
+            assert!(matches!(
+                ProjectService::open(&path),
+                Err(ProjectError::Filesystem(FilesystemError::RecoveryRequired(
+                    _
+                )))
+            ));
+            cleanup(&path);
+        }
+    }
+
+    #[test]
+    fn clean_begin_failure_preserves_the_original_retriable_error() {
+        let path = create_schema_one_fixture("clean-begin-failure");
+        let _fault =
+            install_begin_project_upgrade_fault_for_test(BeginProjectUpgradeFault::BeforeArtifacts);
+
+        let error = ProjectService::upgrade(&path, UPGRADE_CORRELATION_ID)
+            .expect_err("a pre-artifact begin failure must be returned");
+
+        assert_eq!(error.kind(), ProjectErrorKind::Filesystem);
+        assert_eq!(
+            ProjectService::open(&path)
+                .expect("clean schema-one project remains usable")
+                .metadata_schema_version,
+            1
+        );
         cleanup(&path);
     }
 

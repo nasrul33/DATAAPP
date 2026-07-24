@@ -472,7 +472,10 @@ mod tests {
     use std::thread;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    use teratai_app_core::test_utils::create_schema_one_project_fixture;
+    use teratai_app_core::test_utils::{
+        create_schema_one_project_fixture, install_begin_project_upgrade_fault_for_test,
+        BeginProjectUpgradeFault,
+    };
 
     use super::*;
 
@@ -782,6 +785,53 @@ mod tests {
         assert_eq!(
             ProjectService::open(fixture.path())
                 .expect_err("recovery proof must remain visible")
+                .kind(),
+            ProjectErrorKind::RecoveryRequired
+        );
+    }
+
+    #[test]
+    fn genuine_schema_one_begin_failure_maps_to_non_retriable_recovery() {
+        let fixture = create_schema_one_project_fixture(
+            "desktop-upgrade-begin-recovery",
+            PROJECT_ID,
+            CREATE_REQUEST_ID,
+            "Audit Begin Recovery",
+            "2026-07-24T01:00:00Z",
+        )
+        .expect("create genuine schema-one project");
+        let schema_one = ProjectService::open(fixture.path()).expect("open genuine schema one");
+        let session = ProjectSession {
+            lifecycle: Mutex::new(()),
+            current: Mutex::new(Some(ActiveProject {
+                descriptor: schema_one.clone(),
+                job_store: None,
+            })),
+        };
+        let request = CorrelationRequest {
+            request_id: REQUEST_ID.to_owned(),
+        };
+        let _fault = install_begin_project_upgrade_fault_for_test(
+            BeginProjectUpgradeFault::AfterMetadataBackup,
+        );
+
+        let error = session
+            .upgrade(&request, Arc::new(TestEventSink))
+            .expect_err("retained begin artifact must require recovery");
+
+        assert_eq!(error.code, "PROJECT_CORRUPTED");
+        assert!(!error.retriable);
+        assert!(!error.detail.contains("metadata.sqlite"));
+        assert!(!error
+            .detail
+            .contains(fixture.path().to_string_lossy().as_ref()));
+        assert_eq!(
+            session.current(&request).expect("preserve active session"),
+            Some(schema_one)
+        );
+        assert_eq!(
+            ProjectService::open(fixture.path())
+                .expect_err("retained begin artifact must block project open")
                 .kind(),
             ProjectErrorKind::RecoveryRequired
         );

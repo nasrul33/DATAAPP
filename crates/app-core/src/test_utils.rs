@@ -9,6 +9,10 @@ use sha2::{Digest, Sha256};
 use teratai_contracts::generated::project_create_request::ProjectCreateRequest;
 use teratai_contracts::generated::project_manifest::ProjectManifest;
 use teratai_filesystem::{begin_project_creation, FilesystemError};
+pub use teratai_filesystem::{
+    install_begin_project_upgrade_fault_for_test, BeginProjectUpgradeFault,
+    BeginProjectUpgradeFaultGuard,
+};
 
 use crate::{ProjectError, PROJECT_MIGRATION, PROJECT_SCHEMA_VERSION};
 

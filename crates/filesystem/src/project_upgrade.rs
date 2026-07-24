@@ -27,6 +27,7 @@ enum FinalizeStage {
     MoveManifestBackup,
     AfterManifestBackupRename,
     MoveLock,
+    AfterLockRename,
     MoveMarker,
     AfterMarkerRename,
     CleanupMetadataBackup,
@@ -34,6 +35,92 @@ enum FinalizeStage {
     CleanupLock,
     CleanupMarker,
     CleanupDirectory,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BeginFaultStage {
+    BeforeArtifacts,
+    Lock,
+    MetadataBackup,
+    ManifestBackup,
+}
+
+/// Deterministic retained-artifact fault points for upgrade-begin recovery tests.
+///
+/// This test utility is available only to the crate's tests and consumers that
+/// explicitly enable the `test-utils` feature.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BeginProjectUpgradeFault {
+    /// Fail after source validation but before an upgrade artifact is created.
+    BeforeArtifacts,
+    /// Fail after the durable upgrade lock has been published.
+    AfterLock,
+    /// Fail after the durable metadata backup has been published.
+    AfterMetadataBackup,
+    /// Fail after the durable manifest backup has been published.
+    AfterManifestBackup,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl BeginProjectUpgradeFault {
+    const fn matches(self, stage: BeginFaultStage) -> bool {
+        matches!(
+            (self, stage),
+            (Self::BeforeArtifacts, BeginFaultStage::BeforeArtifacts)
+                | (Self::AfterLock, BeginFaultStage::Lock)
+                | (Self::AfterMetadataBackup, BeginFaultStage::MetadataBackup)
+                | (Self::AfterManifestBackup, BeginFaultStage::ManifestBackup)
+        )
+    }
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+thread_local! {
+    static BEGIN_PROJECT_UPGRADE_FAULT: RefCell<Option<BeginProjectUpgradeFault>> = const {
+        RefCell::new(None)
+    };
+}
+
+/// Clears a deterministic begin-upgrade test fault when dropped.
+#[cfg(any(test, feature = "test-utils"))]
+#[derive(Debug)]
+pub struct BeginProjectUpgradeFaultGuard {
+    fault: BeginProjectUpgradeFault,
+}
+
+#[cfg(any(test, feature = "test-utils"))]
+impl Drop for BeginProjectUpgradeFaultGuard {
+    fn drop(&mut self) {
+        BEGIN_PROJECT_UPGRADE_FAULT.with(|configured| {
+            if *configured.borrow() == Some(self.fault) {
+                configured.replace(None);
+            }
+        });
+    }
+}
+
+/// Install one thread-local deterministic failure during project-upgrade begin.
+///
+/// The configured fault is consumed only when its matching durable stage is
+/// reached, and the returned guard clears an unconsumed configuration on drop.
+///
+/// # Panics
+///
+/// Panics when another begin-upgrade fault is already configured for this
+/// thread. Tests must keep fault guards scoped to one upgrade attempt.
+#[cfg(any(test, feature = "test-utils"))]
+#[must_use]
+pub fn install_begin_project_upgrade_fault_for_test(
+    fault: BeginProjectUpgradeFault,
+) -> BeginProjectUpgradeFaultGuard {
+    BEGIN_PROJECT_UPGRADE_FAULT.with(|configured| {
+        assert!(
+            configured.replace(Some(fault)).is_none(),
+            "a project-upgrade begin fault is already configured for this thread"
+        );
+    });
+    BeginProjectUpgradeFaultGuard { fault }
 }
 
 #[derive(Clone, Copy)]
@@ -472,27 +559,21 @@ impl ProjectUpgrade {
             ProofFile::ManifestBackup,
             &cleanup_directory.join(MANIFEST_BACKUP_FILE),
         )?;
+        self.move_lock_file(&cleanup_directory.join(UPGRADE_LOCK_FILE))?;
         self.move_proof_file(
             FinalizeStage::MoveMarker,
             ProofFile::Marker,
             &cleanup_directory.join(UPGRADE_MARKER_FILE),
         )?;
 
-        // The marker move plus directory sync is the commit point. The owned
-        // lock remains at its contract path until after this point, preventing
-        // a cooperating owner from entering during a failed marker sync.
+        // The marker move plus directory sync is the commit point. Every
+        // recovery-blocking artifact, including the owned lock, has already
+        // been moved and verified. Therefore any failure before this point
+        // remains a pre-commit failure that can restore schema-one controls.
         // Windows std does not expose MOVEFILE_WRITE_THROUGH; the safe
         // best-available sequence is synced file contents, atomic rename, then
         // directory-handle sync_all.
         self.committed = true;
-        if !self.skip_cleanup_stage(FinalizeStage::MoveLock) {
-            let lock_destination = cleanup_directory.join(UPGRADE_LOCK_FILE);
-            if fs::rename(&self.lock_path, &lock_destination).is_ok() {
-                self.lock_path = lock_destination;
-                let _ = sync_directory(&cleanup_directory);
-                let _ = sync_directory(&self.layout.root().join("recovery"));
-            }
-        }
         drop(self.lock_file.take());
         let cleanup = [
             (
@@ -503,11 +584,7 @@ impl ProjectUpgrade {
                 FinalizeStage::CleanupManifestBackup,
                 Some(self.manifest_backup_path.clone()),
             ),
-            (
-                FinalizeStage::CleanupLock,
-                (self.lock_path.parent() == Some(cleanup_directory.as_path()))
-                    .then(|| self.lock_path.clone()),
-            ),
+            (FinalizeStage::CleanupLock, Some(self.lock_path.clone())),
             (FinalizeStage::CleanupMarker, Some(self.marker_path.clone())),
         ];
         for (stage, path) in cleanup {
@@ -608,6 +685,63 @@ impl ProjectUpgrade {
             ));
         }
         self.validate_moved_proof(proof, destination)?;
+        self.validate_cleanup_directory()?;
+        self.validate_proof_parent(&source)?;
+        sync_directory(destination.parent().ok_or_else(|| {
+            FilesystemError::InvalidPath("cleanup artifact parent is missing".to_owned())
+        })?)?;
+        sync_directory(source.parent().ok_or_else(|| {
+            FilesystemError::InvalidPath("recovery artifact parent is missing".to_owned())
+        })?)
+    }
+
+    fn move_lock_file(&mut self, destination: &Path) -> Result<(), FilesystemError> {
+        if self.lock_path == destination {
+            let lock_file = self.lock_file.as_ref().ok_or_else(|| {
+                FilesystemError::InvalidLayout("project upgrade lock ownership was lost".to_owned())
+            })?;
+            return validate_file_handle(
+                &self.lock_path,
+                lock_file,
+                self.lock_identity,
+                "project upgrade lock",
+            );
+        }
+
+        self.validate_cleanup_directory()?;
+        self.validate_proof_parent(&self.lock_path)?;
+        let lock_file = self.lock_file.as_ref().ok_or_else(|| {
+            FilesystemError::InvalidLayout("project upgrade lock ownership was lost".to_owned())
+        })?;
+        validate_file_handle(
+            &self.lock_path,
+            lock_file,
+            self.lock_identity,
+            "project upgrade lock",
+        )?;
+        if entry_exists_no_follow(destination)? {
+            return Err(FilesystemError::RecoveryRequired(destination.to_owned()));
+        }
+
+        self.fail_finalize_stage(FinalizeStage::MoveLock)?;
+        let source = self.lock_path.clone();
+        fs::rename(&source, destination)?;
+        destination.clone_into(&mut self.lock_path);
+        self.fail_finalize_stage(FinalizeStage::AfterLockRename)?;
+        if entry_exists_no_follow(&source)? {
+            return Err(FilesystemError::InvalidLayout(
+                "project upgrade lock source remained after rename".to_owned(),
+            ));
+        }
+        let lock_file = self.lock_file.as_ref().ok_or_else(|| {
+            FilesystemError::InvalidLayout("project upgrade lock ownership was lost".to_owned())
+        })?;
+        validate_file_handle(
+            &self.lock_path,
+            lock_file,
+            self.lock_identity,
+            "project upgrade lock",
+        )?;
         self.validate_cleanup_directory()?;
         self.validate_proof_parent(&source)?;
         sync_directory(destination.parent().ok_or_else(|| {
@@ -790,8 +924,8 @@ where
         }
     }
 
-    let (lock_file, lock_identity) = create_owned_file(&lock_path, correlation_id.as_bytes())?;
-    sync_directory(&recovery_directory)?;
+    let (lock_file, lock_identity) =
+        create_and_sync_upgrade_lock(&lock_path, &recovery_directory, correlation_id)?;
     let (metadata_backup_file, metadata_backup_identity, metadata_backup_proof) =
         create_durable_backup(
             &metadata_source,
@@ -799,6 +933,7 @@ where
             &metadata_backup_path,
         )?;
     sync_directory(&recovery_directory)?;
+    fail_begin_fault(BeginFaultStage::MetadataBackup)?;
     let (manifest_backup_file, manifest_backup_identity, manifest_backup_proof) =
         create_durable_backup(
             &manifest_source,
@@ -806,6 +941,7 @@ where
             &manifest_backup_path,
         )?;
     sync_directory(&recovery_directory)?;
+    fail_begin_fault(BeginFaultStage::ManifestBackup)?;
 
     observer(BeginStage::BackupsCopied, layout);
     validate_source_snapshot(
@@ -859,6 +995,48 @@ where
         committed: false,
         finalize_failure: None,
     })
+}
+
+fn create_and_sync_upgrade_lock<E>(
+    lock_path: &Path,
+    recovery_directory: &Path,
+    correlation_id: &str,
+) -> Result<(File, FileIdentity), E>
+where
+    E: From<FilesystemError>,
+{
+    fail_begin_fault(BeginFaultStage::BeforeArtifacts)?;
+    let lock = create_owned_file(lock_path, correlation_id.as_bytes())?;
+    sync_directory(recovery_directory)?;
+    fail_begin_fault(BeginFaultStage::Lock)?;
+    Ok(lock)
+}
+
+fn fail_begin_fault<E>(stage: BeginFaultStage) -> Result<(), E>
+where
+    E: From<FilesystemError>,
+{
+    #[cfg(any(test, feature = "test-utils"))]
+    let should_fail = BEGIN_PROJECT_UPGRADE_FAULT.with(|configured| {
+        let mut configured = configured.borrow_mut();
+        if configured.is_some_and(|fault| fault.matches(stage)) {
+            *configured = None;
+            true
+        } else {
+            false
+        }
+    });
+    #[cfg(not(any(test, feature = "test-utils")))]
+    let _ = stage;
+
+    #[cfg(any(test, feature = "test-utils"))]
+    if should_fail {
+        return Err(FilesystemError::Io(io::Error::other(
+            "injected project-upgrade begin failure",
+        ))
+        .into());
+    }
+    Ok(())
 }
 
 fn publish_initial_marker<E, F>(
@@ -1607,6 +1785,7 @@ mod tests {
             FinalizeStage::CreateCleanupDirectory,
             FinalizeStage::MoveMetadataBackup,
             FinalizeStage::MoveManifestBackup,
+            FinalizeStage::MoveLock,
             FinalizeStage::MoveMarker,
         ] {
             let fixture = project_fixture("finalize-before-marker");
@@ -1631,6 +1810,7 @@ mod tests {
         for stage in [
             FinalizeStage::AfterMetadataBackupRename,
             FinalizeStage::AfterManifestBackupRename,
+            FinalizeStage::AfterLockRename,
             FinalizeStage::AfterMarkerRename,
         ] {
             let fixture = project_fixture("partial-proof-move");
@@ -1653,7 +1833,6 @@ mod tests {
     #[test]
     fn cleanup_failures_after_marker_move_do_not_report_failed_commit() {
         for stage in [
-            FinalizeStage::MoveLock,
             FinalizeStage::CleanupMetadataBackup,
             FinalizeStage::CleanupManifestBackup,
             FinalizeStage::CleanupLock,
@@ -1667,14 +1846,7 @@ mod tests {
             upgrade.inject_finalize_failure(stage);
 
             upgrade.commit().expect("logical commit after marker move");
-            if stage == FinalizeStage::MoveLock {
-                assert!(matches!(
-                    validate_project_layout(layout.root()),
-                    Err(FilesystemError::RecoveryRequired(_))
-                ));
-            } else {
-                validate_project_layout(layout.root()).expect("committed layout");
-            }
+            validate_project_layout(layout.root()).expect("committed layout");
             assert_eq!(
                 fs::read(layout.manifest_path()).unwrap(),
                 b"committed manifest",
@@ -1692,14 +1864,41 @@ mod tests {
                 .root()
                 .join("recovery/manifest-schema-1.json.backup")
                 .exists());
-            assert_eq!(
-                layout
-                    .root()
-                    .join("recovery/.project-upgrade.lock")
-                    .exists(),
-                stage == FinalizeStage::MoveLock
-            );
+            assert!(!layout
+                .root()
+                .join("recovery/.project-upgrade.lock")
+                .exists());
         }
+    }
+
+    #[test]
+    fn begin_fault_after_metadata_backup_keeps_recovery_artifacts() {
+        let fixture = project_fixture("begin-fault-after-metadata");
+        let layout = fixture.layout();
+        let _fault = install_begin_project_upgrade_fault_for_test(
+            BeginProjectUpgradeFault::AfterMetadataBackup,
+        );
+
+        let error = begin_project_upgrade(layout, CORRELATION_ID, MARKER)
+            .expect_err("injected begin failure must be returned");
+
+        assert!(matches!(error, FilesystemError::Io(_)));
+        assert!(layout
+            .root()
+            .join("recovery/.project-upgrade.lock")
+            .is_file());
+        assert!(layout
+            .root()
+            .join("recovery/metadata-schema-1.sqlite.backup")
+            .is_file());
+        assert!(!layout
+            .root()
+            .join("recovery/manifest-schema-1.json.backup")
+            .exists());
+        assert!(matches!(
+            validate_project_layout(layout.root()),
+            Err(FilesystemError::RecoveryRequired(_))
+        ));
     }
 
     #[cfg(unix)]

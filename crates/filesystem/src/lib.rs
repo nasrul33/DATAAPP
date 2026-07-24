@@ -6,6 +6,11 @@ pub use project_upgrade::{
     begin_project_upgrade, pin_project_metadata, PinnedProjectMetadata, PinnedProjectOperation,
     ProjectUpgrade, ProjectUpgradeBackupProof, ProjectUpgradeFileProof,
 };
+#[cfg(any(test, feature = "test-utils"))]
+pub use project_upgrade::{
+    install_begin_project_upgrade_fault_for_test, BeginProjectUpgradeFault,
+    BeginProjectUpgradeFaultGuard,
+};
 
 use std::ffi::OsStr;
 use std::fmt::{self, Display, Formatter};
