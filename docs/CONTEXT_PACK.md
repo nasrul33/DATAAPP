@@ -241,7 +241,7 @@ Residual risks accepted for this task: exactly-once admission is in-process only
 
 ### T-0111 hardening evidence
 
-Fresh gap audit and verification on Windows 11, 2026-07-24, found no unresolved PR comment/review thread; GitHub Actions Quality Gates run 10 was successful and PR #4 remained mergeable. The audit closed one lifecycle defect: an invalid handler cancellation outcome can no longer leave a job `RUNNING`. Regression coverage now also proves aggregate memory/disk rejection, checked arithmetic overflow without reservation corruption, and contiguous revision plus before/after audit-hash linkage through success, queued/running cancellation, preflight rejection, typed failure, panic, invalid cancellation outcome, and restart recovery. GitHub Actions run 11 then exposed a scheduler-dependent race in the pre-existing shutdown-retry test; the test now waits for bounded worker-exit proof before retrying, without changing production behavior.
+Fresh gap audit and verification on Windows 11, 2026-07-24, found no unresolved PR comment/review thread; PR #4 remained mergeable. The audit closed one lifecycle defect: an invalid handler cancellation outcome can no longer leave a job `RUNNING`. Regression coverage now also proves aggregate memory/disk rejection, checked arithmetic overflow without reservation corruption, and contiguous revision plus before/after audit-hash linkage through success, queued/running cancellation, preflight rejection, typed failure, panic, invalid cancellation outcome, and restart recovery. GitHub Actions run 11 exposed a scheduler-dependent race in the pre-existing shutdown-retry test; the test now waits for bounded worker-exit proof before retrying, without changing production behavior. Quality Gates run 12 then passed install, contract check, lint, typecheck, test, and build on a fresh Windows runner.
 
 | Command | Exact result |
 |---|---|
@@ -262,5 +262,6 @@ Fresh gap audit and verification on Windows 11, 2026-07-24, found no unresolved 
 | `uv run pytest -p no:cacheprovider engine/tests tests/golden` | exit 0; 11 passed, 0 failed |
 | `pnpm contracts:check` | exit 0; 16 canonical schemas verified, no stale generated artifact |
 | `pnpm --filter @teratai/desktop desktop:dev` smoke test | Tauri executable responding; Vite `http://localhost:1420` returned HTTP 200; process stopped after verification |
+| GitHub Actions `Quality Gates` run 12 | completed successfully; all Windows quality steps passed |
 
 Dependency and compatibility review: no dependency, lockfile, schema, migration, canonical contract schema, IPC version, Python dispatch, Tauri command/event, or UI behavior was added. The accepted T-0111 residual scope remains unchanged.
