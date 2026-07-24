@@ -71,7 +71,7 @@ describe("desktop project lifecycle UI", () => {
     expect(markup).toContain("Import dataset tetap nonaktif");
   });
 
-  it("renders a non-mutating upgrade state for schema-1 projects", () => {
+  it("renders the actionable upgrade flow for schema-1 projects", () => {
     const markup = renderToStaticMarkup(
       <AppShell
         lifecycle={lifecycle({
@@ -82,7 +82,25 @@ describe("desktop project lifecycle UI", () => {
     );
 
     expect(markup).toContain("Upgrade proyek diperlukan");
-    expect(markup).toContain("tidak di-upgrade otomatis");
+    expect(markup).toContain("Upgrade proyek");
+    expect(markup).toContain("Metadata schema versi 1");
+    expect(markup).not.toContain("tidak di-upgrade otomatis");
+    expect(markup).not.toContain("Belum ada pekerjaan");
+  });
+
+  it("keeps dashboard controls disabled while a schema-1 upgrade is running", () => {
+    const markup = renderToStaticMarkup(
+      <AppShell
+        lifecycle={lifecycle({
+          actionStatus: "upgrading",
+          project: { ...descriptor, metadata_schema_version: 1 },
+          status: "active",
+        })}
+      />,
+    );
+
+    expect(markup).toContain("Meng-upgrade");
+    expect(markup).toContain("disabled");
   });
 
   it("renders recovery remediation without a destructive action", () => {

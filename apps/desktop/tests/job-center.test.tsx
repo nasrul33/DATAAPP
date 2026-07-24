@@ -49,7 +49,8 @@ describe("job center model", () => {
 describe("job center UI states", () => {
   it("renders loading, upgrade, unavailable, and initial error states", () => {
     expect(render("loading")).toContain('aria-busy="true"');
-    expect(render("upgrade")).toContain("tidak di-upgrade otomatis");
+    expect(render("upgrade")).toContain("akan tersedia setelah metadata proyek diperbarui ke schema versi 2");
+    expect(render("upgrade")).not.toContain("tidak di-upgrade otomatis");
     expect(render("unavailable")).toContain("hanya tersedia di aplikasi desktop");
     expect(render("error", desktopError())).toContain("Coba lagi");
   });

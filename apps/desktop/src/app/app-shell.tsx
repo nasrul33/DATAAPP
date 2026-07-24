@@ -31,6 +31,7 @@ import type { DesktopError, ProjectDescriptor } from "@teratai/contracts";
 import { JobCenter } from "../job/job-center";
 import type { JobClient } from "../job/job-client";
 import { ProjectDialog } from "../project/project-dialog";
+import { ProjectUpgradePanel } from "../project/project-upgrade-panel";
 import type { ProjectLifecycle } from "../project/use-project-lifecycle";
 
 interface AppShellProps {
@@ -76,8 +77,11 @@ export function AppShell({ jobClient = null, lifecycle }: AppShellProps) {
             {lifecycle.status === "active" && lifecycle.project !== null ? (
               <ActiveProjectDashboard
                 actionStatus={lifecycle.actionStatus}
+                error={lifecycle.error}
                 jobClient={jobClient}
                 onClose={() => void lifecycle.closeProject()}
+                onDismissError={lifecycle.dismissError}
+                onUpgrade={lifecycle.upgradeProject}
                 project={lifecycle.project}
               />
             ) : null}
@@ -263,10 +267,21 @@ function EmptyDashboard({ actionStatus, onCreate, onOpen }: EmptyDashboardProps)
   );
 }
 
-function ActiveProjectDashboard({ actionStatus, jobClient, onClose, project }: {
+function ActiveProjectDashboard({
+  actionStatus,
+  error,
+  jobClient,
+  onClose,
+  onDismissError,
+  onUpgrade,
+  project,
+}: {
   readonly actionStatus: ProjectLifecycle["actionStatus"];
+  readonly error: DesktopError | null;
   readonly jobClient: JobClient | null;
   readonly onClose: () => void;
+  readonly onDismissError: () => void;
+  readonly onUpgrade: () => Promise<boolean>;
   readonly project: ProjectDescriptor;
 }) {
   const createdAt = new Intl.DateTimeFormat("id-ID", {
@@ -306,7 +321,17 @@ function ActiveProjectDashboard({ actionStatus, jobClient, onClose, project }: {
         </section>
         <SystemStatus workspaceStatus="Terverifikasi" />
       </DashboardGrid>
-      <JobCenter client={jobClient} project={project} />
+      {project.metadata_schema_version === 1 ? (
+        <ProjectUpgradePanel
+          actionStatus={actionStatus}
+          error={error}
+          onDismissError={onDismissError}
+          onUpgrade={onUpgrade}
+          project={project}
+        />
+      ) : (
+        <JobCenter client={jobClient} project={project} />
+      )}
     </div>
   );
 }

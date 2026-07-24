@@ -246,7 +246,7 @@ function JobCenterUpgrade() {
       <ShieldAlert className="text-amber-800" size={24} aria-hidden="true" />
       <h2 className="mt-3 font-bold" id="job-upgrade-title">Upgrade proyek diperlukan</h2>
       <p className="mt-2 max-w-3xl text-sm leading-6 text-stone-700">
-        Job Center memerlukan metadata schema versi 2. Proyek tetap dibuka secara read-only dan tidak di-upgrade otomatis.
+        Job Center akan tersedia setelah metadata proyek diperbarui ke schema versi 2.
       </p>
     </section>
   );
