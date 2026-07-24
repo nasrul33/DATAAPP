@@ -5,7 +5,7 @@ import type { DesktopError, ProjectDescriptor } from "@teratai/contracts";
 import { ProjectClientError, type ProjectClient } from "./project-client";
 
 export type ProjectViewStatus = "active" | "empty" | "error" | "loading" | "permission";
-export type ProjectActionStatus = "closing" | "creating" | "idle" | "opening" | "selecting";
+export type ProjectActionStatus = "closing" | "creating" | "idle" | "opening" | "selecting" | "upgrading";
 
 export interface ProjectLifecycleState {
   readonly actionStatus: ProjectActionStatus;
@@ -20,6 +20,7 @@ export interface ProjectLifecycle extends ProjectLifecycleState {
   readonly dismissError: () => void;
   readonly openProject: () => Promise<boolean>;
   readonly retry: () => Promise<void>;
+  readonly upgradeProject: () => Promise<boolean>;
 }
 
 export type StartupStateOverride = "error" | "loading" | "ready";
@@ -101,6 +102,23 @@ export function useProjectLifecycle(
     }
   }, [client]);
 
+  const upgradeProject = useCallback(async () => {
+    if (client === null) return false;
+    setState((current) => ({
+      ...current,
+      actionStatus: "upgrading",
+      error: null,
+    }));
+    try {
+      const project = await client.upgrade();
+      setState(upgradeSucceeded(project));
+      return true;
+    } catch (error: unknown) {
+      setState((current) => upgradeFailed(current, error));
+      return false;
+    }
+  }, [client]);
+
   const dismissError = useCallback(() => {
     setState((current) => ({
       actionStatus: "idle",
@@ -117,6 +135,37 @@ export function useProjectLifecycle(
     dismissError,
     openProject,
     retry: loadCurrent,
+    upgradeProject,
+  };
+}
+
+export function upgradeSucceeded(project: ProjectDescriptor): ProjectLifecycleState {
+  return {
+    actionStatus: "idle",
+    error: null,
+    project,
+    status: "active",
+  };
+}
+
+export function upgradeFailed(
+  current: ProjectLifecycleState,
+  error: unknown,
+): ProjectLifecycleState {
+  const envelope = desktopErrorFrom(error);
+  if (envelope.code === "PROJECT_CORRUPTED") {
+    return {
+      actionStatus: "idle",
+      error: envelope,
+      project: null,
+      status: "error",
+    };
+  }
+  return {
+    actionStatus: "idle",
+    error: envelope,
+    project: current.project,
+    status: current.project === null ? "error" : "active",
   };
 }
 
@@ -148,7 +197,17 @@ function permissionState(): ProjectLifecycleState {
 }
 
 function errorState(error: unknown): ProjectLifecycleState {
-  const envelope = error instanceof ProjectClientError
+  const envelope = desktopErrorFrom(error);
+  return {
+    actionStatus: "idle",
+    error: envelope,
+    project: null,
+    status: envelope.code === "PERMISSION_DENIED" ? "permission" : "error",
+  };
+}
+
+function desktopErrorFrom(error: unknown): DesktopError {
+  return error instanceof ProjectClientError
     ? error.envelope
     : {
         code: "OPERATION_FAILED",
@@ -159,10 +218,4 @@ function errorState(error: unknown): ProjectLifecycleState {
         remediation: "Coba kembali. Jika masalah berulang, mulai ulang Teratai.",
         retriable: true,
       } satisfies DesktopError;
-  return {
-    actionStatus: "idle",
-    error: envelope,
-    project: null,
-    status: envelope.code === "PERMISSION_DENIED" ? "permission" : "error",
-  };
 }

@@ -21,6 +21,7 @@ export interface ProjectClient {
   readonly open: (projectPath: string) => Promise<ProjectDescriptor>;
   readonly pickCreatePath: (name: string) => Promise<string | null>;
   readonly pickOpenPath: () => Promise<string | null>;
+  readonly upgrade: () => Promise<ProjectDescriptor>;
   readonly validate: (projectPath: string) => Promise<ProjectDescriptor>;
 }
 
@@ -85,6 +86,11 @@ export const tauriProjectClient: ProjectClient = {
       multiple: false,
     });
     return selection;
+  },
+  async upgrade() {
+    return parseProjectDescriptor(
+      await invokeProject("project_upgrade", correlationRequest()),
+    );
   },
   async validate(projectPath) {
     const request = openRequest(projectPath);

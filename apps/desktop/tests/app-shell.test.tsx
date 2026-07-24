@@ -9,9 +9,15 @@ import { ProjectDialog } from "../src/project/project-dialog";
 import {
   parseDesktopError,
   parseProjectDescriptor,
+  ProjectClientError,
   suggestedProjectFileName,
 } from "../src/project/project-client";
-import type { ProjectLifecycle } from "../src/project/use-project-lifecycle";
+import {
+  upgradeFailed,
+  upgradeSucceeded,
+  type ProjectLifecycle,
+  type ProjectLifecycleState,
+} from "../src/project/use-project-lifecycle";
 import { startDesktopTrace } from "../src/runtime-logging";
 
 const descriptor = {
@@ -116,6 +122,62 @@ describe("desktop project boundary helpers", () => {
   });
 });
 
+describe("desktop project upgrade lifecycle transitions", () => {
+  const schemaOneDescriptor = {
+    ...descriptor,
+    metadata_schema_version: 1,
+  } satisfies ProjectDescriptor;
+  const schemaTwoDescriptor = {
+    ...descriptor,
+    metadata_schema_version: 2,
+  } satisfies ProjectDescriptor;
+  const schemaOneState: ProjectLifecycleState = {
+    actionStatus: "upgrading",
+    error: null,
+    project: schemaOneDescriptor,
+    status: "active",
+  };
+
+  it("publishes the validated schema-2 descriptor only after upgrade succeeds", () => {
+    expect(upgradeSucceeded(schemaTwoDescriptor)).toEqual({
+      actionStatus: "idle",
+      error: null,
+      project: schemaTwoDescriptor,
+      status: "active",
+    });
+  });
+
+  it("preserves the active schema-1 descriptor when upgrade failure is retriable", () => {
+    const retriableError = desktopError({
+      code: "OPERATION_FAILED",
+      retriable: true,
+    });
+
+    expect(upgradeFailed(schemaOneState, new ProjectClientError(retriableError))).toEqual({
+      actionStatus: "idle",
+      error: retriableError,
+      project: schemaOneDescriptor,
+      status: "active",
+    });
+  });
+
+  it("escalates project corruption to the full recovery error state", () => {
+    const recoveryError = desktopError({
+      code: "PROJECT_CORRUPTED",
+      message: "Proyek memerlukan pemulihan sebelum dapat dibuka.",
+      remediation: "Jangan hapus berkas proyek.",
+      retriable: false,
+    });
+
+    expect(upgradeFailed(schemaOneState, new ProjectClientError(recoveryError))).toEqual({
+      actionStatus: "idle",
+      error: recoveryError,
+      project: null,
+      status: "error",
+    });
+  });
+});
+
 describe("desktop runtime logging", () => {
   it("emits a safe canonical startup event with a UUID v7", () => {
     const events: unknown[] = [];
@@ -145,6 +207,7 @@ function lifecycle(overrides: Partial<ProjectLifecycle>): ProjectLifecycle {
     project: null,
     retry: () => Promise.resolve(),
     status: "empty",
+    upgradeProject: () => Promise.resolve(false),
     ...overrides,
   };
 }
