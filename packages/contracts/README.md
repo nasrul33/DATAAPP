@@ -21,7 +21,7 @@ pnpm contracts:check
 
 Setiap file generated menyimpan path schema dan SHA-256 dari bytes canonical schema. Generator tidak menambahkan timestamp agar output sama pada setiap mesin.
 
-## Generator revision 1
+## Generator revision 2
 
 Supported root contract:
 
@@ -30,10 +30,11 @@ Supported root contract:
 - PascalCase `title`;
 - snake_case property names;
 - string, integer, number, boolean, dan one-dimensional arrays;
+- sibling canonical `$ref` sebagai property atau item array, dengan title yang cocok dan tanpa reference cycle;
 - required dan optional properties;
 - `additionalProperties: true` untuk forward-compatible additive fields.
 
-Enum, union, nested object, references, maps, dan runtime validation belum didukung. Generator harus menolak construct tersebut secara eksplisit; jangan menghasilkan tipe parsial atau menebak mapping.
+Enum, union, inline nested object, maps, dan runtime validation belum didukung. Generator harus menolak construct tersebut secara eksplisit; jangan menghasilkan tipe parsial atau menebak mapping. Komposisi object hanya melalui sibling canonical `$ref` yang tervalidasi.
 
 ## Compatibility rules
 
@@ -54,7 +55,7 @@ Crate `teratai-contracts` di `packages/contracts/rust` menjadi dependency bersam
 
 ## Persistent job contracts
 
-T-0110 menambahkan lima kontrak flat dan additive berikut. Seluruh field optional direpresentasikan sebagai property optional karena generator revision 1 tidak mendukung union dengan `null`.
+T-0110 menambahkan lima kontrak flat dan additive berikut. Seluruh field optional direpresentasikan sebagai property optional karena generator tidak mendukung union dengan `null`.
 
 | Contract | Required fields | Optional fields |
 |---|---|---|

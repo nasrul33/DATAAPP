@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/job/job-lifecycle-event.schema.json",
+  "title": "JobLifecycleEvent",
+  "description": "Best-effort desktop notification backed by the durable job snapshot and revision.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "protocol_version",
+    "event_name",
+    "sequence",
+    "occurred_at",
+    "job"
+  ],
+  "properties": {
+    "protocol_version": { "description": "Desktop job event protocol version.", "type": "string" },
+    "event_name": { "description": "Stable lifecycle event name such as job.progress or job.failed.", "type": "string" },
+    "sequence": { "description": "Positive per-job sequence equal to the persisted snapshot revision.", "type": "integer" },
+    "occurred_at": { "description": "UTC timestamp of the persisted lifecycle mutation.", "type": "string" },
+    "job": {
+      "description": "Trusted persistent snapshot after the lifecycle mutation.",
+      "$ref": "job-descriptor.schema.json"
+    }
+  }
+}

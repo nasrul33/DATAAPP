@@ -1,10 +1,18 @@
 #![doc = "Application orchestration boundary for Teratai Analytics Desktop."]
 
 pub mod job;
+pub mod job_executor;
 mod project_upgrade;
 
 pub use job::{
-    JobDescriptor, JobEnqueueRequest, JobError, JobErrorKind, JobListCursor, JobPage, JobStore,
+    JobDescriptor, JobEnqueueRequest, JobError, JobErrorKind, JobEventSink, JobLifecycleEvent,
+    JobListCursor, JobPage, JobStore,
+};
+pub use job_executor::resource::{DurationClass, ResourceBudget, ResourceEstimate};
+pub use job_executor::{
+    CheckpointDecision, ClockError, ExecutionContext, ExecutorClock, HandlerOutcome, JobExecutor,
+    JobExecutorConfig, JobExecutorError, JobExecutorErrorKind, JobHandler, JobHandlerError,
+    JobProgress, SystemExecutorClock,
 };
 
 use std::fmt::{self, Display, Formatter};

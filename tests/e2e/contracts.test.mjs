@@ -19,6 +19,10 @@ const generatedContracts = [
   ["job-descriptor", "job_descriptor", "JobDescriptor"],
   ["job-enqueue-request", "job_enqueue_request", "JobEnqueueRequest"],
   ["job-failure-request", "job_failure_request", "JobFailureRequest"],
+  ["job-get-request", "job_get_request", "JobGetRequest"],
+  ["job-lifecycle-event", "job_lifecycle_event", "JobLifecycleEvent"],
+  ["job-list-request", "job_list_request", "JobListRequest"],
+  ["job-list-response", "job_list_response", "JobListResponse"],
   ["job-progress-update-request", "job_progress_update_request", "JobProgressUpdateRequest"],
   ["job-transition-request", "job_transition_request", "JobTransitionRequest"],
 ];

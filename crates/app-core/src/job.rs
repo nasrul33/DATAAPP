@@ -1,5 +1,6 @@
 use std::fmt::{self, Display, Formatter};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use rusqlite::{
     params, Connection, OpenFlags, OptionalExtension, Row, Transaction, TransactionBehavior,
@@ -8,6 +9,7 @@ use sha2::{Digest, Sha256};
 pub use teratai_contracts::generated::job_descriptor::JobDescriptor;
 pub use teratai_contracts::generated::job_enqueue_request::JobEnqueueRequest;
 pub use teratai_contracts::generated::job_failure_request::JobFailureRequest;
+pub use teratai_contracts::generated::job_lifecycle_event::JobLifecycleEvent;
 pub use teratai_contracts::generated::job_progress_update_request::JobProgressUpdateRequest;
 pub use teratai_contracts::generated::job_transition_request::JobTransitionRequest;
 use teratai_filesystem::{
@@ -27,6 +29,65 @@ struct AfterCommitHook {
 #[cfg(test)]
 static AFTER_COMMIT_HOOK: std::sync::OnceLock<std::sync::Mutex<Option<AfterCommitHook>>> =
     std::sync::OnceLock::new();
+
+#[cfg(test)]
+static AUDIT_INSERT_FAULT_KIND: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+    std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) struct AuditInsertFaultGuard {
+    kind: String,
+}
+
+#[cfg(test)]
+impl Drop for AuditInsertFaultGuard {
+    fn drop(&mut self) {
+        let mut fault = match AUDIT_INSERT_FAULT_KIND
+            .get_or_init(|| std::sync::Mutex::new(None))
+            .lock()
+        {
+            Ok(fault) => fault,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if fault.as_deref() == Some(self.kind.as_str()) {
+            *fault = None;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn install_audit_insert_fault_for_test(kind: &str) -> AuditInsertFaultGuard {
+    assert!(is_safe_token(kind, 120));
+    let mut fault = AUDIT_INSERT_FAULT_KIND
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("audit insert fault is available");
+    assert!(fault.is_none(), "audit insert fault is already installed");
+    *fault = Some(kind.to_owned());
+    AuditInsertFaultGuard {
+        kind: kind.to_owned(),
+    }
+}
+
+#[cfg(test)]
+fn inject_audit_insert_failure(
+    transaction: &Transaction<'_>,
+    after: &JobDescriptor,
+) -> Result<(), JobError> {
+    let should_fail = AUDIT_INSERT_FAULT_KIND
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .map_err(|_| JobError::Database(rusqlite::Error::InvalidQuery))?
+        .as_deref()
+        == Some(after.kind.as_str());
+    if should_fail {
+        transaction.execute(
+            "INSERT INTO audit_event (missing_test_column) VALUES (NULL)",
+            [],
+        )?;
+    }
+    Ok(())
+}
 
 #[cfg(test)]
 fn install_after_commit_hook(hook: Option<AfterCommitHook>) {
@@ -149,15 +210,40 @@ pub struct JobPage {
 }
 
 /// Persistent, project-scoped job snapshot and history store.
-#[derive(Debug)]
 pub struct JobStore {
     project_path: PathBuf,
     project_id: String,
     metadata: PinnedProjectMetadata,
+    event_sink: Arc<dyn JobEventSink>,
+}
+
+impl fmt::Debug for JobStore {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("JobStore")
+            .field("project_path", &self.project_path)
+            .field("project_id", &self.project_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Best-effort observer for already-durable job lifecycle mutations.
+///
+/// Implementations must not treat delivery as durable. Consumers recover missed
+/// notifications through [`JobStore::get`] and [`JobStore::list`].
+pub trait JobEventSink: Send + Sync {
+    fn publish(&self, event: &JobLifecycleEvent);
+}
+
+#[derive(Debug)]
+struct NoopJobEventSink;
+
+impl JobEventSink for NoopJobEventSink {
+    fn publish(&self, _event: &JobLifecycleEvent) {}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum JobStatus {
+pub(crate) enum JobStatus {
     Queued,
     Running,
     Succeeded,
@@ -188,7 +274,7 @@ impl JobStatus {
         }
     }
 
-    fn parse(value: &str) -> Result<Self, JobError> {
+    pub(crate) fn parse(value: &str) -> Result<Self, JobError> {
         match value {
             "QUEUED" => Ok(Self::Queued),
             "RUNNING" => Ok(Self::Running),
@@ -202,7 +288,7 @@ impl JobStatus {
         }
     }
 
-    const fn is_terminal(self) -> bool {
+    pub(crate) const fn is_terminal(self) -> bool {
         matches!(self, Self::Succeeded | Self::Failed | Self::Cancelled)
     }
 }
@@ -267,6 +353,22 @@ impl JobStore {
     /// Returns a typed error for unsafe layouts, incompatible schemas, invalid
     /// project identity, or database failures.
     pub fn open(project_path: &Path) -> Result<Self, JobError> {
+        Self::open_with_event_sink(project_path, Arc::new(NoopJobEventSink))
+    }
+
+    /// Open a schema-2 store with a best-effort lifecycle event observer.
+    ///
+    /// The observer runs only after a mutation is durably committed and pinned
+    /// metadata identity has been refreshed. Observer failure or panic never
+    /// rolls back or changes the persistent lifecycle.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed trust-boundary failures as [`JobStore::open`].
+    pub fn open_with_event_sink(
+        project_path: &Path,
+        event_sink: Arc<dyn JobEventSink>,
+    ) -> Result<Self, JobError> {
         let layout = validated_project_layout(project_path)?;
         let metadata = pin_project_metadata(&layout).map_err(|_| {
             JobError::DataIntegrity("project metadata could not be pinned safely".to_owned())
@@ -290,6 +392,7 @@ impl JobStore {
             project_path: canonical_path,
             project_id: descriptor.project_id,
             metadata,
+            event_sink,
         })
     }
 
@@ -596,10 +699,11 @@ impl JobStore {
             .map_err(|_| JobError::DataIntegrity("pinned metadata identity changed".to_owned()));
         refresh_result?;
         write_result?;
+        self.publish_event("job.queued", &descriptor);
         Ok(descriptor)
     }
 
-    fn start_at(
+    pub(crate) fn start_at(
         &self,
         request: &JobTransitionRequest,
         timestamp: &str,
@@ -611,7 +715,7 @@ impl JobStore {
         )
     }
 
-    fn succeed_at(
+    pub(crate) fn succeed_at(
         &self,
         request: &JobTransitionRequest,
         timestamp: &str,
@@ -623,7 +727,7 @@ impl JobStore {
         )
     }
 
-    fn fail_at(
+    pub(crate) fn fail_at(
         &self,
         request: &JobFailureRequest,
         timestamp: &str,
@@ -635,14 +739,14 @@ impl JobStore {
         )
     }
 
-    fn update_progress_at(
+    pub(crate) fn update_progress_at(
         &self,
         request: &JobProgressUpdateRequest,
         timestamp: &str,
     ) -> Result<JobDescriptor, JobError> {
         validate_progress_request(request)?;
         validate_timestamp(timestamp)?;
-        self.with_immediate_transaction(|transaction| {
+        let descriptor = self.with_immediate_transaction(|transaction| {
             let before = select_job(transaction, &self.project_id, &request.job_id)?;
             if before.revision != request.expected_revision {
                 return Err(JobError::RevisionConflict {
@@ -699,7 +803,9 @@ impl JobStore {
                 "job.progressed",
             )?;
             Ok(after)
-        })
+        })?;
+        self.publish_event("job.progress", &descriptor);
+        Ok(descriptor)
     }
 
     fn request_cancellation_at(
@@ -715,7 +821,7 @@ impl JobStore {
         )
     }
 
-    fn complete_cancellation_at(
+    pub(crate) fn complete_cancellation_at(
         &self,
         request: &JobTransitionRequest,
         timestamp: &str,
@@ -734,7 +840,7 @@ impl JobStore {
     ) -> Result<Vec<JobDescriptor>, JobError> {
         validate_uuid(correlation_id, "correlation_id")?;
         validate_timestamp(timestamp)?;
-        self.with_immediate_transaction(|transaction| {
+        let recovered = self.with_immediate_transaction(|transaction| {
             let active = {
                 let mut statement = transaction.prepare(
                     "SELECT job_id, project_id, kind, status, correlation_id, revision,
@@ -794,7 +900,11 @@ impl JobStore {
                 recovered.push(after);
             }
             Ok(recovered)
-        })
+        })?;
+        for descriptor in &recovered {
+            self.publish_event("job.failed", descriptor);
+        }
+        Ok(recovered)
     }
 
     fn transition_to_at(
@@ -815,7 +925,7 @@ impl JobStore {
     ) -> Result<JobDescriptor, JobError> {
         validate_transition_request(request, to)?;
         validate_timestamp(timestamp)?;
-        self.with_immediate_transaction(|transaction| {
+        let (descriptor, event_name) = self.with_immediate_transaction(|transaction| {
             let before = select_job(transaction, &self.project_id, request.job_id())?;
             if before.revision != request.expected_revision() {
                 return Err(JobError::RevisionConflict {
@@ -826,7 +936,7 @@ impl JobStore {
             let from = JobStatus::parse(&before.status)?;
             if idempotent_cancelling && from == JobStatus::Cancelling && to == JobStatus::Cancelling
             {
-                return Ok(before);
+                return Ok((before, None));
             }
             if !transition_allowed(from, to) {
                 return Err(JobError::InvalidTransition {
@@ -838,8 +948,24 @@ impl JobStore {
             let after = transitioned_descriptor(&before, request, from, to, timestamp)?;
             let action = transition_action(from, to)?;
             persist_mutation(transaction, &self.project_id, &before, &after, action)?;
-            Ok(after)
-        })
+            Ok((after, Some(lifecycle_event_name(from, to)?)))
+        })?;
+        if let Some(event_name) = event_name {
+            self.publish_event(event_name, &descriptor);
+        }
+        Ok(descriptor)
+    }
+
+    fn publish_event(&self, event_name: &str, descriptor: &JobDescriptor) {
+        let event = JobLifecycleEvent {
+            event_name: event_name.to_owned(),
+            job: descriptor.clone(),
+            occurred_at: descriptor.updated_at.clone(),
+            protocol_version: "1.0".to_owned(),
+            sequence: descriptor.revision,
+        };
+        let sink = Arc::clone(&self.event_sink);
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| sink.publish(&event)));
     }
 
     fn with_immediate_transaction<T>(
@@ -1175,6 +1301,24 @@ fn transition_action(from: JobStatus, to: JobStatus) -> Result<&'static str, Job
     }
 }
 
+fn lifecycle_event_name(from: JobStatus, to: JobStatus) -> Result<&'static str, JobError> {
+    match (from, to) {
+        (JobStatus::Queued, JobStatus::Running) => Ok("job.started"),
+        (JobStatus::Running, JobStatus::Succeeded) => Ok("job.completed"),
+        (JobStatus::Queued | JobStatus::Running, JobStatus::Cancelling) => {
+            Ok("job.cancellation_requested")
+        }
+        (JobStatus::Cancelling, JobStatus::Cancelled) => Ok("job.cancelled"),
+        (JobStatus::Queued | JobStatus::Running | JobStatus::Cancelling, JobStatus::Failed) => {
+            Ok("job.failed")
+        }
+        _ => Err(JobError::InvalidTransition {
+            from: from.as_str().to_owned(),
+            to: to.as_str().to_owned(),
+        }),
+    }
+}
+
 fn persist_mutation(
     transaction: &Transaction<'_>,
     project_id: &str,
@@ -1260,6 +1404,8 @@ fn persist_mutation(
     )?;
     let before_hash = snapshot_hash(before)?;
     let after_hash = snapshot_hash(after)?;
+    #[cfg(test)]
+    inject_audit_insert_failure(transaction, after)?;
     transaction.execute(
         "INSERT INTO audit_event (
             event_id, actor, action, target_type, target_id,
@@ -1414,6 +1560,11 @@ fn snapshot_hash(descriptor: &JobDescriptor) -> Result<String, JobError> {
         JobError::DataIntegrity("job snapshot could not be hashed safely".to_owned())
     })?;
     Ok(format!("sha256:{:x}", Sha256::digest(canonical)))
+}
+
+#[cfg(test)]
+pub(crate) fn snapshot_hash_for_test(descriptor: &JobDescriptor) -> Result<String, JobError> {
+    snapshot_hash(descriptor)
 }
 
 fn format_uuid(bytes: [u8; 16]) -> String {
@@ -1654,7 +1805,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::mpsc;
+    use std::sync::{mpsc, Arc, Mutex};
     use std::time::Duration;
 
     use rusqlite::{params, Connection, Result, TransactionBehavior};
@@ -1670,7 +1821,8 @@ mod tests {
     use super::{
         event_id_at, full_project_validation_count, install_after_commit_hook, snapshot_hash,
         transition_allowed, validate_persisted_descriptor, AfterCommitHook, JobError, JobErrorKind,
-        JobListCursor, JobStatus, JobStore, TransitionRequest, JOB_MIGRATION,
+        JobEventSink, JobLifecycleEvent, JobListCursor, JobStatus, JobStore, TransitionRequest,
+        JOB_MIGRATION,
     };
     use crate::ProjectService;
 
@@ -1685,6 +1837,26 @@ mod tests {
     const NOW_1: &str = "2026-07-20T12:01:00Z";
     const NOW_2: &str = "2026-07-20T12:02:00Z";
     const NOW_3: &str = "2026-07-20T12:03:00Z";
+
+    #[derive(Debug, Default)]
+    struct RecordingJobEventSink {
+        events: Mutex<Vec<JobLifecycleEvent>>,
+    }
+
+    impl JobEventSink for RecordingJobEventSink {
+        fn publish(&self, event: &JobLifecycleEvent) {
+            self.events.lock().expect("event sink").push(event.clone());
+        }
+    }
+
+    #[derive(Debug)]
+    struct PanickingJobEventSink;
+
+    impl JobEventSink for PanickingJobEventSink {
+        fn publish(&self, _event: &JobLifecycleEvent) {
+            panic!("fixed test-only event sink failure");
+        }
+    }
     const NOW_4: &str = "2026-07-20T12:04:00Z";
     const NOW_5: &str = "2026-07-20T12:05:00Z";
     const INVALID_CALENDAR_TIMESTAMPS: [&str; 4] = [
@@ -2097,6 +2269,73 @@ mod tests {
         assert_eq!(cancelled.status, "CANCELLED");
         assert_eq!(cancelled.finished_at.as_deref(), Some(NOW_3));
 
+        drop(store);
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn lifecycle_sink_observes_only_durable_mutations_in_revision_order() {
+        let path = create_schema_two_project("lifecycle-events");
+        let sink = Arc::new(RecordingJobEventSink::default());
+        let store = JobStore::open_with_event_sink(&path, sink.clone()).expect("open event store");
+
+        let queued = store.enqueue_at(&enqueue(0), NOW).expect("enqueue");
+        let running = store
+            .start_at(&transition(queued.revision), NOW_1)
+            .expect("start");
+        let progressed = store
+            .update_progress_at(&progress(running.revision, 1, Some(10), "mock.work"), NOW_2)
+            .expect("progress");
+        let cancelling = store
+            .request_cancellation_at(&transition(progressed.revision), NOW_3)
+            .expect("cancel");
+        store
+            .request_cancellation_at(&transition(cancelling.revision), NOW_4)
+            .expect("idempotent cancel");
+        store
+            .complete_cancellation_at(&transition(cancelling.revision), NOW_5)
+            .expect("complete cancel");
+
+        let events = sink.events.lock().expect("recorded events");
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_name.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "job.queued",
+                "job.started",
+                "job.progress",
+                "job.cancellation_requested",
+                "job.cancelled"
+            ]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert!(events.iter().all(|event| event.protocol_version == "1.0"
+            && event.sequence == event.job.revision
+            && event.occurred_at == event.job.updated_at));
+        drop(events);
+        drop(store);
+        cleanup_project(&path);
+    }
+
+    #[test]
+    fn lifecycle_sink_panic_cannot_change_durable_job_state() {
+        let path = create_schema_two_project("lifecycle-event-panic");
+        let store = JobStore::open_with_event_sink(&path, Arc::new(PanickingJobEventSink))
+            .expect("open event store");
+
+        let queued = store
+            .enqueue_at(&enqueue(0), NOW)
+            .expect("event panic is contained");
+
+        assert_eq!(store.get(&queued.job_id).expect("durable job"), queued);
         drop(store);
         cleanup_project(&path);
     }

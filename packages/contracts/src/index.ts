@@ -9,6 +9,10 @@ export type { EngineHandshakeResponse } from "./generated/engine-handshake-respo
 export type { JobDescriptor } from "./generated/job-descriptor";
 export type { JobEnqueueRequest } from "./generated/job-enqueue-request";
 export type { JobFailureRequest } from "./generated/job-failure-request";
+export type { JobGetRequest } from "./generated/job-get-request";
+export type { JobLifecycleEvent } from "./generated/job-lifecycle-event";
+export type { JobListRequest } from "./generated/job-list-request";
+export type { JobListResponse } from "./generated/job-list-response";
 export type { JobProgressUpdateRequest } from "./generated/job-progress-update-request";
 export type { JobTransitionRequest } from "./generated/job-transition-request";
 export type { ProjectCreateRequest } from "./generated/project-create-request";

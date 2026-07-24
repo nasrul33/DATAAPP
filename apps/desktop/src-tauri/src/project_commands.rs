@@ -1,39 +1,55 @@
 use std::ffi::OsStr;
 use std::path::{Component, Path};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use tauri::State;
-use teratai_app_core::{ProjectError, ProjectErrorKind, ProjectService};
+use tauri::{AppHandle, State};
+use teratai_app_core::{
+    JobError, JobEventSink, JobStore, ProjectError, ProjectErrorKind, ProjectService,
+};
 use teratai_contracts::generated::correlation_request::CorrelationRequest;
 use teratai_contracts::generated::desktop_error::DesktopError;
 use teratai_contracts::generated::project_create_request::ProjectCreateRequest;
 use teratai_contracts::generated::project_descriptor::ProjectDescriptor;
 use teratai_contracts::generated::project_open_request::ProjectOpenRequest;
 
-type CommandResult<T> = Result<T, Box<DesktopError>>;
+pub(crate) type CommandResult<T> = Result<T, Box<DesktopError>>;
+
+#[derive(Debug)]
+struct ActiveProject {
+    descriptor: ProjectDescriptor,
+    job_store: Option<Arc<JobStore>>,
+}
 
 /// Owns the currently active project descriptor for the desktop process.
 #[derive(Debug, Default)]
 pub struct ProjectSession {
-    current: Mutex<Option<ProjectDescriptor>>,
+    current: Mutex<Option<ActiveProject>>,
 }
 
 impl ProjectSession {
-    fn create(&self, request: &ProjectCreateRequest) -> CommandResult<ProjectDescriptor> {
+    pub(crate) fn create(
+        &self,
+        request: &ProjectCreateRequest,
+        event_sink: Arc<dyn JobEventSink>,
+    ) -> CommandResult<ProjectDescriptor> {
         validate_request_id(&request.request_id)?;
         let descriptor = ProjectService::create(request).map_err(|error| {
             map_project_error(&error, &request.request_id, ProjectOperation::Create)
         })?;
-        self.activate(descriptor, &request.request_id)
+        self.activate(descriptor, &request.request_id, event_sink)
     }
 
-    fn open(&self, request: &ProjectOpenRequest) -> CommandResult<ProjectDescriptor> {
+    pub(crate) fn open(
+        &self,
+        request: &ProjectOpenRequest,
+        event_sink: Arc<dyn JobEventSink>,
+    ) -> CommandResult<ProjectDescriptor> {
         validate_open_request(request)?;
         let descriptor =
             ProjectService::open(Path::new(&request.project_path)).map_err(|error| {
                 map_project_error(&error, &request.request_id, ProjectOperation::Open)
             })?;
-        self.activate(descriptor, &request.request_id)
+        self.activate(descriptor, &request.request_id, event_sink)
     }
 
     fn validate(request: &ProjectOpenRequest) -> CommandResult<ProjectDescriptor> {
@@ -47,7 +63,7 @@ impl ProjectSession {
         validate_request_id(&request.request_id)?;
         self.current
             .lock()
-            .map(|current| current.clone())
+            .map(|current| current.as_ref().map(|active| active.descriptor.clone()))
             .map_err(|_| session_error(&request.request_id))
     }
 
@@ -65,13 +81,53 @@ impl ProjectSession {
         &self,
         descriptor: ProjectDescriptor,
         correlation_id: &str,
+        event_sink: Arc<dyn JobEventSink>,
     ) -> CommandResult<ProjectDescriptor> {
+        let job_store = if descriptor.metadata_schema_version == 2 {
+            Some(Arc::new(
+                JobStore::open_with_event_sink(Path::new(&descriptor.project_path), event_sink)
+                    .map_err(|error| map_job_activation_error(&error, correlation_id))?,
+            ))
+        } else {
+            None
+        };
         let mut current = self
             .current
             .lock()
             .map_err(|_| session_error(correlation_id))?;
-        *current = Some(descriptor.clone());
+        *current = Some(ActiveProject {
+            descriptor: descriptor.clone(),
+            job_store,
+        });
         Ok(descriptor)
+    }
+
+    pub(crate) fn job_store(&self, correlation_id: &str) -> CommandResult<Arc<JobStore>> {
+        validate_request_id(correlation_id)?;
+        let current = self
+            .current
+            .lock()
+            .map_err(|_| session_error(correlation_id))?;
+        let active = current.as_ref().ok_or_else(|| {
+            command_error(
+                "VALIDATION_ERROR",
+                correlation_id,
+                "no active project is available for job access",
+                "Buka proyek sebelum mengakses pekerjaan.",
+                "Pilih atau buat proyek Teratai lalu coba kembali.",
+                false,
+            )
+        })?;
+        active.job_store.clone().ok_or_else(|| {
+            command_error(
+                "PROJECT_UPGRADE_REQUIRED",
+                correlation_id,
+                "active project metadata schema does not provide job runtime",
+                "Proyek perlu ditingkatkan sebelum pekerjaan dapat digunakan.",
+                "Gunakan alur peningkatan proyek sebelum membuka Job Center.",
+                false,
+            )
+        })
     }
 }
 
@@ -79,18 +135,20 @@ impl ProjectSession {
 #[allow(clippy::needless_pass_by_value)]
 pub fn project_create(
     request: ProjectCreateRequest,
+    app: AppHandle,
     session: State<'_, ProjectSession>,
 ) -> CommandResult<ProjectDescriptor> {
-    session.create(&request)
+    session.create(&request, crate::job_commands::tauri_event_sink(app))
 }
 
 #[tauri::command]
 #[allow(clippy::needless_pass_by_value)]
 pub fn project_open(
     request: ProjectOpenRequest,
+    app: AppHandle,
     session: State<'_, ProjectSession>,
 ) -> CommandResult<ProjectDescriptor> {
-    session.open(&request)
+    session.open(&request, crate::job_commands::tauri_event_sink(app))
 }
 
 #[tauri::command]
@@ -145,7 +203,7 @@ fn validate_open_request(request: &ProjectOpenRequest) -> CommandResult<()> {
     Ok(())
 }
 
-fn validate_request_id(request_id: &str) -> CommandResult<()> {
+pub(crate) fn validate_request_id(request_id: &str) -> CommandResult<()> {
     if is_uuid_v7(request_id) {
         return Ok(());
     }
@@ -280,6 +338,29 @@ fn session_error(correlation_id: &str) -> Box<DesktopError> {
     })
 }
 
+fn map_job_activation_error(error: &JobError, correlation_id: &str) -> Box<DesktopError> {
+    crate::job_commands::map_job_error(error, correlation_id)
+}
+
+pub(crate) fn command_error(
+    code: &str,
+    correlation_id: &str,
+    detail: &str,
+    message: &str,
+    remediation: &str,
+    retriable: bool,
+) -> Box<DesktopError> {
+    Box::new(DesktopError {
+        code: code.to_owned(),
+        correlation_id: correlation_id.to_owned(),
+        detail: detail.to_owned(),
+        field_errors: Vec::new(),
+        message: message.to_owned(),
+        remediation: Some(remediation.to_owned()),
+        retriable,
+    })
+}
+
 fn is_uuid_v7(value: &str) -> bool {
     let bytes = value.as_bytes();
     bytes.len() == 36
@@ -300,12 +381,19 @@ fn is_uuid_v7(value: &str) -> bool {
 mod tests {
     use std::fs;
     use std::path::PathBuf;
+    use std::sync::Arc;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
 
     const PROJECT_ID: &str = "00000000-0000-7000-8000-000000000110";
     const REQUEST_ID: &str = "00000000-0000-7000-8000-000000000111";
+
+    struct TestEventSink;
+
+    impl JobEventSink for TestEventSink {
+        fn publish(&self, _event: &teratai_app_core::JobLifecycleEvent) {}
+    }
 
     fn test_parent() -> PathBuf {
         let nonce = SystemTime::now()
@@ -333,7 +421,9 @@ mod tests {
             request_id: REQUEST_ID.to_owned(),
         };
 
-        let created = session.create(&request).expect("create project");
+        let created = session
+            .create(&request, Arc::new(TestEventSink))
+            .expect("create project");
         let correlation = CorrelationRequest {
             request_id: REQUEST_ID.to_owned(),
         };
@@ -371,6 +461,30 @@ mod tests {
         .expect_err("relative path must fail");
 
         assert_eq!(error.code, "VALIDATION_ERROR");
+        assert_eq!(error.correlation_id, REQUEST_ID);
+    }
+
+    #[test]
+    fn schema_one_session_requires_explicit_upgrade_for_job_access() {
+        let session = ProjectSession {
+            current: Mutex::new(Some(ActiveProject {
+                descriptor: ProjectDescriptor {
+                    created_at: "2026-07-24T01:00:00Z".to_owned(),
+                    metadata_schema_version: 1,
+                    name: "Project schema 1".to_owned(),
+                    project_id: PROJECT_ID.to_owned(),
+                    project_path: "D:\\Projects\\schema-one.teratai".to_owned(),
+                    schema_version: "1.0.0".to_owned(),
+                },
+                job_store: None,
+            })),
+        };
+
+        let error = session
+            .job_store(REQUEST_ID)
+            .expect_err("schema one job access must fail");
+
+        assert_eq!(error.code, "PROJECT_UPGRADE_REQUIRED");
         assert_eq!(error.correlation_id, REQUEST_ID);
     }
 }
