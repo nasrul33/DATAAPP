@@ -54,15 +54,42 @@ function snakeCaseFileName(schemaPath) {
   return schemaBaseName(schemaPath).replaceAll("-", "_");
 }
 
-function validateProperty(property, propertyPath) {
+function referenceFileName(reference, propertyPath, schemaFileNames) {
+  assertCondition(
+    typeof reference === "string" && /^[a-z][a-z0-9-]*\.schema\.json$/.test(reference),
+    `${propertyPath}.$ref must name one canonical sibling schema.`,
+  );
+  assertCondition(
+    schemaFileNames.has(reference),
+    `${propertyPath}.$ref references missing schema ${reference}.`,
+  );
+  return reference;
+}
+
+function referenceTypeName(reference) {
+  return basename(reference, ".schema.json")
+    .split("-")
+    .map((part) => `${part[0].toUpperCase()}${part.slice(1)}`)
+    .join("");
+}
+
+function validateProperty(property, propertyPath, schemaFileNames) {
   assertCondition(isRecord(property), `${propertyPath} must be an object.`);
   assertCondition(
     typeof property.description === "string" && property.description.trim().length > 0,
     `${propertyPath}.description must be a non-empty string.`,
   );
+  if (Object.hasOwn(property, "$ref")) {
+    referenceFileName(property.$ref, propertyPath, schemaFileNames);
+    assertCondition(
+      !Object.hasOwn(property, "type") && !Object.hasOwn(property, "items"),
+      `${propertyPath}.$ref cannot be combined with type or items.`,
+    );
+    return;
+  }
   assertCondition(
     ["array", "boolean", "integer", "number", "string"].includes(property.type),
-    `${propertyPath}.type is not supported by generator revision 1.`,
+    `${propertyPath}.type is not supported by generator revision 2.`,
   );
 
   if (property.type === "array") {
@@ -70,12 +97,13 @@ function validateProperty(property, propertyPath) {
     validateProperty(
       { description: `${property.description} item`, ...property.items },
       `${propertyPath}.items`,
+      schemaFileNames,
     );
     assertCondition(property.items.type !== "array", `${propertyPath} cannot contain nested arrays.`);
   }
 }
 
-function validateSchema(schema, schemaPath) {
+function validateSchema(schema, schemaPath, schemaFileNames) {
   const displayPath = relative(repositoryRoot, schemaPath);
   assertCondition(isRecord(schema), `${displayPath} must contain a JSON object.`);
   assertCondition(
@@ -117,7 +145,11 @@ function validateSchema(schema, schemaPath) {
       /^[a-z][a-z0-9_]*$/.test(propertyName),
       `${displayPath}.properties.${propertyName} must be a snake_case identifier.`,
     );
-    validateProperty(schema.properties[propertyName], `${displayPath}.properties.${propertyName}`);
+    validateProperty(
+      schema.properties[propertyName],
+      `${displayPath}.properties.${propertyName}`,
+      schemaFileNames,
+    );
   }
 
   for (const requiredName of requiredNames) {
@@ -137,6 +169,8 @@ function orderedProperties(schema) {
 }
 
 function mapType(property, language) {
+  if (Object.hasOwn(property, "$ref")) return referenceTypeName(property.$ref);
+
   const primitives = {
     python: { boolean: "bool", integer: "int", number: "float", string: "str" },
     rust: { boolean: "bool", integer: "i64", number: "f64", string: "String" },
@@ -151,6 +185,19 @@ function mapType(property, language) {
   }
 
   return primitives[language][property.type];
+}
+
+function referencedSchemas(schema) {
+  const references = new Set();
+  const visit = (property) => {
+    if (Object.hasOwn(property, "$ref")) {
+      references.add(property.$ref);
+      return;
+    }
+    if (property.type === "array") visit(property.items);
+  };
+  Object.values(schema.properties).forEach(visit);
+  return [...references].sort(compareAscii);
 }
 
 function renderTypeScript(schema, sourcePath, fingerprint) {
@@ -168,6 +215,11 @@ function renderTypeScript(schema, sourcePath, fingerprint) {
     `// Schema SHA-256: ${fingerprint}.`,
     "// Do not edit manually.",
     "",
+    ...referencedSchemas(schema).map(
+      (reference) =>
+        `import type { ${referenceTypeName(reference)} } from "./${basename(reference, ".schema.json")}";`,
+    ),
+    ...(referencedSchemas(schema).length > 0 ? [""] : []),
     `/** ${normalizeDescription(schema.description)} */`,
     `export interface ${schema.title} {`,
     ...properties,
@@ -194,6 +246,11 @@ function renderPython(schema, sourcePath, fingerprint) {
     "",
     "from dataclasses import dataclass",
     "",
+    ...referencedSchemas(schema).map(
+      (reference) =>
+        `from .${basename(reference, ".schema.json").replaceAll("-", "_")} import ${referenceTypeName(reference)}`,
+    ),
+    ...(referencedSchemas(schema).length > 0 ? [""] : []),
     "",
     "@dataclass(frozen=True, slots=True)",
     `class ${schema.title}:`,
@@ -217,6 +274,11 @@ function renderRust(schema, sourcePath, fingerprint) {
     `// Schema SHA-256: ${fingerprint}.`,
     "// Do not edit manually.",
     "",
+    ...referencedSchemas(schema).map(
+      (reference) =>
+        `use super::${basename(reference, ".schema.json").replaceAll("-", "_")}::${referenceTypeName(reference)};`,
+    ),
+    ...(referencedSchemas(schema).length > 0 ? [""] : []),
     `/// ${normalizeDescription(schema.description)}`,
     "#[derive(Debug, Clone, PartialEq, serde::Deserialize, serde::Serialize)]",
     `pub struct ${schema.title} {`,
@@ -248,14 +310,45 @@ async function main() {
     .filter((fileName) => fileName.endsWith(".schema.json"))
     .sort(compareAscii);
   assertCondition(schemaFileNames.length > 0, "No canonical contract schemas were found.");
-
-  const driftedFiles = [];
-  const generatedModules = [];
+  const schemaFileNameSet = new Set(schemaFileNames);
+  const schemaDefinitions = new Map();
   for (const schemaFileName of schemaFileNames) {
     const schemaPath = join(schemaDirectory, schemaFileName);
     const schemaSource = await readFile(schemaPath, "utf8");
     const schema = JSON.parse(schemaSource);
-    validateSchema(schema, schemaPath);
+    validateSchema(schema, schemaPath, schemaFileNameSet);
+    schemaDefinitions.set(schemaFileName, { schema, schemaPath, schemaSource });
+  }
+  for (const [schemaFileName, definition] of schemaDefinitions) {
+    for (const reference of referencedSchemas(definition.schema)) {
+      const target = schemaDefinitions.get(reference);
+      assertCondition(target !== undefined, `${schemaFileName} references missing schema ${reference}.`);
+      assertCondition(
+        referenceTypeName(reference) === target.schema.title,
+        `${schemaFileName} reference ${reference} does not match title ${target.schema.title}.`,
+      );
+    }
+  }
+  const visited = new Set();
+  const visiting = new Set();
+  const visitReferences = (schemaFileName) => {
+    if (visited.has(schemaFileName)) return;
+    assertCondition(!visiting.has(schemaFileName), `Contract schema reference cycle includes ${schemaFileName}.`);
+    visiting.add(schemaFileName);
+    const definition = schemaDefinitions.get(schemaFileName);
+    assertCondition(definition !== undefined, `Missing loaded schema ${schemaFileName}.`);
+    referencedSchemas(definition.schema).forEach(visitReferences);
+    visiting.delete(schemaFileName);
+    visited.add(schemaFileName);
+  };
+  schemaFileNames.forEach(visitReferences);
+
+  const driftedFiles = [];
+  const generatedModules = [];
+  for (const schemaFileName of schemaFileNames) {
+    const definition = schemaDefinitions.get(schemaFileName);
+    assertCondition(definition !== undefined, `Missing loaded schema ${schemaFileName}.`);
+    const { schema, schemaPath, schemaSource } = definition;
     const sourcePath = relative(repositoryRoot, schemaPath).replaceAll("\\", "/");
     const fingerprint = createHash("sha256").update(schemaSource).digest("hex");
     generatedModules.push(snakeCaseFileName(schemaPath));

@@ -1,0 +1,18 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/job/job-list-request.schema.json",
+  "title": "JobListRequest",
+  "description": "Typed bounded keyset request for project-scoped persistent jobs.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "correlation_id",
+    "limit"
+  ],
+  "properties": {
+    "correlation_id": { "description": "Lowercase UUID v7 identity for this desktop request.", "type": "string" },
+    "limit": { "description": "Requested page size validated natively within one through one hundred.", "type": "integer" },
+    "cursor_updated_at": { "description": "Optional UTC timestamp from the previous page cursor.", "type": "string" },
+    "cursor_job_id": { "description": "Optional lowercase UUID v7 from the previous page cursor.", "type": "string" }
+  }
+}

@@ -72,6 +72,7 @@ Codex must read AGENTS, Product, Architecture, Primitives, IPC Contracts, curren
 | T-0101 | Completed | 2026-07-20 | Typed Tauri lifecycle commands, system path selection, safe desktop error mapping, in-memory active session, and complete loading/empty/permission/recovery/error/active UI states |
 | T-0110 | Completed | 2026-07-21 | Explicit schema-1-to-2 upgrade, persistent job snapshot and append-only history, optimistic CAS, idempotent cancellation, restart recovery to `FAILED/INTERRUPTED`, and cross-language flat contracts |
 | T-0111 | Completed | 2026-07-21 | Project-scoped bounded Rust executor runs a persisted mock job asynchronously; progress, cancellation, resource rejection, typed failure, panic containment, shutdown, reaper cleanup, duplicate admission, and restart recovery are deterministic and audit-backed |
+| T-0112 | Completed | 2026-07-24 | Schema-first active-project job get/list/cancel commands, revision-linked durable lifecycle notifications, safe error mapping, and strict TypeScript trust-boundary parsing pass all local quality gates |
 
 ## T-0001 decisions and deviations
 | ID | Decision/deviation | Reason | Follow-up |
@@ -241,7 +242,7 @@ Residual risks accepted for this task: exactly-once admission is in-process only
 
 ### T-0111 hardening evidence
 
-Fresh gap audit and verification on Windows 11, 2026-07-24, found no unresolved PR comment/review thread; PR #4 remained mergeable. The audit closed one lifecycle defect: an invalid handler cancellation outcome can no longer leave a job `RUNNING`. Regression coverage now also proves aggregate memory/disk rejection, checked arithmetic overflow without reservation corruption, and contiguous revision plus before/after audit-hash linkage through success, queued/running cancellation, preflight rejection, typed failure, panic, invalid cancellation outcome, and restart recovery. GitHub Actions run 11 exposed a scheduler-dependent race in the pre-existing shutdown-retry test; the test now waits for bounded worker-exit proof before retrying, without changing production behavior. Quality Gates run 12 then passed install, contract check, lint, typecheck, test, and build on a fresh Windows runner.
+Fresh gap audit and verification on Windows 11, 2026-07-24, found no unresolved PR comment/review thread; PR #4 remained mergeable. The audit closed one lifecycle defect: an invalid handler cancellation outcome can no longer leave a job `RUNNING`. Regression coverage now also proves aggregate memory/disk rejection, checked arithmetic overflow without reservation corruption, and contiguous revision plus before/after audit-hash linkage through success, queued/running cancellation, preflight rejection, typed failure, panic, invalid cancellation outcome, and restart recovery. GitHub Actions run 11 exposed a scheduler-dependent race in the pre-existing shutdown-retry test; the test now waits for bounded worker-exit proof before retrying, without changing production behavior. Quality Gates runs 12 and 13 then passed install, contract check, lint, typecheck, test, and build on fresh Windows runners, including the final documentation commit.
 
 | Command | Exact result |
 |---|---|
@@ -262,6 +263,42 @@ Fresh gap audit and verification on Windows 11, 2026-07-24, found no unresolved 
 | `uv run pytest -p no:cacheprovider engine/tests tests/golden` | exit 0; 11 passed, 0 failed |
 | `pnpm contracts:check` | exit 0; 16 canonical schemas verified, no stale generated artifact |
 | `pnpm --filter @teratai/desktop desktop:dev` smoke test | Tauri executable responding; Vite `http://localhost:1420` returned HTTP 200; process stopped after verification |
-| GitHub Actions `Quality Gates` run 12 | completed successfully; all Windows quality steps passed |
+| GitHub Actions `Quality Gates` runs 12 and 13 | completed successfully; all Windows quality steps passed, including final commit `67b1b79` |
 
 Dependency and compatibility review: no dependency, lockfile, schema, migration, canonical contract schema, IPC version, Python dispatch, Tauri command/event, or UI behavior was added. The accepted T-0111 residual scope remains unchanged.
+
+## T-0112 decisions and deviations
+
+| ID | Decision/deviation | Reason | Follow-up |
+|---|---|---|---|
+| DEC-F070 | Advance the canonical generator to revision 2 with validated acyclic sibling `$ref` properties and array items | Job pages and event payloads must compose the existing `JobDescriptor` source of truth instead of duplicating its fields or serializing nested JSON as strings | Keep enum/union/inline-object support out until an owning contract task defines validation and compatibility rules |
+| DEC-F071 | Store an optional pinned `JobStore` beside the active desktop project descriptor | Schema-2 sessions need one project-scoped authority for commands/events, while schema-1 projects must remain openable and read-only | The explicit project upgrade command/UI must replace `PROJECT_UPGRADE_REQUIRED`; open must remain migration-free |
+| DEC-F072 | Publish `job:lifecycle` only after durable commit and pinned metadata identity refresh, with sequence equal to persistent revision | UI notification delivery cannot become a second lifecycle truth or cause a committed job mutation to report failure | Consumers must recover missed notifications through `job_get`/`job_list`; a durable broker is out of MVP scope |
+| DEC-F073 | Expose only bounded `job_get`, `job_list`, and cooperative `job_cancel` plus a strict TypeScript parser | Provide safe observability/control without inventing executable operation payloads or bypassing T-0110 CAS | Job Center UI may consume this client in T-0113; operation-specific enqueue commands belong to their operation tasks |
+| DEC-F074 | Keep Python dispatch, automatic retry, platform probes, schema upgrade UI, and Job Center UI out of T-0112 | Preserve a reviewable IPC foundation and avoid authorizing arbitrary or incomplete execution paths | Deliver each capability as an explicit follow-up with its own contracts and complete UI states |
+
+No runtime dependency, lockfile change, metadata migration, source-data access, Python execution, or automatic project mutation was added by T-0112. Event delivery is best-effort; durable job snapshot/history/audit remain authoritative.
+
+### T-0112 completion evidence
+
+Fresh verification on Windows 11, 2026-07-24:
+
+| Command | Exact result |
+|---|---|
+| `pnpm install --frozen-lockfile --config.confirmModulesPurge=false` | exit 0; all 6 workspace projects already up to date; pnpm 11.9.0 |
+| `uv sync --frozen` | exit 0; 12 packages checked |
+| `pnpm lint` | exit 0; 20 schemas current; ESLint, Cargo fmt/Clippy, and Ruff clean |
+| `pnpm typecheck` | exit 0; strict TypeScript and Cargo workspace check clean; mypy found no issues in 30 source files |
+| `pnpm test` | exit 0; 23 TypeScript tests, 4 e2e tests, 133 Rust tests, and 12 Python tests passed; 0 failed |
+| `pnpm test:e2e` | exit 0; 4 passed, 0 failed |
+| `pnpm build` | exit 0; TypeScript/Vite, Cargo workspace, and Python bytecode builds succeeded |
+| `cargo fmt --check` | exit 0; no formatting diff |
+| `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0; no warnings |
+| `cargo test -p teratai-app-core -p teratai-desktop --locked` | exit 0; app-core 95 unit + 1 integration and desktop 7 passed; 0 failed |
+| `uv run ruff check engine tests/golden` | exit 0; all checks passed |
+| `uv run mypy` | exit 0; no issues in 30 source files |
+| `uv run pytest -p no:cacheprovider engine/tests tests/golden` | exit 0; 12 passed, 0 failed |
+| `pnpm contracts:check` | exit 0; 20 canonical schemas verified, no stale generated artifact |
+| `git diff -- Cargo.toml Cargo.lock pnpm-lock.yaml uv.lock` | no output; dependency and lockfiles unchanged |
+
+Residual scope after T-0112: event delivery is process-local and best-effort; schema-1 upgrade UI, operation enqueue/engine dispatch, platform resource discovery, retry orchestration, and Job Center UI remain unimplemented.

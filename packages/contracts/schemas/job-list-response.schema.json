@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/job/job-list-response.schema.json",
+  "title": "JobListResponse",
+  "description": "Bounded project-scoped job page with an optional opaque keyset cursor pair.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "items"
+  ],
+  "properties": {
+    "items": {
+      "description": "Trusted persistent job snapshots ordered newest first.",
+      "type": "array",
+      "items": { "$ref": "job-descriptor.schema.json" }
+    },
+    "next_cursor_updated_at": { "description": "UTC timestamp for the next keyset page.", "type": "string" },
+    "next_cursor_job_id": { "description": "Lowercase UUID v7 for the next keyset page.", "type": "string" }
+  }
+}

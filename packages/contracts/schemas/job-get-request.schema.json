@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.teratai.local/job/job-get-request.schema.json",
+  "title": "JobGetRequest",
+  "description": "Typed desktop request for one project-scoped persistent job snapshot.",
+  "type": "object",
+  "additionalProperties": true,
+  "required": [
+    "job_id",
+    "correlation_id"
+  ],
+  "properties": {
+    "job_id": { "description": "Lowercase UUID v7 identity of the requested job.", "type": "string" },
+    "correlation_id": { "description": "Lowercase UUID v7 identity for this desktop request.", "type": "string" }
+  }
+}
