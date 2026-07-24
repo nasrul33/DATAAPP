@@ -2,15 +2,15 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Barrier, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use teratai_contracts::generated::project_create_request::ProjectCreateRequest;
 
 use super::resource::{DurationClass, ResourceBudget, ResourceEstimate};
 use super::{
-    wait_for_join_exit, CheckpointDecision, ClockError, ExecutionContext, ExecutorClock,
-    ExecutorCore, HandlerOutcome, JobExecutor, JobExecutorConfig, JobExecutorError, JobHandler,
-    JobHandlerError, JobProgress, ReaperCommand, SystemExecutorClock, WorkerSlot,
+    wait_for_join_exit, wait_for_slot_exit, CheckpointDecision, ClockError, ExecutionContext,
+    ExecutorClock, ExecutorCore, HandlerOutcome, JobExecutor, JobExecutorConfig, JobExecutorError,
+    JobHandler, JobHandlerError, JobProgress, ReaperCommand, SystemExecutorClock, WorkerSlot,
 };
 use crate::job::{JobProgressUpdateRequest, JobTransitionRequest};
 use crate::{JobEnqueueRequest, JobStore, ProjectService};
@@ -1464,6 +1464,13 @@ fn shutdown_timeout_retains_worker_for_successful_retry() {
     ));
 
     release_sender.send(()).expect("release gated handler");
+    let worker_exit_deadline = Instant::now()
+        .checked_add(Duration::from_secs(2))
+        .expect("bounded worker exit deadline");
+    assert!(
+        wait_for_slot_exit(&executor.workers[0].slot, worker_exit_deadline),
+        "released worker must exit before retrying shutdown"
+    );
     executor.shutdown().expect("retry joins completed worker");
     assert_eq!(
         fixture

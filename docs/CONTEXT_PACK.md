@@ -208,6 +208,7 @@ T-0110 adds no runtime dependency and no executor/UI behavior. No conflict with 
 | DEC-F066 | Keep Python dispatch, Tauri job command/event, Job Center UI, retry runner, operation payload persistence, and platform probes outside T-0111 | Preserve a reviewable executor-core boundary and avoid authorizing arbitrary execution | Deliver each capability in an explicit EPIC-110 follow-up with contracts, UI states, and tests |
 | DEC-F067 | Replace the originally designed bounded `Adopt(JoinHandle)` reaper channel with preallocated `Arc<WorkerSlot>` values shared with the reaper before worker spawn | A payload-bearing bounded channel can return `Full` or `Disconnected` while owning a handle; shared slots keep ownership discoverable and prevent either command-channel error from dropping it | Keep the reaper command channel payload-free (`Stop` only); after timed-out Drop, sender disconnection wakes the reaper to take/join remaining slot handles asynchronously, and lifecycle tests must preserve this proof |
 | DEC-F068 | Treat `HandlerOutcome::Cancelled` from a trusted `RUNNING` snapshot as a native handler contract violation and persist fixed non-retriable `FAILED/OPERATION_FAILED` metadata | Cancellation completion is valid only after persistent `CANCELLING`; silently releasing admission on an invalid outcome previously left the snapshot `RUNNING` until restart recovery | Future handlers must return `Cancelled` only after observing persistent cancellation; regression tests must prove the worker continues and the audit chain remains linked |
+| DEC-F069 | Synchronize the shutdown-retry regression test on bounded worker-exit proof before issuing the retry | GitHub Actions run 11 exposed a test-only race: releasing the gated handler and immediately retrying with the production shutdown timeout could observe a valid worker still finishing on a loaded runner | Keep production timeout behavior unchanged; lifecycle tests that require a completed worker must use observable completion/exit proof instead of scheduler timing or sleeps |
 
 No schema migration or dependency was added by T-0111. Source data remains immutable, and `JobStore` remains the only writer of job snapshot, immutable job history, and hash-linked audit history.
 
@@ -240,7 +241,7 @@ Residual risks accepted for this task: exactly-once admission is in-process only
 
 ### T-0111 hardening evidence
 
-Fresh gap audit and verification on Windows 11, 2026-07-24, found no unresolved PR comment/review thread; GitHub Actions Quality Gates run 10 was successful and PR #4 remained mergeable. The audit closed one lifecycle defect: an invalid handler cancellation outcome can no longer leave a job `RUNNING`. Regression coverage now also proves aggregate memory/disk rejection, checked arithmetic overflow without reservation corruption, and contiguous revision plus before/after audit-hash linkage through success, queued/running cancellation, preflight rejection, typed failure, panic, invalid cancellation outcome, and restart recovery.
+Fresh gap audit and verification on Windows 11, 2026-07-24, found no unresolved PR comment/review thread; GitHub Actions Quality Gates run 10 was successful and PR #4 remained mergeable. The audit closed one lifecycle defect: an invalid handler cancellation outcome can no longer leave a job `RUNNING`. Regression coverage now also proves aggregate memory/disk rejection, checked arithmetic overflow without reservation corruption, and contiguous revision plus before/after audit-hash linkage through success, queued/running cancellation, preflight rejection, typed failure, panic, invalid cancellation outcome, and restart recovery. GitHub Actions run 11 then exposed a scheduler-dependent race in the pre-existing shutdown-retry test; the test now waits for bounded worker-exit proof before retrying, without changing production behavior.
 
 | Command | Exact result |
 |---|---|
@@ -255,6 +256,7 @@ Fresh gap audit and verification on Windows 11, 2026-07-24, found no unresolved 
 | `cargo clippy --workspace --all-targets --locked -- -D warnings` | exit 0; no warnings |
 | `cargo test --workspace --locked` | exit 0; app-core 93 unit + 1 integration, desktop 3, engine-host 6, filesystem 23, secure-store 1; 127 total passed, 0 failed |
 | `1..10 \| % { cargo test -p teratai-app-core job_executor::tests --locked --quiet }` | exit 0; 28 executor tests passed in every run; 280/280 cumulative |
+| `1..100 \| % { cargo test -p teratai-app-core job_executor::tests::shutdown_timeout_retains_worker_for_successful_retry --locked --quiet }` | exit 0; shutdown-retry regression passed in every run; 100/100 cumulative |
 | `uv run ruff check engine` | exit 0; all checks passed |
 | `uv run mypy engine` | exit 0; no issues in 25 source files |
 | `uv run pytest -p no:cacheprovider engine/tests tests/golden` | exit 0; 11 passed, 0 failed |
